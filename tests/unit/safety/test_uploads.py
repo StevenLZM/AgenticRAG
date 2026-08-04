@@ -8,6 +8,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
+import agentic_rag.safety.uploads as uploads_module
 from agentic_rag.safety.uploads import (
     DefaultUploadSafetyScanner,
     UploadSafetyStatus,
@@ -37,6 +38,16 @@ def _zip_bytes() -> bytes:
     with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
         archive.writestr("payload.txt", "nested archive")
     return payload.getvalue()
+
+
+def _forge_eocd_entry_count(content: bytes, advertised_count: int) -> bytes:
+    forged = bytearray(content)
+    eocd_offset = forged.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    encoded_count = advertised_count.to_bytes(2, "little")
+    forged[eocd_offset + 8 : eocd_offset + 10] = encoded_count
+    forged[eocd_offset + 10 : eocd_offset + 12] = encoded_count
+    return bytes(forged)
 
 
 def test_mime_mismatch_is_rejected(scanner: DefaultUploadSafetyScanner) -> None:
@@ -195,6 +206,88 @@ def test_xlsx_rejects_nested_zip_disguised_with_non_archive_suffix(
     assert "unsupported_container" in decision.reasons
 
 
+def test_xlsx_rejects_prefixed_nested_zip_inside_xml_part(
+    scanner: DefaultUploadSafetyScanner,
+) -> None:
+    """Checking only the first member bytes must not admit an SFX-style ZIP."""
+    workbook = _xlsx_bytes(
+        extra_entries={
+            "xl/worksheets/innocent-looking.xml": b" " * 600 + _zip_bytes()
+        }
+    )
+
+    decision = scanner.scan(
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        workbook,
+    )
+
+    assert decision.status is UploadSafetyStatus.REJECTED
+    assert decision.detected_mime == "application/zip"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("xl/worksheets/broken.xml", b"<worksheet>"),
+        ("xl/media/image1.png", b"not-a-png"),
+    ],
+)
+def test_xlsx_rejects_parts_that_do_not_match_allowed_content_structure(
+    scanner: DefaultUploadSafetyScanner, name: str, value: bytes
+) -> None:
+    workbook = _xlsx_bytes(extra_entries={name: value})
+
+    decision = scanner.scan(
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        workbook,
+    )
+
+    assert decision.status is UploadSafetyStatus.REJECTED
+    assert decision.detected_mime == "application/zip"
+
+
+def test_xlsx_accepts_well_formed_xml_and_signature_valid_image_parts(
+    scanner: DefaultUploadSafetyScanner,
+) -> None:
+    workbook = _xlsx_bytes(
+        extra_entries={
+            "xl/worksheets/sheet1.xml": b"<worksheet><row/></worksheet>",
+            "xl/media/image1.png": b"\x89PNG\r\n\x1a\nminimal-test-payload",
+        }
+    )
+
+    decision = scanner.scan(
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        workbook,
+    )
+
+    assert decision.status is UploadSafetyStatus.ACCEPTED
+
+
+def test_xlsx_rejects_nested_zip_concatenated_after_valid_image_signature(
+    scanner: DefaultUploadSafetyScanner,
+) -> None:
+    workbook = _xlsx_bytes(
+        extra_entries={
+            "xl/media/image1.png": (
+                b"\x89PNG\r\n\x1a\n" + b"image-prefix" * 60 + _zip_bytes()
+            )
+        }
+    )
+
+    decision = scanner.scan(
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        workbook,
+    )
+
+    assert decision.status is UploadSafetyStatus.REJECTED
+    assert decision.detected_mime == "application/zip"
+
+
 def test_xlsx_rejects_archives_above_the_configured_entry_count() -> None:
     scanner = DefaultUploadSafetyScanner(max_xlsx_entries=4)
     workbook = _xlsx_bytes(
@@ -209,6 +302,35 @@ def test_xlsx_rejects_archives_above_the_configured_entry_count() -> None:
         "ledger.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         workbook,
+    )
+
+    assert decision.status is UploadSafetyStatus.REJECTED
+    assert decision.detected_mime == "application/zip"
+
+
+def test_forged_eocd_count_is_rejected_before_zipfile_materializes_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workbook = _xlsx_bytes(
+        extra_entries={
+            "xl/worksheets/sheet1.xml": "<sheet/>",
+            "xl/styles.xml": "<styles/>",
+            "docProps/core.xml": "<properties/>",
+        }
+    )
+    forged = _forge_eocd_entry_count(workbook, advertised_count=2)
+
+    class AllocationGuard:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("ZipFile constructed before bounded header count")
+
+    monkeypatch.setattr(uploads_module, "ZipFile", AllocationGuard)
+    scanner = DefaultUploadSafetyScanner(max_xlsx_entries=4)
+
+    decision = scanner.scan(
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        forged,
     )
 
     assert decision.status is UploadSafetyStatus.REJECTED

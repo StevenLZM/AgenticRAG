@@ -9,6 +9,7 @@ from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
+from xml.parsers import expat
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from pydantic import BaseModel, ConfigDict
@@ -38,20 +39,21 @@ _NESTED_ARCHIVE_SIGNATURES = _ZIP_SIGNATURES + (
     b"\x28\xb5\x2f\xfd",
     b"\x04\x22\x4d\x18",
 )
+_XML_PART_SUFFIXES = (".xml", ".rels", ".vml", ".svg")
+_IMAGE_PART_SIGNATURES = {
+    ".png": (b"\x89PNG\r\n\x1a\n",),
+    ".jpg": (b"\xff\xd8\xff",),
+    ".jpeg": (b"\xff\xd8\xff",),
+    ".gif": (b"GIF87a", b"GIF89a"),
+    ".bmp": (b"BM",),
+    ".tif": (b"II*\x00", b"MM\x00*"),
+    ".tiff": (b"II*\x00", b"MM\x00*"),
+    ".emf": (b"\x01\x00\x00\x00",),
+    ".wmf": (b"\xd7\xcd\xc6\x9a", b"\x01\x00\t\x00", b"\x02\x00\t\x00"),
+}
 _ALLOWED_OOXML_PART_SUFFIXES = (
-    ".xml",
-    ".rels",
-    ".vml",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".emf",
-    ".wmf",
-    ".svg",
+    *_XML_PART_SUFFIXES,
+    *_IMAGE_PART_SIGNATURES,
 )
 _MIME_EXTENSIONS = {
     PDF_MIME: {".pdf"},
@@ -249,8 +251,8 @@ def _is_safe_xlsx(content: bytes, *, max_entries: int) -> bool:
                 total_uncompressed / total_compressed > 1000
             ):
                 return False
-            return not any(
-                _member_looks_like_nested_archive(workbook, entry)
+            return all(
+                _is_safe_ooxml_part_content(workbook, entry)
                 for entry in entries
                 if not entry.is_dir()
             )
@@ -281,15 +283,69 @@ def _zip_metadata_within_limits(content: bytes, *, max_entries: int) -> bool:
         content[eocd_offset + 16 : eocd_offset + 20], "little"
     )
     max_directory_size = min(8 * 1024 * 1024, max_entries * 2048)
-    return (
+    metadata_bounds_are_safe = (
         disk_number == 0
         and directory_disk == 0
         and disk_entries == total_entries
         and total_entries != 0xFFFF
         and total_entries <= max_entries
         and directory_size <= max_directory_size
-        and directory_offset + directory_size <= eocd_offset
+        and directory_offset + directory_size == eocd_offset
     )
+    if not metadata_bounds_are_safe:
+        return False
+    parsed_entries = _count_central_directory_headers(
+        content,
+        directory_offset=directory_offset,
+        directory_size=directory_size,
+        max_entries=max_entries,
+    )
+    return parsed_entries == total_entries
+
+
+def _count_central_directory_headers(
+    content: bytes,
+    *,
+    directory_offset: int,
+    directory_size: int,
+    max_entries: int,
+) -> int | None:
+    cursor = directory_offset
+    directory_end = directory_offset + directory_size
+    count = 0
+    while cursor < directory_end:
+        if count >= max_entries or cursor + 46 > directory_end:
+            return None
+        if content[cursor : cursor + 4] != b"PK\x01\x02":
+            return None
+        compressed_size = int.from_bytes(
+            content[cursor + 20 : cursor + 24], "little"
+        )
+        uncompressed_size = int.from_bytes(
+            content[cursor + 24 : cursor + 28], "little"
+        )
+        name_length = int.from_bytes(content[cursor + 28 : cursor + 30], "little")
+        extra_length = int.from_bytes(content[cursor + 30 : cursor + 32], "little")
+        comment_length = int.from_bytes(
+            content[cursor + 32 : cursor + 34], "little"
+        )
+        starting_disk = int.from_bytes(content[cursor + 34 : cursor + 36], "little")
+        local_header_offset = int.from_bytes(
+            content[cursor + 42 : cursor + 46], "little"
+        )
+        if (
+            compressed_size == 0xFFFFFFFF
+            or uncompressed_size == 0xFFFFFFFF
+            or local_header_offset == 0xFFFFFFFF
+            or starting_disk != 0
+        ):
+            return None
+        record_size = 46 + name_length + extra_length + comment_length
+        if cursor + record_size > directory_end:
+            return None
+        cursor += record_size
+        count += 1
+    return count if cursor == directory_end else None
 
 
 def _is_safe_ooxml_member_name(name: str) -> bool:
@@ -310,9 +366,61 @@ def _is_safe_ooxml_member_name(name: str) -> bool:
     )
 
 
-def _member_looks_like_nested_archive(workbook: ZipFile, entry: ZipInfo) -> bool:
-    with workbook.open(entry) as member:
-        header = member.read(512)
-    return header.startswith(_NESTED_ARCHIVE_SIGNATURES) or (
-        len(header) >= 262 and header[257:262] == b"ustar"
+class _UnsafeXmlPart(ValueError):
+    pass
+
+
+def _is_safe_ooxml_part_content(workbook: ZipFile, entry: ZipInfo) -> bool:
+    suffix = Path(entry.filename).suffix.lower()
+    if suffix in _XML_PART_SUFFIXES:
+        return _is_well_formed_xml_part(workbook, entry)
+    expected_signatures = _IMAGE_PART_SIGNATURES.get(suffix)
+    if expected_signatures is None:
+        return False
+    return _is_signature_valid_image_without_nested_archive(
+        workbook, entry, expected_signatures
     )
+
+
+def _is_well_formed_xml_part(workbook: ZipFile, entry: ZipInfo) -> bool:
+    parser = expat.ParserCreate()
+
+    def reject_declaration(*_args: object) -> None:
+        raise _UnsafeXmlPart("DTD and entity declarations are not allowed")
+
+    def reject_external_entity(*_args: object) -> int:
+        raise _UnsafeXmlPart("external entities are not allowed")
+
+    parser.StartDoctypeDeclHandler = reject_declaration
+    parser.EntityDeclHandler = reject_declaration
+    parser.ExternalEntityRefHandler = reject_external_entity
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    try:
+        with workbook.open(entry) as member:
+            while chunk := member.read(64 * 1024):
+                parser.Parse(chunk, False)
+        parser.Parse(b"", True)
+    except (expat.ExpatError, _UnsafeXmlPart):
+        return False
+    return True
+
+
+def _is_signature_valid_image_without_nested_archive(
+    workbook: ZipFile,
+    entry: ZipInfo,
+    expected_signatures: tuple[bytes, ...],
+) -> bool:
+    longest_signature = max(len(signature) for signature in _NESTED_ARCHIVE_SIGNATURES)
+    tail = b""
+    header = b""
+    with workbook.open(entry) as member:
+        while chunk := member.read(64 * 1024):
+            if not header:
+                header = chunk[:64]
+            window = tail + chunk
+            if any(signature in window for signature in _NESTED_ARCHIVE_SIGNATURES):
+                return False
+            if b"ustar" in window:
+                return False
+            tail = window[-(longest_signature - 1) :]
+    return header.startswith(expected_signatures)
