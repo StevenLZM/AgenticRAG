@@ -454,6 +454,42 @@ def test_assembler_rejects_malformed_fragment_graph_shape(
         GlobalAssembler().assemble([fragment])
 
 
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"schema_name": "DoclingDocument", "body": None},
+        {"schema_name": "DoclingDocument", "furniture": None},
+        {
+            "schema_name": "DoclingDocument",
+            "body": {"self_ref": "#/body", "children": [{"$ref": "#/texts/0"}]},
+            "texts": [
+                {
+                    "self_ref": "#/texts/0",
+                    "parent": {"$ref": 7},
+                    "label": "text",
+                    "text": "malformed parent",
+                    "prov": [{"page_no": 1}],
+                }
+            ],
+        },
+    ],
+    ids=("null-body", "null-furniture", "non-string-nested-reference"),
+)
+def test_assembler_rejects_null_roots_and_non_string_nested_references(
+    document: dict[str, object],
+) -> None:
+    fragment = FragmentAst(
+        envelope=_envelope(),
+        batch_no=1,
+        page_from=1,
+        page_to=1,
+        docling_document=document,
+    )
+
+    with pytest.raises(AstAssemblyError, match="fragment Docling graph"):
+        GlobalAssembler().assemble([fragment])
+
+
 def test_assembler_persists_versioned_canonical_json_artifact(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
 

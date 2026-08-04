@@ -77,6 +77,61 @@ class _Converter:
         return _Result(_Document([1, 2, 3]))
 
 
+class _FurnitureDocument(_Document):
+    def __init__(
+        self,
+        source_pages: list[int],
+        *,
+        rebase_pages: bool = False,
+        drop_furniture: bool = False,
+    ) -> None:
+        super().__init__(source_pages, rebase_pages=rebase_pages)
+        self.drop_furniture = drop_furniture
+
+    def export_to_dict(self, **kwargs: Any) -> dict[str, Any]:
+        exported = super().export_to_dict(**kwargs)
+        exported["furniture"] = {"self_ref": "#/furniture", "children": []}
+        exported["groups"] = []
+        if self.drop_furniture or 3 not in self.source_pages:
+            return exported
+        header_ref = f"#/texts/{len(self.source_pages)}"
+        exported["furniture"]["children"] = [{"$ref": "#/groups/0"}]
+        exported["groups"] = [
+            {
+                "self_ref": "#/groups/0",
+                "parent": {"$ref": "#/furniture"},
+                "children": [{"$ref": header_ref}],
+                "label": "section",
+                "name": "headers",
+            }
+        ]
+        exported["texts"].append(
+            {
+                "self_ref": header_ref,
+                "parent": {"$ref": "#/groups/0"},
+                "label": "page_header",
+                "text": "HEADER",
+                "prov": [{"page_no": 3}],
+            }
+        )
+        return exported
+
+    def filter(self, page_nrs: set[int] | None = None) -> _FurnitureDocument:
+        selected = [page for page in self.source_pages if page in (page_nrs or set())]
+        return _FurnitureDocument(
+            selected,
+            rebase_pages=True,
+            drop_furniture=True,
+        )
+
+
+class _FurnitureConverter:
+    def convert(self, source: object, **_kwargs: Any) -> _Result:
+        assert isinstance(source, _Stream)
+        assert source.stream.read() == b"source bytes"
+        return _Result(_FurnitureDocument([1, 2, 3]))
+
+
 def _envelope(uri: str, sha256: str) -> DocumentEnvelope:
     return DocumentEnvelope(
         document_id="doc-1",
@@ -139,6 +194,42 @@ async def test_parser_filters_docling_document_into_versioned_page_batches(
         "page 2",
         "page 3",
     ]
+
+
+@pytest.mark.asyncio
+async def test_parser_does_not_double_shift_restored_furniture_provenance(
+    tmp_path: Path,
+) -> None:
+    artifacts = LocalArtifactStore(tmp_path)
+    original = artifacts.put_bytes("source/report.pdf", b"source bytes")
+    parser = DocumentParser(
+        source_loader=lambda _ref: b"source bytes",
+        artifacts=artifacts,
+        converter=_FurnitureConverter(),
+        document_stream_factory=_Stream,
+        page_batch_size=2,
+    )
+
+    fragments = [
+        fragment
+        async for fragment in parser.parse_batches(
+            original, _envelope(original.uri, original.sha256)
+        )
+    ]
+
+    second = fragments[1]
+    assert (second.page_from, second.page_to) == (3, 3)
+    assert second.docling_document["pages"] == {"3": {"page_no": 3}}
+    assert [
+        (item["label"], item["prov"][0]["page_no"])
+        for item in second.docling_document["texts"]
+    ] == [("text", 3), ("page_header", 3)]
+    canonical = GlobalAssembler().assemble(fragments)
+    assert [
+        item["prov"][0]["page_no"]
+        for item in canonical.docling_document["texts"]
+        if item["label"] == "page_header"
+    ] == [3]
 
 
 @pytest.mark.asyncio

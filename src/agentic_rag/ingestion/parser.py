@@ -240,6 +240,8 @@ def _restore_page_furniture(
         raise DoclingConversionError("Docling furniture children must be a list")
     if filtered_children:
         return filtered
+    local_page_from, _ = _declared_page_bounds(filtered)
+    furniture_page_delta = local_page_from - page_from
 
     items_by_ref: dict[str, Mapping[str, Any]] = {}
     collection_by_ref: dict[str, str] = {}
@@ -329,6 +331,8 @@ def _restore_page_furniture(
         child_refs = selected_children[old_ref]
         if "children" in item:
             item["children"] = [{"$ref": ref} for ref in child_refs]
+        if furniture_page_delta:
+            _shift_nested_page_numbers(item, furniture_page_delta)
         _rewrite_docling_references(item, reference_map)
     _rewrite_docling_references(restored_root, reference_map)
     return restored
@@ -445,15 +449,17 @@ def _shift_docling_page_numbers(document: dict[str, Any], delta: int) -> None:
             shifted_pages[shifted_key] = page
         document["pages"] = shifted_pages
 
-    def shift(value: Any) -> None:
-        if isinstance(value, dict):
-            page_no = value.get("page_no")
-            if isinstance(page_no, int):
-                value["page_no"] = page_no + delta
-            for child in value.values():
-                shift(child)
-        elif isinstance(value, list):
-            for child in value:
-                shift(child)
+    _shift_nested_page_numbers(document, delta)
 
-    shift(document)
+
+def _shift_nested_page_numbers(value: Any, delta: int) -> None:
+    """Shift every declared page number without changing page-map keys."""
+    if isinstance(value, dict):
+        page_no = value.get("page_no")
+        if isinstance(page_no, int):
+            value["page_no"] = page_no + delta
+        for child in value.values():
+            _shift_nested_page_numbers(child, delta)
+    elif isinstance(value, list):
+        for child in value:
+            _shift_nested_page_numbers(child, delta)

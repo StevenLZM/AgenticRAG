@@ -650,10 +650,11 @@ def _validate_fragment_graphs(fragments: Sequence[FragmentAst]) -> None:
 
 
 def _validate_fragment_graph_shape(document: Mapping[str, Any]) -> None:
+    _validate_reference_shapes(document, context="fragment Docling graph")
     for root_name in ("body", "furniture"):
-        root = document.get(root_name)
-        if root is None:
+        if root_name not in document:
             continue
+        root = document[root_name]
         if not isinstance(root, Mapping) or root.get("self_ref") != f"#/{root_name}":
             raise AstAssemblyError(
                 f"fragment Docling graph has invalid {root_name} root"
@@ -695,6 +696,19 @@ def _validate_fragment_graph_shape(document: Mapping[str, Any]) -> None:
                 )
 
 
+def _validate_reference_shapes(value: Any, *, context: str) -> None:
+    if isinstance(value, Mapping):
+        if "$ref" in value:
+            reference = value["$ref"]
+            if not isinstance(reference, str) or not reference:
+                raise AstAssemblyError(f"{context} contains a non-string or empty $ref")
+        for child in value.values():
+            _validate_reference_shapes(child, context=context)
+    elif isinstance(value, list):
+        for child in value:
+            _validate_reference_shapes(child, context=context)
+
+
 def _self_ref_counts(value: Any) -> dict[str, int]:
     counts: dict[str, int] = {}
 
@@ -714,6 +728,7 @@ def _self_ref_counts(value: Any) -> dict[str, int]:
 
 
 def _validate_complete_docling_graph(document: Mapping[str, Any]) -> None:
+    _validate_reference_shapes(document, context="complete Docling graph")
     references = _self_ref_counts(document)
     duplicates = sorted(
         reference for reference, count in references.items() if count > 1
