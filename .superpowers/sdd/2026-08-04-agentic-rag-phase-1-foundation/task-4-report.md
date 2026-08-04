@@ -133,3 +133,40 @@ conda run -n agentic-rag pytest -m integration tests/integration/persistence/tes
 
 The explicit loopback-only `AGENTIC_RAG_TEST_REDIS_DSN` gate remains unchanged;
 no Redis instance was started for this fix round.
+
+## Fix round 2
+
+### Durable integration coverage
+
+- `test_worker_commits_run_claim_before_redis_ack` reuses the existing explicit
+  disposable-MySQL migration fixture and requires the existing loopback-only
+  `AGENTIC_RAG_TEST_REDIS_DSN`. It commits a successful
+  `SqlAlchemyRunRepository.claim` before `XACK`, verifies the committed running
+  state while the stream entry is still pending, and then acknowledges it. It
+  also verifies rejected and deliberately rolled-back claims leave their Redis
+  entries pending and leave the rolled-back run queued.
+- `test_outbox_claim_lease_excludes_an_independent_session` opens two separate
+  MySQL sessions. It confirms that the first session's `FOR UPDATE SKIP LOCKED`
+  claim hides the controlled due row from the second session, then confirms the
+  committed lease continues to prevent a later claim. Neither repository method
+  commits on behalf of its caller.
+
+### Verification
+
+```text
+conda run -n agentic-rag ruff check src tests
+All checks passed!
+
+conda run -n agentic-rag mypy src/agentic_rag/persistence --ignore-missing-imports
+Success: no issues found in 5 source files
+
+conda run -n agentic-rag pytest tests/unit -q
+34 passed in 0.14s
+
+conda run -n agentic-rag pytest -m integration tests/integration/persistence/test_mysql_schema.py -q
+14 skipped in 0.15s
+```
+
+No `AGENTIC_RAG_TEST_MYSQL_DSN` or `AGENTIC_RAG_TEST_REDIS_DSN` was supplied in
+this environment, so the new end-to-end tests correctly skipped rather than
+guessing at or mutating a database. No Docker or local service was started.

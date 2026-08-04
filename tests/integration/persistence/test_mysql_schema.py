@@ -11,6 +11,8 @@ import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta, timezone
+from urllib.parse import urlparse
+from uuid import uuid4
 
 import pytest
 from alembic import command
@@ -18,9 +20,12 @@ from alembic.config import Config
 from sqlalchemy import inspect, insert, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from agentic_rag.domain.models import RunStatus, UserScope
 from agentic_rag.persistence.mysql import create_mysql_engine, create_session_factory
+from agentic_rag.persistence.redis_queue import RedisStreamsBroker
 from agentic_rag.persistence import repositories
 from agentic_rag.persistence.repositories import (
     ActiveRunConflict,
@@ -30,6 +35,7 @@ from agentic_rag.persistence.repositories import (
     SqlAlchemyDocumentRepository,
     SqlAlchemyEventRepository,
     SqlAlchemyIngestionJobRepository,
+    SqlAlchemyOutboxRepository,
     SqlAlchemyRunRepository,
     agent_runs,
     ingestion_jobs,
@@ -173,6 +179,28 @@ async def session_factory(
         yield factory
     finally:
         await engine.dispose()
+
+
+async def _local_redis_client() -> Redis:
+    dsn = os.getenv("AGENTIC_RAG_TEST_REDIS_DSN")
+    if not dsn:
+        pytest.skip(
+            "set AGENTIC_RAG_TEST_REDIS_DSN to run Redis/MySQL worker integration"
+        )
+    parsed = urlparse(dsn)
+    if parsed.scheme not in {"redis", "rediss"} or parsed.hostname not in {
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    }:
+        pytest.skip("AGENTIC_RAG_TEST_REDIS_DSN must target an explicit local Redis")
+    client = Redis.from_url(dsn, decode_responses=True)
+    try:
+        await client.ping()
+    except RedisError as error:
+        await client.aclose()
+        pytest.skip(f"local Redis is unavailable: {error}")
+    return client
 
 
 @pytest.mark.asyncio
@@ -641,3 +669,138 @@ async def test_run_and_job_creation_commit_matching_outbox_rows(
         ("query_run", run.id),
         ("ingestion_job", job.id),
     }
+
+
+@pytest.mark.asyncio
+async def test_worker_commits_run_claim_before_redis_ack(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An ACK is allowed only after a successful aggregate claim has committed."""
+    client = await _local_redis_client()
+    broker = RedisStreamsBroker(client)
+    stream = f"agenticrag:test:worker-claim:{uuid4().hex}"
+    scope = UserScope(user_id=f"worker-claim-{uuid4().hex}")
+    enqueued_at = datetime.now(UTC)
+
+    try:
+        async with session_factory.begin() as transaction:
+            run = await SqlAlchemyRunRepository(transaction).create_queued(
+                scope, "worker-claim-thread", SNAPSHOT
+            )
+
+        await broker.publish(stream, run.id, enqueued_at)
+        accepted = (await broker.consume(stream, "workers", "worker-a", 100))[0]
+        async with session_factory.begin() as transaction:
+            claimed = await SqlAlchemyRunRepository(transaction).claim(
+                accepted.aggregate_id, "worker-a", lease_seconds=30
+            )
+            assert claimed is not None
+
+        async with session_factory() as transaction:
+            durable = await SqlAlchemyRunRepository(transaction).get(run.id, scope)
+        assert durable is not None
+        assert durable.status is RunStatus.RUNNING
+        assert (await client.xpending(stream, "workers"))["pending"] == 1
+        await broker.ack(stream, "workers", accepted.id)
+        assert (await client.xpending(stream, "workers"))["pending"] == 0
+
+        await broker.publish(stream, run.id, enqueued_at)
+        rejected = (await broker.consume(stream, "workers", "worker-a", 100))[0]
+        async with session_factory.begin() as transaction:
+            assert (
+                await SqlAlchemyRunRepository(transaction).claim(
+                    rejected.aggregate_id, "worker-b", lease_seconds=30
+                )
+                is None
+            )
+        assert (await client.xpending(stream, "workers"))["pending"] == 1
+
+        async with session_factory.begin() as transaction:
+            rolled_back_run = await SqlAlchemyRunRepository(transaction).create_queued(
+                scope, "rolled-back-claim-thread", SNAPSHOT
+            )
+        await broker.publish(stream, rolled_back_run.id, enqueued_at)
+        rolled_back = (await broker.consume(stream, "workers", "worker-a", 100))[0]
+        rollback_session = session_factory()
+        try:
+            await rollback_session.begin()
+            claimed = await SqlAlchemyRunRepository(rollback_session).claim(
+                rolled_back.aggregate_id, "worker-c", lease_seconds=30
+            )
+            assert claimed is not None
+            await rollback_session.rollback()
+        finally:
+            await rollback_session.close()
+
+        async with session_factory() as transaction:
+            rolled_back_durable = await SqlAlchemyRunRepository(transaction).get(
+                rolled_back_run.id, scope
+            )
+        assert rolled_back_durable is not None
+        assert rolled_back_durable.status is RunStatus.QUEUED
+        assert (await client.xpending(stream, "workers"))["pending"] == 2
+    finally:
+        await client.delete(stream)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_outbox_claim_lease_excludes_an_independent_session(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """SKIP LOCKED excludes a due row until its first transaction commits a lease."""
+    outbox_id = str(uuid4())
+    initial_attempt = datetime(2000, 1, 1, tzinfo=UTC)
+    async with session_factory.begin() as transaction:
+        await transaction.execute(
+            insert(task_outbox).values(
+                id=outbox_id,
+                aggregate_type="query_run",
+                aggregate_id=str(uuid4()),
+                stream_name="agenticrag:jobs:query",
+                status="pending",
+                attempt_count=0,
+                next_attempt_at=initial_attempt,
+                created_at=datetime.now(UTC),
+            )
+        )
+
+    first_session = session_factory()
+    second_session = session_factory()
+    try:
+        await first_session.begin()
+        first_claim = await SqlAlchemyOutboxRepository(first_session).claim_pending(1)
+        assert [record.id for record in first_claim] == [outbox_id]
+
+        await second_session.begin()
+        second_claim = await SqlAlchemyOutboxRepository(second_session).claim_pending(
+            100
+        )
+        assert outbox_id not in {record.id for record in second_claim}
+        await second_session.commit()
+
+        await first_session.commit()
+        async with session_factory.begin() as transaction:
+            persisted = (
+                (
+                    await transaction.execute(
+                        select(task_outbox.c.next_attempt_at).where(
+                            task_outbox.c.id == outbox_id
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert persisted["next_attempt_at"] != initial_attempt
+            later_claim = await SqlAlchemyOutboxRepository(transaction).claim_pending(
+                100
+            )
+            assert outbox_id not in {record.id for record in later_claim}
+    finally:
+        if first_session.in_transaction():
+            await first_session.rollback()
+        if second_session.in_transaction():
+            await second_session.rollback()
+        await first_session.close()
+        await second_session.close()
