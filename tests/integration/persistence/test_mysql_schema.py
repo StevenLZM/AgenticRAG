@@ -10,19 +10,25 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import inspect, insert, select, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agentic_rag.domain.models import UserScope
+from agentic_rag.domain.models import RunStatus, UserScope
 from agentic_rag.persistence.mysql import create_mysql_engine, create_session_factory
+from agentic_rag.persistence import repositories
 from agentic_rag.persistence.repositories import (
     ActiveRunConflict,
+    AgentEvent,
+    EventKeyConflict,
+    LeaseLost,
     SqlAlchemyDocumentRepository,
+    SqlAlchemyEventRepository,
     SqlAlchemyIngestionJobRepository,
     SqlAlchemyRunRepository,
     agent_runs,
@@ -44,6 +50,69 @@ EXPECTED_TABLES = {
     "messages",
     "agent_events",
     "memory_tombstones",
+}
+
+EXPECTED_INDEXES = {
+    "documents": {
+        "ix_documents_user_status": ("user_id", "status"),
+        "ix_documents_user_content_hash": ("user_id", "content_hash"),
+    },
+    "document_versions": {"ix_versions_document_status": ("document_id", "status")},
+    "parent_chunks": {
+        "ix_parents_user_status": ("user_id", "status"),
+        "ix_parents_user_document": ("user_id", "document_id"),
+    },
+    "ingestion_jobs": {
+        "ix_jobs_status_lease": ("status", "lease_expires_at"),
+        "ix_jobs_user_created": ("user_id", "created_at"),
+    },
+    "agent_runs": {
+        "ix_runs_status_lease": ("status", "lease_expires_at"),
+        "ix_runs_user_thread_created": ("user_id", "thread_id", "created_at"),
+    },
+    "task_outbox": {"ix_outbox_pending": ("status", "next_attempt_at", "id")},
+    "messages": {
+        "ix_messages_user_thread_created": ("user_id", "thread_id", "created_at")
+    },
+    "agent_events": {"ix_events_user_run_id": ("user_id", "run_id", "id")},
+    "memory_tombstones": {"ix_tombstones_status_requested": ("status", "requested_at")},
+}
+
+EXPECTED_FOREIGN_KEYS = {
+    "documents": {
+        "fk_documents_active_version": (
+            ("active_version_id",),
+            "document_versions",
+            ("id",),
+            "SET NULL",
+        )
+    },
+    "document_versions": {
+        "fk_versions_document": (("document_id",), "documents", ("id",), "CASCADE")
+    },
+    "parent_chunks": {
+        "fk_parents_document": (("document_id",), "documents", ("id",), "CASCADE"),
+        "fk_parents_version": (
+            ("document_version_id",),
+            "document_versions",
+            ("id",),
+            "CASCADE",
+        ),
+    },
+    "ingestion_jobs": {
+        "fk_jobs_document": (("document_id",), "documents", ("id",), "CASCADE"),
+        "fk_jobs_version": (
+            ("document_version_id",),
+            "document_versions",
+            ("id",),
+            "CASCADE",
+        ),
+    },
+    "agent_runs": {},
+    "task_outbox": {},
+    "messages": {"fk_messages_run": (("run_id",), "agent_runs", ("id",), "CASCADE")},
+    "agent_events": {"fk_events_run": (("run_id",), "agent_runs", ("id",), "CASCADE")},
+    "memory_tombstones": {},
 }
 
 SNAPSHOT = RuntimeConfigSnapshot(
@@ -124,23 +193,45 @@ async def test_migration_creates_exact_schema_with_required_keys(
                 tuple(item["column_names"])
                 for item in inspector.get_unique_constraints("agent_events")
             }
-            foreign_keys = {
-                table: inspector.get_foreign_keys(table) for table in EXPECTED_TABLES
+            indexes = {
+                table: {
+                    item["name"]: tuple(item["column_names"])
+                    for item in inspector.get_indexes(table)
+                    if not item["unique"]
+                }
+                for table in EXPECTED_TABLES
             }
-            return tables, run_uniques, event_uniques, foreign_keys
+            foreign_keys = {
+                table: {
+                    item["name"]: (
+                        tuple(item["constrained_columns"]),
+                        item["referred_table"],
+                        tuple(item["referred_columns"]),
+                        item.get("options", {}).get("ondelete"),
+                    )
+                    for item in inspector.get_foreign_keys(table)
+                }
+                for table in EXPECTED_TABLES
+            }
+            return tables, run_uniques, event_uniques, indexes, foreign_keys
 
-        tables, run_uniques, event_uniques, foreign_keys = await schema.run_sync(
-            inspect_schema
-        )
+        (
+            tables,
+            run_uniques,
+            event_uniques,
+            indexes,
+            foreign_keys,
+        ) = await schema.run_sync(inspect_schema)
 
     assert tables == EXPECTED_TABLES
     assert ("user_id", "thread_id", "active_slot") in run_uniques
     assert ("event_key",) in event_uniques
-    assert foreign_keys["document_versions"]
-    assert foreign_keys["parent_chunks"]
-    assert foreign_keys["ingestion_jobs"]
-    assert foreign_keys["messages"]
-    assert foreign_keys["agent_events"]
+    required_indexes = {
+        table: {name: indexes[table].get(name) for name in definitions}
+        for table, definitions in EXPECTED_INDEXES.items()
+    }
+    assert required_indexes == EXPECTED_INDEXES
+    assert foreign_keys == EXPECTED_FOREIGN_KEYS
 
 
 @pytest.mark.asyncio
@@ -159,7 +250,16 @@ async def test_only_one_active_run_per_user_thread(
 
     async with session_factory.begin() as transaction:
         repository = SqlAlchemyRunRepository(transaction)
-        await repository.mark_completed(first.id, result_ref="artifact://answer")
+        claimed = await repository.claim(first.id, "worker:first", lease_seconds=30)
+        assert claimed is not None
+        await repository.finish(
+            first.id,
+            RunStatus.COMPLETED,
+            result_ref="artifact://answer",
+            error_code=None,
+            owner="worker:first",
+            claim_generation=claimed.claim_generation,
+        )
         second = await repository.create_queued(scope, "thread-1", SNAPSHOT)
 
     assert second.id != first.id
@@ -178,6 +278,183 @@ async def test_scoped_run_read_cannot_cross_user_boundary(
         repository = SqlAlchemyRunRepository(transaction)
         assert await repository.get(run.id, owner) is not None
         assert await repository.get(run.id, UserScope(user_id="other-user")) is None
+
+
+@pytest.mark.asyncio
+async def test_queued_cancel_finalizes_and_allows_next_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = UserScope(user_id="queued-cancel-user")
+    async with session_factory.begin() as transaction:
+        repository = SqlAlchemyRunRepository(transaction)
+        first = await repository.create_queued(scope, "cancel-thread", SNAPSHOT)
+        assert await repository.request_cancel(first.id, scope) is RunStatus.CANCELLED
+        second = await repository.create_queued(scope, "cancel-thread", SNAPSHOT)
+
+    assert second.id != first.id
+
+
+@pytest.mark.asyncio
+async def test_claim_is_single_winner_and_cancel_requested_is_reclaimable(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = UserScope(user_id="claim-user")
+    async with session_factory.begin() as transaction:
+        repository = SqlAlchemyRunRepository(transaction)
+        run = await repository.create_queued(scope, "claim-thread", SNAPSHOT)
+        first = await repository.claim(run.id, "shared-owner", lease_seconds=30)
+        assert first is not None
+
+    async with session_factory.begin() as transaction:
+        repository = SqlAlchemyRunRepository(transaction)
+        assert await repository.claim(run.id, "shared-owner", lease_seconds=30) is None
+        assert (
+            await repository.request_cancel(run.id, scope) is RunStatus.CANCEL_REQUESTED
+        )
+        await transaction.execute(
+            update(agent_runs)
+            .where(agent_runs.c.id == run.id)
+            .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+
+    async with session_factory.begin() as transaction:
+        repository = SqlAlchemyRunRepository(transaction)
+        reclaimed = await repository.claim(run.id, "worker-2", lease_seconds=30)
+        assert reclaimed is not None
+        assert reclaimed.status is RunStatus.CANCEL_REQUESTED
+        assert reclaimed.claim_generation == first.claim_generation + 1
+        await repository.finish(
+            run.id,
+            RunStatus.CANCELLED,
+            result_ref=None,
+            error_code=None,
+            owner="worker-2",
+            claim_generation=reclaimed.claim_generation,
+        )
+
+
+@pytest.mark.asyncio
+async def test_expired_heartbeat_and_stale_finish_are_fenced(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = UserScope(user_id="fence-user")
+    async with session_factory.begin() as transaction:
+        repository = SqlAlchemyRunRepository(transaction)
+        run = await repository.create_queued(scope, "fence-thread", SNAPSHOT)
+        first = await repository.claim(run.id, "worker-1", lease_seconds=30)
+        assert first is not None
+        await transaction.execute(
+            update(agent_runs)
+            .where(agent_runs.c.id == run.id)
+            .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        with pytest.raises(LeaseLost):
+            await repository.heartbeat(
+                run.id,
+                "worker-1",
+                30,
+                claim_generation=first.claim_generation,
+            )
+
+    async with session_factory.begin() as transaction:
+        repository = SqlAlchemyRunRepository(transaction)
+        second = await repository.claim(run.id, "worker-2", lease_seconds=30)
+        assert second is not None
+        with pytest.raises(LeaseLost):
+            await repository.finish(
+                run.id,
+                RunStatus.COMPLETED,
+                result_ref="artifact://stale",
+                error_code=None,
+                owner="worker-1",
+                claim_generation=first.claim_generation,
+            )
+        await repository.finish(
+            run.id,
+            RunStatus.COMPLETED,
+            result_ref="artifact://fresh",
+            error_code=None,
+            owner="worker-2",
+            claim_generation=second.claim_generation,
+        )
+
+    async with session_factory.begin() as transaction:
+        assert (
+            await SqlAlchemyRunRepository(transaction).request_cancel(run.id, scope)
+            is RunStatus.COMPLETED
+        )
+
+
+@pytest.mark.asyncio
+async def test_event_append_is_idempotent_and_rejects_key_conflicts(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = UserScope(user_id="event-user")
+    async with session_factory.begin() as transaction:
+        run = await SqlAlchemyRunRepository(transaction).create_queued(
+            scope, "event-thread", SNAPSHOT
+        )
+        repository = SqlAlchemyEventRepository(transaction)
+        event = AgentEvent(
+            event_key="event-key:integration",
+            trace_id="trace-1",
+            run_id=run.id,
+            user_id=scope.user_id,
+            event_type="RETRIEVAL_COMPLETED",
+            summary="retrieval complete",
+            runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        )
+        first_id = await repository.append(event)
+        assert await repository.append(event) == first_id
+        with pytest.raises(EventKeyConflict):
+            await repository.append(
+                AgentEvent(
+                    event_key=event.event_key,
+                    trace_id=event.trace_id,
+                    run_id=event.run_id,
+                    user_id=event.user_id,
+                    event_type=event.event_type,
+                    summary="conflicting summary",
+                    runtime_config_snapshot_id=event.runtime_config_snapshot_id,
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_outbox_insert_failure_rolls_back_run(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    duplicate_outbox_id = "00000000-0000-7000-8000-000000000001"
+    run_id = "00000000-0000-7000-8000-000000000002"
+    now = datetime.now(UTC)
+    async with session_factory.begin() as transaction:
+        await transaction.execute(
+            insert(task_outbox).values(
+                id=duplicate_outbox_id,
+                aggregate_type="query_run",
+                aggregate_id="existing-run",
+                stream_name="agenticrag:jobs:query",
+                status="pending",
+                attempt_count=0,
+                next_attempt_at=now,
+                created_at=now,
+            )
+        )
+
+    ids = iter([run_id, duplicate_outbox_id])
+    monkeypatch.setattr(repositories, "new_id", lambda: next(ids))
+    with pytest.raises(IntegrityError):
+        async with session_factory.begin() as transaction:
+            await SqlAlchemyRunRepository(transaction).create_queued(
+                UserScope(user_id="rollback-user"), "rollback-thread", SNAPSHOT
+            )
+
+    async with session_factory() as transaction:
+        assert (
+            await transaction.execute(
+                select(agent_runs.c.id).where(agent_runs.c.id == run_id)
+            )
+        ).one_or_none() is None
 
 
 @pytest.mark.asyncio

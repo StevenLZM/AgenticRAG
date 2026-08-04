@@ -21,6 +21,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
+    case,
+    func,
     insert,
     or_,
     select,
@@ -29,6 +31,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from agentic_rag.domain.models import (
     DocumentStatus,
@@ -314,8 +317,23 @@ def active_slot_for_status(status: RunStatus) -> int | None:
     return 1 if status in ACTIVE_RUN_STATUSES else None
 
 
+def _is_mysql_duplicate_for(error: IntegrityError, constraint_name: str) -> bool:
+    args = getattr(error.orig, "args", ())
+    if not args:
+        return False
+    return args[0] == 1062 and constraint_name in str(error.orig)
+
+
 class ActiveRunConflict(RuntimeError):
     """Raised when a user/thread already has a non-terminal run."""
+
+
+class LeaseLost(RuntimeError):
+    """Raised when a worker no longer owns the current live Run lease."""
+
+
+class EventKeyConflict(RuntimeError):
+    """Raised when one deterministic event key is reused for different data."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +346,9 @@ class QueryRun:
     active_slot: int | None
     runtime_config_snapshot_id: str
     runtime_config_snapshot: dict[str, Any]
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    claim_generation: int = 0
     result_ref: str | None = None
     error_code: str | None = None
 
@@ -420,7 +441,14 @@ class RunRepository(Protocol):
         self, run_id: str, owner: str, lease_seconds: int
     ) -> QueryRun | None: ...
 
-    async def heartbeat(self, run_id: str, owner: str, lease_seconds: int) -> None: ...
+    async def heartbeat(
+        self,
+        run_id: str,
+        owner: str,
+        lease_seconds: int,
+        *,
+        claim_generation: int,
+    ) -> None: ...
 
     async def request_cancel(self, run_id: str, scope: UserScope) -> RunStatus: ...
 
@@ -430,6 +458,9 @@ class RunRepository(Protocol):
         status: RunStatus,
         result_ref: str | None,
         error_code: str | None,
+        *,
+        owner: str,
+        claim_generation: int,
     ) -> None: ...
 
 
@@ -518,6 +549,9 @@ def _run_from_row(row: dict[str, Any]) -> QueryRun:
         active_slot=row["active_slot"],
         runtime_config_snapshot_id=row["runtime_config_snapshot_id"],
         runtime_config_snapshot=cast(dict[str, Any], row["runtime_config_snapshot"]),
+        lease_owner=row["lease_owner"],
+        lease_expires_at=row["lease_expires_at"],
+        claim_generation=row["attempt_count"],
         result_ref=row["result_ref"],
         error_code=row["error_code"],
     )
@@ -560,6 +594,8 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                 )
             )
         except IntegrityError as error:
+            if not _is_mysql_duplicate_for(error, "uq_runs_active_slot"):
+                raise
             raise ActiveRunConflict(
                 f"active run already exists for user={scope.user_id!r}, thread={thread_id!r}"
             ) from error
@@ -600,57 +636,122 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
             raise ValueError("lease_seconds must be positive")
         session = self._session()
         now = _now()
-        await session.execute(
-            update(agent_runs)
-            .where(
-                agent_runs.c.id == run_id,
-                or_(
-                    agent_runs.c.status == RunStatus.QUEUED.value,
-                    and_(
-                        agent_runs.c.status == RunStatus.RUNNING.value,
-                        agent_runs.c.lease_expires_at < now,
+        result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(agent_runs)
+                .where(
+                    agent_runs.c.id == run_id,
+                    or_(
+                        agent_runs.c.status == RunStatus.QUEUED.value,
+                        and_(
+                            agent_runs.c.status.in_(
+                                [
+                                    RunStatus.RUNNING.value,
+                                    RunStatus.CANCEL_REQUESTED.value,
+                                ]
+                            ),
+                            agent_runs.c.lease_expires_at <= now,
+                        ),
                     ),
-                ),
-            )
-            .values(
-                status=RunStatus.RUNNING.value,
-                lease_owner=owner,
-                lease_expires_at=now + timedelta(seconds=lease_seconds),
-                heartbeat_at=now,
-                attempt_count=agent_runs.c.attempt_count + 1,
-                started_at=now,
-            )
+                )
+                .values(
+                    status=case(
+                        (
+                            agent_runs.c.status == RunStatus.CANCEL_REQUESTED.value,
+                            RunStatus.CANCEL_REQUESTED.value,
+                        ),
+                        else_=RunStatus.RUNNING.value,
+                    ),
+                    lease_owner=owner,
+                    lease_expires_at=now + timedelta(seconds=lease_seconds),
+                    heartbeat_at=now,
+                    attempt_count=agent_runs.c.attempt_count + 1,
+                    started_at=func.coalesce(agent_runs.c.started_at, now),
+                )
+            ),
         )
+        if result.rowcount != 1:
+            return None
         row = (
             (await session.execute(select(agent_runs).where(agent_runs.c.id == run_id)))
             .mappings()
             .one_or_none()
         )
-        if not row or row["lease_owner"] != owner or row["status"] != "running":
+        if not row:
             return None
         return _run_from_row(dict(row))
 
-    async def heartbeat(self, run_id: str, owner: str, lease_seconds: int) -> None:
+    async def heartbeat(
+        self,
+        run_id: str,
+        owner: str,
+        lease_seconds: int,
+        *,
+        claim_generation: int,
+    ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         now = _now()
-        await self._session().execute(
-            update(agent_runs)
-            .where(
-                agent_runs.c.id == run_id,
-                agent_runs.c.lease_owner == owner,
-                agent_runs.c.status.in_(
-                    [RunStatus.RUNNING.value, RunStatus.CANCEL_REQUESTED.value]
-                ),
-            )
-            .values(
-                heartbeat_at=now,
-                lease_expires_at=now + timedelta(seconds=lease_seconds),
-            )
+        result = cast(
+            CursorResult[Any],
+            await self._session().execute(
+                update(agent_runs)
+                .where(
+                    agent_runs.c.id == run_id,
+                    agent_runs.c.lease_owner == owner,
+                    agent_runs.c.attempt_count == claim_generation,
+                    agent_runs.c.lease_expires_at > now,
+                    agent_runs.c.status.in_(
+                        [RunStatus.RUNNING.value, RunStatus.CANCEL_REQUESTED.value]
+                    ),
+                )
+                .values(
+                    heartbeat_at=now,
+                    lease_expires_at=now + timedelta(seconds=lease_seconds),
+                )
+            ),
         )
+        if result.rowcount != 1:
+            raise LeaseLost(run_id)
 
     async def request_cancel(self, run_id: str, scope: UserScope) -> RunStatus:
         session = self._session()
+        now = _now()
+        queued_result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(agent_runs)
+                .where(
+                    agent_runs.c.id == run_id,
+                    agent_runs.c.user_id == scope.user_id,
+                    agent_runs.c.status == RunStatus.QUEUED.value,
+                )
+                .values(
+                    status=RunStatus.CANCELLED.value,
+                    active_slot=None,
+                    finished_at=now,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                )
+            ),
+        )
+        if queued_result.rowcount == 1:
+            return RunStatus.CANCELLED
+        running_result = cast(
+            CursorResult[Any],
+            await session.execute(
+                update(agent_runs)
+                .where(
+                    agent_runs.c.id == run_id,
+                    agent_runs.c.user_id == scope.user_id,
+                    agent_runs.c.status == RunStatus.RUNNING.value,
+                )
+                .values(status=RunStatus.CANCEL_REQUESTED.value)
+            ),
+        )
+        if running_result.rowcount == 1:
+            return RunStatus.CANCEL_REQUESTED
         row = (
             await session.execute(
                 select(agent_runs.c.status).where(
@@ -661,18 +762,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         ).one_or_none()
         if row is None:
             raise KeyError(run_id)
-        status = RunStatus(row[0])
-        if status in ACTIVE_RUN_STATUSES and status is not RunStatus.CANCEL_REQUESTED:
-            await session.execute(
-                update(agent_runs)
-                .where(
-                    agent_runs.c.id == run_id,
-                    agent_runs.c.user_id == scope.user_id,
-                )
-                .values(status=RunStatus.CANCEL_REQUESTED.value)
-            )
-            return RunStatus.CANCEL_REQUESTED
-        return status
+        return RunStatus(row[0])
 
     async def finish(
         self,
@@ -680,25 +770,57 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         status: RunStatus,
         result_ref: str | None,
         error_code: str | None,
+        *,
+        owner: str,
+        claim_generation: int,
     ) -> None:
         if status not in TERMINAL_RUN_STATUSES:
             raise ValueError("finish requires a terminal RunStatus")
-        await self._session().execute(
-            update(agent_runs)
-            .where(agent_runs.c.id == run_id)
-            .values(
-                status=status.value,
-                active_slot=None,
-                result_ref=result_ref,
-                error_code=error_code,
-                finished_at=_now(),
-                lease_owner=None,
-                lease_expires_at=None,
-            )
+        now = _now()
+        allowed_current_statuses = [RunStatus.RUNNING.value]
+        if status is RunStatus.CANCELLED:
+            allowed_current_statuses.append(RunStatus.CANCEL_REQUESTED.value)
+        result = cast(
+            CursorResult[Any],
+            await self._session().execute(
+                update(agent_runs)
+                .where(
+                    agent_runs.c.id == run_id,
+                    agent_runs.c.status.in_(allowed_current_statuses),
+                    agent_runs.c.lease_owner == owner,
+                    agent_runs.c.attempt_count == claim_generation,
+                    agent_runs.c.lease_expires_at > now,
+                )
+                .values(
+                    status=status.value,
+                    active_slot=None,
+                    result_ref=result_ref,
+                    error_code=error_code,
+                    finished_at=now,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                )
+            ),
         )
+        if result.rowcount != 1:
+            raise LeaseLost(run_id)
 
-    async def mark_completed(self, run_id: str, result_ref: str | None) -> None:
-        await self.finish(run_id, RunStatus.COMPLETED, result_ref, None)
+    async def mark_completed(
+        self,
+        run_id: str,
+        result_ref: str | None,
+        *,
+        owner: str,
+        claim_generation: int,
+    ) -> None:
+        await self.finish(
+            run_id,
+            RunStatus.COMPLETED,
+            result_ref,
+            None,
+            owner=owner,
+            claim_generation=claim_generation,
+        )
 
 
 class SqlAlchemyIngestionJobRepository(_SqlAlchemyRepository):
@@ -888,24 +1010,54 @@ class SqlAlchemyParentRepository(_SqlAlchemyRepository):
 
 class SqlAlchemyEventRepository(_SqlAlchemyRepository):
     async def append(self, event: AgentEvent) -> int:
-        result = cast(
-            CursorResult[Any],
-            await self._session().execute(
-                insert(agent_events).values(
-                    event_key=event.event_key,
-                    trace_id=event.trace_id,
-                    run_id=event.run_id,
-                    user_id=event.user_id,
-                    node_name=event.node_name,
-                    event_type=event.event_type,
-                    summary=event.summary,
-                    payload_ref=event.payload_ref,
-                    runtime_config_snapshot_id=event.runtime_config_snapshot_id,
-                    created_at=event.created_at or _now(),
-                )
-            ),
+        session = self._session()
+        statement = mysql_insert(agent_events).values(
+            event_key=event.event_key,
+            trace_id=event.trace_id,
+            run_id=event.run_id,
+            user_id=event.user_id,
+            node_name=event.node_name,
+            event_type=event.event_type,
+            summary=event.summary,
+            payload_ref=event.payload_ref,
+            runtime_config_snapshot_id=event.runtime_config_snapshot_id,
+            created_at=event.created_at or _now(),
         )
-        return cast(int, result.lastrowid)
+        await session.execute(statement.on_duplicate_key_update(id=agent_events.c.id))
+        row = (
+            (
+                await session.execute(
+                    select(agent_events).where(
+                        agent_events.c.event_key == event.event_key
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        expected = (
+            event.trace_id,
+            event.run_id,
+            event.user_id,
+            event.node_name,
+            event.event_type,
+            event.summary,
+            event.payload_ref,
+            event.runtime_config_snapshot_id,
+        )
+        actual = (
+            row["trace_id"],
+            row["run_id"],
+            row["user_id"],
+            row["node_name"],
+            row["event_type"],
+            row["summary"],
+            row["payload_ref"],
+            row["runtime_config_snapshot_id"],
+        )
+        if actual != expected:
+            raise EventKeyConflict(event.event_key)
+        return cast(int, row["id"])
 
     async def list_after(
         self, run_id: str, scope: UserScope, after_id: int, limit: int
