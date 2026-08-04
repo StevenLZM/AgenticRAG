@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-rag"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "alembic",
+  "asyncmy",
+  "docling",
+  "elasticsearch[async]",
+  "fastapi",
+  "langgraph",
+  "langgraph-checkpoint-sqlite",
+  "mem0ai==2.0.12",
+  "openai",
+  "orjson",
+  "pydantic>=2",
+  "pydantic-settings",
+  "redis",
+  "sentence-transformers",
+  "sqlalchemy[asyncio]>=2",
+  "tenacity",
+  "uvicorn",
+  "uuid6"
+]
+
+[project.optional-dependencies]
+dev = ["httpx", "mypy", "pytest", "pytest-asyncio", "ruff"]
+eval = ["datasets", "ragas"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+markers = [
+  "integration: requires local infrastructure",
+  "e2e: full system scenario",
+  "live_model: calls configured external model APIs"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
