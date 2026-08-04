@@ -98,6 +98,8 @@ document_versions = Table(
     Column("pipeline_version", String(128), nullable=False),
     Column("canonical_ast_path", String(1024), nullable=True),
     Column("canonical_ast_hash", String(64), nullable=True),
+    Column("manifest_path", String(1024), nullable=True),
+    Column("manifest_hash", String(64), nullable=True),
     Column("parent_count", Integer, nullable=False, default=0),
     Column("child_count", Integer, nullable=False, default=0),
     Column("embedding_version", String(128), nullable=False),
@@ -107,6 +109,11 @@ document_versions = Table(
     CheckConstraint(
         "status IN ('uploaded','building','active','quarantined','failed','inactive')",
         name="ck_document_versions_status",
+    ),
+    CheckConstraint(
+        "((manifest_path IS NULL AND manifest_hash IS NULL) OR "
+        "(manifest_path IS NOT NULL AND manifest_hash IS NOT NULL))",
+        name="ck_document_versions_manifest_pair",
     ),
     UniqueConstraint("document_id", "version_no", name="uq_versions_document_number"),
     Index("ix_versions_document_status", "document_id", "status"),
