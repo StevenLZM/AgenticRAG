@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from alembic import command
@@ -447,7 +447,7 @@ async def test_event_append_is_idempotent_and_rejects_key_conflicts(
                     runtime_config_snapshot_id=event.runtime_config_snapshot_id,
                 )
             )
-        explicit_at = datetime(2026, 8, 5, 10, 0, tzinfo=UTC)
+        explicit_at = datetime(2026, 8, 5, 10, 0, tzinfo=timezone(timedelta(hours=8)))
         timestamped = AgentEvent(
             event_key="event-key:timestamped",
             trace_id="trace-1",
@@ -458,7 +458,22 @@ async def test_event_append_is_idempotent_and_rejects_key_conflicts(
             runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
             created_at=explicit_at,
         )
-        await repository.append(timestamped)
+        timestamped_id = await repository.append(timestamped)
+        assert (
+            await repository.append(
+                AgentEvent(
+                    event_key=timestamped.event_key,
+                    trace_id=timestamped.trace_id,
+                    run_id=timestamped.run_id,
+                    user_id=timestamped.user_id,
+                    event_type=timestamped.event_type,
+                    summary=timestamped.summary,
+                    runtime_config_snapshot_id=(timestamped.runtime_config_snapshot_id),
+                    created_at=datetime(2026, 8, 5, 2, 0, tzinfo=UTC),
+                )
+            )
+            == timestamped_id
+        )
         with pytest.raises(EventKeyConflict):
             await repository.append(
                 AgentEvent(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, cast
 
 import pytest
@@ -349,6 +349,8 @@ async def test_identical_event_replay_returns_existing_cursor() -> None:
 
     assert await repository.append(event) == 41
     assert await repository.append(event) == 41
+    generated_timestamp = transaction.statements[0].compile().params["created_at"]
+    assert generated_timestamp.tzinfo is None
 
 
 @pytest.mark.asyncio
@@ -366,18 +368,34 @@ async def test_event_key_reuse_with_conflicting_payload_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_event_timestamp_is_part_of_replay_identity() -> None:
-    """Two explicit creation times cannot silently share one event key."""
-    persisted_at = datetime(2026, 8, 5, 10, 0, tzinfo=UTC)
-    existing = _event(created_at=persisted_at)
-    replay = _event(created_at=persisted_at + timedelta(seconds=1))
+async def test_offset_event_timestamp_is_canonicalized_before_replay_comparison() -> (
+    None
+):
+    """Equivalent offset instants share a cursor while a different instant conflicts."""
+    source_time = datetime(2026, 8, 5, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+    equivalent_utc = datetime(2026, 8, 5, 2, 0, tzinfo=UTC)
+    canonical_row = _event_row(_event(created_at=equivalent_utc))
+    canonical_row["created_at"] = equivalent_utc.replace(tzinfo=None)
     transaction = RecordingSession(
-        scripted=[RecordingResult(), RecordingResult([_event_row(existing)])]
+        scripted=[
+            RecordingResult(),
+            RecordingResult([canonical_row]),
+            RecordingResult(),
+            RecordingResult([canonical_row]),
+            RecordingResult(),
+            RecordingResult([canonical_row]),
+        ]
     )
     repository = SqlAlchemyEventRepository(cast(AsyncSession, transaction))
 
+    assert await repository.append(_event(created_at=source_time)) == 41
+    assert await repository.append(_event(created_at=equivalent_utc)) == 41
     with pytest.raises(EventKeyConflict):
-        await repository.append(replay)
+        await repository.append(
+            _event(created_at=equivalent_utc + timedelta(seconds=1))
+        )
+    bound_timestamp = transaction.statements[0].compile().params["created_at"]
+    assert bound_timestamp == equivalent_utc.replace(tzinfo=None)
 
 
 @pytest.mark.asyncio

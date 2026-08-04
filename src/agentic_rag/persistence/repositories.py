@@ -1033,7 +1033,7 @@ class SqlAlchemyEventRepository(_SqlAlchemyRepository):
             summary=event.summary,
             payload_ref=event.payload_ref,
             runtime_config_snapshot_id=event.runtime_config_snapshot_id,
-            created_at=event.created_at or _now(),
+            created_at=_mysql_datetime(event.created_at or _now()),
         )
         await session.execute(statement.on_duplicate_key_update(id=agent_events.c.id))
         row = (
