@@ -9,6 +9,7 @@ second tokenization implementation.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
@@ -16,9 +17,21 @@ from docling.chunking import HybridChunker  # type: ignore[import-not-found]
 from docling_core.transforms.chunker.tokenizer.base import (  # type: ignore[import-not-found]
     BaseTokenizer,
 )
+from docling_core.transforms.chunker.hierarchical_chunker import (  # type: ignore[import-not-found]
+    ChunkingDocSerializer,
+)
+from docling_core.transforms.serializer.base import (  # type: ignore[import-not-found]
+    BaseDocSerializer,
+    BaseSerializerProvider,
+)
+from docling_core.transforms.serializer.markdown import (  # type: ignore[import-not-found]
+    MarkdownTableSerializer,
+)
 from docling_core.types.doc import (  # type: ignore[import-not-found]
     DocItemLabel,
     DoclingDocument,
+    TableCell,
+    TableData,
 )
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -34,6 +47,63 @@ CHILD_MAX_TOKENS = 384
 
 class ChunkingError(ValueError):
     """Raised when chunking cannot preserve a required production invariant."""
+
+
+class AstSpan(BaseModel):
+    """Resolvable half-open range within one Canonical AST text block."""
+
+    model_config = ConfigDict(frozen=True)
+
+    canonical_path: str = Field(pattern=r"^#/text_blocks/(0|[1-9][0-9]*)$")
+    block_id: str
+    page_from: int = Field(ge=1)
+    page_to: int = Field(ge=1)
+    char_from: int = Field(ge=0)
+    char_to: int = Field(gt=0)
+    row_from: int | None = Field(default=None, ge=0)
+    row_to: int | None = Field(default=None, ge=1)
+    table_header_row_to: int = Field(default=0, ge=0)
+    parent_char_from: int = Field(ge=0)
+    parent_char_to: int = Field(gt=0)
+    separator_before: str = ""
+
+    @model_validator(mode="after")
+    def _valid_span(self) -> AstSpan:
+        if self.char_to <= self.char_from:
+            raise ValueError("AST character range is empty or reversed")
+        if self.page_to < self.page_from:
+            raise ValueError("AST span page range is reversed")
+        if self.parent_char_to <= self.parent_char_from:
+            raise ValueError("Parent character range is empty or reversed")
+        if (self.row_from is None) != (self.row_to is None):
+            raise ValueError("AST row range must be complete")
+        if self.row_from is not None and self.row_to is not None:
+            if self.row_to <= self.row_from:
+                raise ValueError("AST row range is empty or reversed")
+            if self.table_header_row_to > self.row_from:
+                raise ValueError("table header must precede the selected body rows")
+        elif self.table_header_row_to:
+            raise ValueError("table header metadata requires a row range")
+        return self
+
+
+class AstLocator(BaseModel):
+    """Structured provenance locator persisted with a Parent or Child."""
+
+    model_config = ConfigDict(frozen=True)
+
+    spans: tuple[AstSpan, ...]
+    segment_ordinal: int = Field(ge=0)
+    parent_char_from: int = Field(ge=0)
+    parent_char_to: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _non_empty(self) -> AstLocator:
+        if not self.spans:
+            raise ValueError("AST locator requires at least one span")
+        if self.parent_char_to <= self.parent_char_from:
+            raise ValueError("locator Parent range is empty or reversed")
+        return self
 
 
 class ChildChunk(BaseModel):
@@ -56,7 +126,7 @@ class ChildChunk(BaseModel):
     token_count: int = Field(ge=1, le=CHILD_MAX_TOKENS)
     page_from: int = Field(ge=1)
     page_to: int = Field(ge=1)
-    ast_locator: str
+    ast_locator: AstLocator
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
@@ -85,7 +155,7 @@ class ParentChunk(BaseModel):
     token_count: int = Field(ge=1)
     page_from: int = Field(ge=1)
     page_to: int = Field(ge=1)
-    ast_locator: str
+    ast_locator: AstLocator
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     row_from: int | None = Field(default=None, ge=1)
     row_to: int | None = Field(default=None, ge=1)
@@ -114,13 +184,15 @@ class ParentChunk(BaseModel):
 class _ParentPiece:
     content: str
     content_type: str
-    block_from: int
-    block_to: int
     page_from: int
     page_to: int
-    ast_locator: str
+    canonical_path: str
+    block_id: str
+    char_from: int
+    char_to: int
     row_from: int | None = None
     row_to: int | None = None
+    table_header_row_to: int = 0
     oversize_reason: Literal["indivisible_row_exceeds_parent_hard_limit"] | None = None
 
 
@@ -140,6 +212,16 @@ class _LimitedTokenizer(BaseTokenizer):
 
     def get_tokenizer(self) -> object:
         return self.delegate.get_tokenizer()
+
+
+class _StructuredSerializerProvider(BaseSerializerProvider):
+    """Use Docling's Markdown table serializer so row/header splitting is retained."""
+
+    def get_serializer(self, doc: DoclingDocument) -> BaseDocSerializer:
+        return ChunkingDocSerializer(
+            doc=doc,
+            table_serializer=MarkdownTableSerializer(),
+        )
 
 
 class ParentBuilder:
@@ -240,6 +322,11 @@ class ParentBuilder:
         if not pending:
             pending.append(piece)
             return
+        if pending[-1].content_type != piece.content_type:
+            drafts.append((heading_path, heading_ast_locators, list(pending)))
+            pending.clear()
+            pending.append(piece)
+            return
 
         candidate_content = _join_piece_content((*pending, piece))
         candidate_tokens = self._count(candidate_content)
@@ -262,6 +349,20 @@ class ParentBuilder:
         content_type = _content_type(block)
         token_count = self._count(block.text)
         if token_count <= self._hard_max:
+            if content_type == "table":
+                rows = block.text.splitlines() or [block.text]
+                header_row_to = _table_header_row_to(rows)
+                if header_row_to < len(rows):
+                    return [
+                        _piece_from_block(
+                            block,
+                            block_index,
+                            content_type=content_type,
+                            row_from=header_row_to,
+                            row_to=len(rows),
+                            table_header_row_to=header_row_to,
+                        )
+                    ]
             return [_piece_from_block(block, block_index, content_type=content_type)]
         if content_type in {"table", "code", "log"}:
             return self._row_fallback(block, block_index, content_type=content_type)
@@ -283,18 +384,27 @@ class ParentBuilder:
         if not chunks:
             raise ChunkingError(f"Docling emitted no Parent content for {block.id}")
         pieces: list[_ParentPiece] = []
-        for segment_index, chunk in enumerate(chunks):
+        source_cursor = 0
+        for chunk in chunks:
             if self._count(chunk.text) > self._hard_max:
                 raise ChunkingError(
                     f"Docling exceeded the Parent hard limit for {block.id}"
                 )
+            char_from = block.text.find(chunk.text, source_cursor)
+            if char_from < 0:
+                raise ChunkingError(
+                    f"Docling Parent segment cannot be mapped to {block.id}"
+                )
+            char_to = char_from + len(chunk.text)
+            source_cursor = char_to
             pieces.append(
                 _piece_from_block(
                     block,
                     block_index,
                     content_type=content_type,
                     content=chunk.text,
-                    ast_locator=f"#/text_blocks/{block_index}/segments/{segment_index}",
+                    char_from=char_from,
+                    char_to=char_to,
                 )
             )
         return pieces
@@ -303,9 +413,11 @@ class ParentBuilder:
         self, block: CanonicalBlock, block_index: int, *, content_type: str
     ) -> list[_ParentPiece]:
         rows = block.text.splitlines() or [block.text]
+        if content_type == "table":
+            return self._table_row_fallback(block, block_index, rows)
         output: list[_ParentPiece] = []
         current: list[str] = []
-        current_from = 1
+        current_from = 0
 
         def emit(row_to: int) -> None:
             nonlocal current
@@ -318,9 +430,8 @@ class ParentBuilder:
                     block_index,
                     content_type=content_type,
                     content=content,
-                    ast_locator=(
-                        f"#/text_blocks/{block_index}/rows/{current_from}:{row_to}"
-                    ),
+                    char_from=0,
+                    char_to=len(block.text),
                     row_from=current_from,
                     row_to=row_to,
                     oversize_reason=(
@@ -332,22 +443,89 @@ class ParentBuilder:
             )
             current = []
 
-        for row_no, row in enumerate(rows, start=1):
+        for row_index, row in enumerate(rows):
             if not current:
                 current = [row]
-                current_from = row_no
+                current_from = row_index
                 if self._count(row) > self._hard_max:
-                    emit(row_no)
+                    emit(row_index + 1)
                 continue
             candidate = "\n".join((*current, row))
             if self._count(candidate) <= self._hard_max:
                 current.append(row)
                 continue
-            emit(row_no - 1)
+            emit(row_index)
             current = [row]
-            current_from = row_no
+            current_from = row_index
             if self._count(row) > self._hard_max:
-                emit(row_no)
+                emit(row_index + 1)
+        emit(len(rows))
+        return output
+
+    def _table_row_fallback(
+        self,
+        block: CanonicalBlock,
+        block_index: int,
+        rows: Sequence[str],
+    ) -> list[_ParentPiece]:
+        header_row_to = _table_header_row_to(rows)
+        if header_row_to >= len(rows):
+            return [
+                _piece_from_block(
+                    block,
+                    block_index,
+                    content_type="table",
+                    row_from=0,
+                    row_to=len(rows),
+                )
+            ]
+        header = "\n".join(rows[:header_row_to])
+        output: list[_ParentPiece] = []
+        current: list[str] = []
+        current_from = header_row_to
+
+        def emit(row_to: int) -> None:
+            nonlocal current
+            if not current:
+                return
+            content = "\n".join((header, *current))
+            output.append(
+                _piece_from_block(
+                    block,
+                    block_index,
+                    content_type="table",
+                    content=content,
+                    char_from=0,
+                    char_to=len(block.text),
+                    row_from=current_from,
+                    row_to=row_to,
+                    table_header_row_to=header_row_to,
+                    oversize_reason=(
+                        "indivisible_row_exceeds_parent_hard_limit"
+                        if self._count(content) > self._hard_max
+                        else None
+                    ),
+                )
+            )
+            current = []
+
+        for row_index in range(header_row_to, len(rows)):
+            row = rows[row_index]
+            if not current:
+                current = [row]
+                current_from = row_index
+                if self._count("\n".join((header, row))) > self._hard_max:
+                    emit(row_index + 1)
+                continue
+            candidate = "\n".join((header, *current, row))
+            if self._count(candidate) <= self._hard_max:
+                current.append(row)
+                continue
+            emit(row_index)
+            current = [row]
+            current_from = row_index
+            if self._count("\n".join((header, row))) > self._hard_max:
+                emit(row_index + 1)
         emit(len(rows))
         return output
 
@@ -361,9 +539,12 @@ class ParentBuilder:
     ) -> ParentChunk:
         content = _join_piece_content(pieces)
         digest = _sha256(content)
-        locator = _combined_locator(pieces)
+        locator = _locator_for_pieces(pieces, segment_ordinal=ordinal)
         envelope = canonical_ast.envelope
-        chunk_id = f"par_{content_id(envelope.document_version_id, str(ordinal), locator, digest)[:32]}"
+        chunk_id = (
+            "par_"
+            f"{content_id(envelope.document_version_id, str(ordinal), locator.model_dump_json(), digest)[:32]}"
+        )
         content_types = {piece.content_type for piece in pieces}
         return ParentChunk(
             id=chunk_id,
@@ -380,7 +561,11 @@ class ParentBuilder:
             page_to=max(piece.page_to for piece in pieces),
             ast_locator=locator,
             content_hash=digest,
-            row_from=pieces[0].row_from if len(pieces) == 1 else None,
+            row_from=(
+                pieces[0].row_from + 1
+                if len(pieces) == 1 and pieces[0].row_from is not None
+                else None
+            ),
             row_to=pieces[0].row_to if len(pieces) == 1 else None,
             oversize_reason=(pieces[0].oversize_reason if len(pieces) == 1 else None),
         )
@@ -402,16 +587,38 @@ class ChildBuilder:
         )
 
     def build(self, parent: ParentChunk) -> list[ChildChunk]:
-        doc = DoclingDocument(name=parent.id)
-        for level, heading in enumerate(parent.heading_path, start=1):
-            doc.add_heading(text=heading, level=level)
-        doc.add_text(label=DocItemLabel.TEXT, text=parent.content)
-        chunker = HybridChunker(tokenizer=self._tokenizer, merge_peers=True)
+        heading_context = "\n".join(parent.heading_path)
+        if heading_context and self._tokenizer.count_tokens(heading_context) >= (
+            self._tokenizer.get_max_tokens()
+        ):
+            raise ChunkingError(
+                f"heading context exhausts the Child token limit for {parent.id}"
+            )
+        doc = _parent_docling_document(parent)
+        chunker = HybridChunker(
+            tokenizer=self._tokenizer,
+            delim="\n\n",
+            merge_peers=True,
+            repeat_table_header=True,
+            serializer_provider=_StructuredSerializerProvider(),
+        )
         docling_chunks = list(chunker.chunk(doc))
+        if parent.content_type == "list_item":
+            # Semchunk may detach Docling's synthetic Markdown marker from a long
+            # ListItem. It has no Canonical source range; structure remains in the
+            # server-owned content_type while every source token stays in a Child.
+            docling_chunks = [
+                chunk
+                for chunk in docling_chunks
+                if chunk.text.strip() not in {"-", "*", "+"}
+            ]
         if not docling_chunks:
             raise ChunkingError(f"Docling emitted no Child chunks for {parent.id}")
 
         children: list[ChildChunk] = []
+        source_cursor = 0
+        table_row_cursor = 0
+        list_char_cursor = 0
         for ordinal, chunk in enumerate(docling_chunks):
             contextualized = chunker.contextualize(chunk=chunk)
             token_count = self._tokenizer.count_tokens(contextualized)
@@ -419,8 +626,47 @@ class ChildBuilder:
                 raise ChunkingError(
                     f"Docling emitted {token_count} tokens for Child of {parent.id}"
                 )
+            emitted_headings = tuple(getattr(chunk.meta, "headings", None) or ())
+            if parent.heading_path and emitted_headings != parent.heading_path:
+                raise ChunkingError(
+                    f"Docling dropped required heading context for {parent.id}"
+                )
+            if parent.content_type == "table":
+                locator, table_row_cursor = _table_child_locator(
+                    parent,
+                    chunk.text,
+                    ordinal=ordinal,
+                    row_cursor=table_row_cursor,
+                )
+            elif parent.content_type == "list_item":
+                locator, list_char_cursor = _list_child_locator(
+                    parent,
+                    chunk.text,
+                    ordinal=ordinal,
+                    char_cursor=list_char_cursor,
+                )
+            else:
+                char_from = parent.content.find(chunk.text, source_cursor)
+                if char_from < 0:
+                    locator = _formatted_child_locator(
+                        parent,
+                        chunk.text,
+                        ordinal=ordinal,
+                    )
+                else:
+                    char_to = char_from + len(chunk.text)
+                    locator = _clip_locator(
+                        parent.ast_locator,
+                        char_from,
+                        char_to,
+                        segment_ordinal=ordinal,
+                    )
+                    source_cursor = char_to
             digest = _sha256(contextualized)
-            child_id = f"chi_{content_id(parent.document_version_id, parent.id, str(ordinal), digest)[:32]}"
+            child_id = (
+                "chi_"
+                f"{content_id(parent.document_version_id, parent.id, str(ordinal), locator.model_dump_json(), digest)[:32]}"
+            )
             children.append(
                 ChildChunk(
                     id=child_id,
@@ -436,9 +682,9 @@ class ChildBuilder:
                     content=chunk.text,
                     contextualized_content=contextualized,
                     token_count=token_count,
-                    page_from=parent.page_from,
-                    page_to=parent.page_to,
-                    ast_locator=parent.ast_locator,
+                    page_from=min(span.page_from for span in locator.spans),
+                    page_to=max(span.page_to for span in locator.spans),
+                    ast_locator=locator,
                     content_hash=digest,
                 )
             )
@@ -457,6 +703,266 @@ class ChunkingPipeline:
             parent.model_copy(update={"children": tuple(self._children.build(parent))})
             for parent in self._parents.build(canonical_ast)
         ]
+
+
+def resolve_ast_locator(canonical_ast: CanonicalAst, locator: AstLocator) -> str:
+    """Resolve a persisted locator against the Canonical AST, failing closed."""
+
+    resolved: list[str] = []
+    for span in locator.spans:
+        match = re.fullmatch(r"#/text_blocks/(0|[1-9][0-9]*)", span.canonical_path)
+        if match is None:
+            raise ChunkingError(f"invalid Canonical AST path {span.canonical_path!r}")
+        block_index = int(match.group(1))
+        try:
+            block = canonical_ast.text_blocks[block_index]
+        except IndexError as error:
+            raise ChunkingError(
+                f"Canonical AST path is out of range: {span.canonical_path}"
+            ) from error
+        if block.id != span.block_id:
+            raise ChunkingError(
+                f"Canonical AST block identity changed at {span.canonical_path}"
+            )
+        if span.char_to > len(block.text):
+            raise ChunkingError(
+                f"Canonical AST character range exceeds {span.canonical_path}"
+            )
+        if span.row_from is None or span.row_to is None:
+            text = block.text[span.char_from : span.char_to]
+        else:
+            rows = block.text.splitlines() or [block.text]
+            if span.row_to > len(rows):
+                raise ChunkingError(
+                    f"Canonical AST row range exceeds {span.canonical_path}"
+                )
+            selected = list(rows[span.row_from : span.row_to])
+            if span.table_header_row_to:
+                selected = list(rows[: span.table_header_row_to]) + selected
+            text = "\n".join(selected)
+        resolved.append(f"{span.separator_before}{text}")
+    return "".join(resolved)
+
+
+def _parent_docling_document(parent: ParentChunk) -> DoclingDocument:
+    doc = DoclingDocument(name=parent.id)
+    for level, heading in enumerate(parent.heading_path, start=1):
+        doc.add_heading(text=heading, level=level)
+    if parent.content_type == "table":
+        doc.add_table(data=_table_data(parent.content))
+    elif parent.content_type == "list_item":
+        list_group = doc.add_list_group()
+        for span in parent.ast_locator.spans:
+            item = parent.content[span.parent_char_from : span.parent_char_to]
+            doc.add_list_item(text=item, parent=list_group)
+    elif parent.content_type == "code":
+        doc.add_code(text=parent.content)
+    elif parent.content_type == "formula":
+        doc.add_formula(text=parent.content)
+    else:
+        for span in parent.ast_locator.spans:
+            item = parent.content[span.parent_char_from : span.parent_char_to]
+            doc.add_text(label=DocItemLabel.TEXT, text=item)
+    return doc
+
+
+def _table_data(content: str) -> TableData:
+    rows = _table_cells(content)
+    if not rows:
+        raise ChunkingError("table Parent has no rows")
+    column_count = max(len(row) for row in rows)
+    cells: list[TableCell] = []
+    for row_index, row in enumerate(rows):
+        padded = [*row, *([""] * (column_count - len(row)))]
+        for column_index, text in enumerate(padded):
+            cells.append(
+                TableCell(
+                    text=text,
+                    start_row_offset_idx=row_index,
+                    end_row_offset_idx=row_index + 1,
+                    start_col_offset_idx=column_index,
+                    end_col_offset_idx=column_index + 1,
+                    column_header=row_index == 0,
+                )
+            )
+    return TableData(
+        table_cells=cells,
+        num_rows=len(rows),
+        num_cols=column_count,
+    )
+
+
+def _table_cells(content: str) -> list[list[str]]:
+    parsed: list[list[str]] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or _is_markdown_separator(stripped):
+            continue
+        if "|" in stripped:
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        elif "\t" in stripped:
+            cells = [cell.strip() for cell in stripped.split("\t")]
+        else:
+            cells = [stripped]
+        parsed.append(cells)
+    return parsed
+
+
+def _is_markdown_separator(line: str) -> bool:
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+
+def _table_header_row_to(rows: Sequence[str]) -> int:
+    if not rows:
+        return 0
+    if len(rows) > 1 and _is_markdown_separator(rows[1].strip()):
+        return 2
+    return 1
+
+
+def _clip_locator(
+    parent: AstLocator,
+    char_from: int,
+    char_to: int,
+    *,
+    segment_ordinal: int,
+) -> AstLocator:
+    if not 0 <= char_from < char_to <= parent.parent_char_to:
+        raise ChunkingError("Child character range is outside its Parent")
+    spans: list[AstSpan] = []
+    for source in parent.spans:
+        overlap_from = max(char_from, source.parent_char_from)
+        overlap_to = min(char_to, source.parent_char_to)
+        if overlap_from >= overlap_to:
+            continue
+        separator = ""
+        separator_start = source.parent_char_from - len(source.separator_before)
+        if spans and char_from <= separator_start:
+            separator = source.separator_before
+        if source.row_from is None:
+            canonical_from = source.char_from + overlap_from - source.parent_char_from
+            canonical_to = source.char_from + overlap_to - source.parent_char_from
+        else:
+            canonical_from = source.char_from
+            canonical_to = source.char_to
+        spans.append(
+            source.model_copy(
+                update={
+                    "char_from": canonical_from,
+                    "char_to": canonical_to,
+                    "parent_char_from": overlap_from,
+                    "parent_char_to": overlap_to,
+                    "separator_before": separator,
+                }
+            )
+        )
+    if not spans:
+        raise ChunkingError("Child range has no Canonical AST provenance")
+    return AstLocator(
+        spans=tuple(spans),
+        segment_ordinal=segment_ordinal,
+        parent_char_from=char_from,
+        parent_char_to=char_to,
+    )
+
+
+def _table_child_locator(
+    parent: ParentChunk,
+    child_content: str,
+    *,
+    ordinal: int,
+    row_cursor: int,
+) -> tuple[AstLocator, int]:
+    if len(parent.ast_locator.spans) != 1:
+        raise ChunkingError("table Parent must have exactly one Canonical AST span")
+    source = parent.ast_locator.spans[0]
+    if source.row_from is None or source.row_to is None:
+        raise ChunkingError("table Parent is missing row provenance")
+    parent_rows = _table_cells(parent.content)
+    child_rows = _table_cells(child_content)
+    if len(parent_rows) < 2 or len(child_rows) < 2:
+        raise ChunkingError("table Child has no traceable body rows")
+    parent_body = parent_rows[1:]
+    child_body = child_rows[1:]
+    local_start = _find_row_sequence(parent_body, child_body, row_cursor)
+    local_to = local_start + len(child_body)
+    canonical_from = source.row_from + local_start
+    canonical_to = source.row_from + local_to
+    span = source.model_copy(
+        update={
+            "row_from": canonical_from,
+            "row_to": canonical_to,
+            "parent_char_from": _line_offset(parent.content, local_start + 1),
+            "parent_char_to": _line_offset(parent.content, local_to + 1),
+            "separator_before": "",
+        }
+    )
+    locator = AstLocator(
+        spans=(span,),
+        segment_ordinal=ordinal,
+        parent_char_from=span.parent_char_from,
+        parent_char_to=span.parent_char_to,
+    )
+    return locator, local_to
+
+
+def _find_row_sequence(
+    rows: Sequence[Sequence[str]],
+    wanted: Sequence[Sequence[str]],
+    start: int,
+) -> int:
+    normalized = [tuple(cell.strip() for cell in row) for row in rows]
+    target = [tuple(cell.strip() for cell in row) for row in wanted]
+    for index in range(start, len(normalized) - len(target) + 1):
+        if normalized[index : index + len(target)] == target:
+            return index
+    raise ChunkingError("Docling table Child rows cannot be mapped to its Parent")
+
+
+def _line_offset(content: str, line_index: int) -> int:
+    lines = content.splitlines(keepends=True)
+    return min(len(content), sum(len(line) for line in lines[:line_index]))
+
+
+def _list_child_locator(
+    parent: ParentChunk,
+    child_content: str,
+    *,
+    ordinal: int,
+    char_cursor: int,
+) -> tuple[AstLocator, int]:
+    source_content = re.sub(r"(?m)^[*+-]\s+", "", child_content).strip()
+    char_from = parent.content.find(source_content, char_cursor)
+    if char_from < 0:
+        raise ChunkingError("Docling list Child cannot be mapped to its Parent")
+    char_to = char_from + len(source_content)
+    return (
+        _clip_locator(
+            parent.ast_locator,
+            char_from,
+            char_to,
+            segment_ordinal=ordinal,
+        ),
+        char_to,
+    )
+
+
+def _formatted_child_locator(
+    parent: ParentChunk, child_content: str, *, ordinal: int
+) -> AstLocator:
+    unwrapped = child_content
+    if parent.content_type == "code" and child_content.startswith("```\n"):
+        unwrapped = child_content.removeprefix("```\n").removesuffix("\n```")
+    char_from = parent.content.find(unwrapped)
+    if char_from < 0:
+        raise ChunkingError(f"Docling Child cannot be mapped to Parent {parent.id}")
+    return _clip_locator(
+        parent.ast_locator,
+        char_from,
+        char_from + len(unwrapped),
+        segment_ordinal=ordinal,
+    )
 
 
 def _update_heading_path(
@@ -489,21 +995,25 @@ def _piece_from_block(
     *,
     content_type: str,
     content: str | None = None,
-    ast_locator: str | None = None,
+    char_from: int | None = None,
+    char_to: int | None = None,
     row_from: int | None = None,
     row_to: int | None = None,
+    table_header_row_to: int = 0,
     oversize_reason: Literal["indivisible_row_exceeds_parent_hard_limit"] | None = None,
 ) -> _ParentPiece:
     return _ParentPiece(
         content=block.text if content is None else content,
         content_type=content_type,
-        block_from=block_index,
-        block_to=block_index,
         page_from=block.provenance.page_from,
         page_to=block.provenance.page_to,
-        ast_locator=ast_locator or f"#/text_blocks/{block_index}",
+        canonical_path=f"#/text_blocks/{block_index}",
+        block_id=block.id,
+        char_from=0 if char_from is None else char_from,
+        char_to=len(block.text) if char_to is None else char_to,
         row_from=row_from,
         row_to=row_to,
+        table_header_row_to=table_header_row_to,
         oversize_reason=oversize_reason,
     )
 
@@ -512,12 +1022,38 @@ def _join_piece_content(pieces: Sequence[_ParentPiece]) -> str:
     return "\n\n".join(piece.content for piece in pieces)
 
 
-def _combined_locator(pieces: Sequence[_ParentPiece]) -> str:
-    if len(pieces) == 1:
-        return pieces[0].ast_locator
-    first = min(piece.block_from for piece in pieces)
-    last = max(piece.block_to for piece in pieces) + 1
-    return f"#/text_blocks/{first}:{last}"
+def _locator_for_pieces(
+    pieces: Sequence[_ParentPiece], *, segment_ordinal: int
+) -> AstLocator:
+    spans: list[AstSpan] = []
+    cursor = 0
+    for index, piece in enumerate(pieces):
+        separator = "" if index == 0 else "\n\n"
+        parent_from = cursor + len(separator)
+        parent_to = parent_from + len(piece.content)
+        spans.append(
+            AstSpan(
+                canonical_path=piece.canonical_path,
+                block_id=piece.block_id,
+                page_from=piece.page_from,
+                page_to=piece.page_to,
+                char_from=piece.char_from,
+                char_to=piece.char_to,
+                row_from=piece.row_from,
+                row_to=piece.row_to,
+                table_header_row_to=piece.table_header_row_to,
+                parent_char_from=parent_from,
+                parent_char_to=parent_to,
+                separator_before=separator,
+            )
+        )
+        cursor = parent_to
+    return AstLocator(
+        spans=tuple(spans),
+        segment_ordinal=segment_ordinal,
+        parent_char_from=0,
+        parent_char_to=cursor,
+    )
 
 
 def _sha256(content: str) -> str:

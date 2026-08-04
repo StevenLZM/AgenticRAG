@@ -22,8 +22,10 @@ from agentic_rag.ingestion.assembler import (
 )
 from agentic_rag.ingestion.chunker import (
     ChildBuilder,
+    ChunkingError,
     ChunkingPipeline,
     ParentBuilder,
+    resolve_ast_locator,
 )
 
 
@@ -110,7 +112,11 @@ def test_parent_child_ids_are_deterministic_version_scoped_and_traceable() -> No
     assert all(parent.document_version_id == "version-1" for parent in first)
     assert all(parent.user_id == "user-1" for parent in first)
     assert all(parent.document_id == "document-1" for parent in first)
-    assert all(parent.ast_locator.startswith("#/text_blocks/") for parent in first)
+    assert all(
+        span.canonical_path.startswith("#/text_blocks/")
+        for parent in first
+        for span in parent.ast_locator.spans
+    )
     assert all(parent.heading_ast_locators == ("#/text_blocks/0",) for parent in first)
     assert all(parent.page_from <= parent.page_to for parent in first)
     assert all(
@@ -121,11 +127,26 @@ def test_parent_child_ids_are_deterministic_version_scoped_and_traceable() -> No
         child.parent_id == parent.id
         and child.document_version_id == parent.document_version_id
         and child.user_id == parent.user_id
-        and child.page_from == parent.page_from
-        and child.page_to == parent.page_to
-        and child.ast_locator == parent.ast_locator
+        and child.page_from == min(span.page_from for span in child.ast_locator.spans)
+        and child.page_to == max(span.page_to for span in child.ast_locator.spans)
         and child.heading_ast_locators == parent.heading_ast_locators
         and child.content_hash
+        for parent in first
+        for child in parent.children
+    )
+    assert any(
+        (child.page_from, child.page_to) != (parent.page_from, parent.page_to)
+        for parent in first
+        for child in parent.children
+    )
+    child_locators = [
+        child.ast_locator.model_dump_json()
+        for parent in first
+        for child in parent.children
+    ]
+    assert len(child_locators) == len(set(child_locators))
+    assert all(
+        resolve_ast_locator(canonical, child.ast_locator) == child.content
         for parent in first
         for child in parent.children
     )
@@ -155,17 +176,24 @@ def test_parent_builder_targets_section_sized_chunks_without_crossing_headings()
 
 
 def test_parent_builder_uses_row_fallback_for_oversized_structural_atom() -> None:
-    table = "\n".join((_words(0, 1300), _words(1300, 1300)))
+    header = "name | value"
+    first_row = _words(0, 1300)
+    second_row = _words(1300, 1300)
+    table = "\n".join((header, first_row, second_row))
     canonical = _canonical((_block(0, kind="table", text=table),))
 
     parents = ParentBuilder(_tokenizer()).build(canonical)
 
-    assert [parent.token_count for parent in parents] == [1300, 1300]
-    assert [parent.row_from for parent in parents] == [1, 2]
-    assert [parent.row_to for parent in parents] == [1, 2]
+    assert [parent.token_count for parent in parents] == [1303, 1303]
+    assert [parent.row_from for parent in parents] == [2, 3]
+    assert [parent.row_to for parent in parents] == [2, 3]
     assert all(parent.content_type == "table" for parent in parents)
     assert all(parent.oversize_reason is None for parent in parents)
-    assert "\n".join(parent.content for parent in parents) == table
+    assert all(parent.content.startswith(f"{header}\n") for parent in parents)
+    assert [resolve_ast_locator(canonical, parent.ast_locator) for parent in parents] == [
+        f"{header}\n{first_row}",
+        f"{header}\n{second_row}",
+    ]
 
 
 def test_parent_builder_marks_only_an_indivisible_row_over_hard_limit() -> None:
@@ -204,7 +232,10 @@ def test_child_builder_uses_hybrid_chunker_heading_context_without_overlap() -> 
     children = ChildBuilder(_tokenizer()).build(parent)
 
     assert len(children) == 3
-    assert all(child.contextualized_content.startswith("Product\nDesign\n") for child in children)
+    assert all(
+        child.contextualized_content.startswith("Product\n\nDesign\n\n")
+        for child in children
+    )
     assert all(child.token_count <= 384 for child in children)
     body_tokens = [
         token
@@ -213,6 +244,71 @@ def test_child_builder_uses_hybrid_chunker_heading_context_without_overlap() -> 
     ]
     assert body_tokens == [f"w{index}" for index in range(800)]
     assert len(body_tokens) == len(set(body_tokens))
+
+
+def test_child_table_chunks_repeat_header_and_retain_row_locators() -> None:
+    header = "name | value"
+    rows = [f"row{index} | {_words(index * 40, 40)}" for index in range(24)]
+    canonical = _canonical(
+        (_block(0, kind="table", text="\n".join((header, *rows))),)
+    )
+
+    parents = ChunkingPipeline(_tokenizer()).build(canonical)
+    children = [child for parent in parents for child in parent.children]
+
+    assert len(parents) == 1
+    assert len(children) >= 2
+    assert all("name" in child.content and "value" in child.content for child in children)
+    assert len({child.ast_locator.model_dump_json() for child in children}) == len(children)
+    resolved = [resolve_ast_locator(canonical, child.ast_locator) for child in children]
+    assert all(source.startswith(header) for source in resolved)
+    assert all("row" in source for source in resolved)
+
+
+def test_parent_builder_keeps_paragraph_and_list_transitions_separate() -> None:
+    canonical = _canonical(
+        (
+            _block(0, text=_words(0, 500)),
+            _block(1, kind="list_item", text=_words(500, 500)),
+        )
+    )
+
+    parents = ParentBuilder(_tokenizer()).build(canonical)
+
+    assert [parent.content_type for parent in parents] == ["paragraph", "list_item"]
+    assert [resolve_ast_locator(canonical, parent.ast_locator) for parent in parents] == [
+        _words(0, 500),
+        _words(500, 500),
+    ]
+
+
+def test_long_list_item_keeps_docling_list_structure_and_source_ranges() -> None:
+    canonical = _canonical((_block(0, kind="list_item", text=_words(0, 800)),))
+
+    parents = ChunkingPipeline(_tokenizer()).build(canonical)
+    children = parents[0].children
+
+    assert len(children) == 3
+    assert all(child.content_type == "list_item" for child in children)
+    resolved_tokens = [
+        token
+        for child in children
+        for token in resolve_ast_locator(canonical, child.ast_locator).split()
+    ]
+    assert resolved_tokens == [f"w{index}" for index in range(800)]
+
+
+def test_child_builder_fails_closed_when_heading_context_exhausts_limit() -> None:
+    canonical = _canonical(
+        (
+            _block(0, kind="heading", text=_words(0, 384), heading_level=1),
+            _block(1, text="w999"),
+        )
+    )
+    parent = ParentBuilder(_tokenizer()).build(canonical)[0]
+
+    with pytest.raises(ChunkingError, match="heading context"):
+        ChildBuilder(_tokenizer()).build(parent)
 
 
 def test_parent_builder_rejects_an_empty_canonical_document() -> None:
