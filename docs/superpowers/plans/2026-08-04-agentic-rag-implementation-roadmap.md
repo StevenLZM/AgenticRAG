@@ -23,7 +23,8 @@
 - Retrieved documents and Memory are untrusted data and can never override system instructions or Tool schemas.
 - No Token or cost budget routing; Token and estimated cost are observability fields only.
 - Unit tests never require live model APIs. Integration tests requiring local ES, MySQL or Redis use explicit pytest markers and fail with a clear dependency message when selected without the service.
-- Development and evaluation environments install with `python -m pip install -e '.[dev,eval]'`.
+- Development and evaluation environments install with `conda run -n agentic-rag python -m pip install -e '.[dev,eval]'`.
+- Run all commands inside the Conda environment `agentic-rag`; use `conda run -n agentic-rag ...` in non-interactive scripts.
 - Every task follows red-green-refactor, ends with focused tests, and creates one reviewable commit.
 
 ---

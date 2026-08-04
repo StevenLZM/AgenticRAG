@@ -15,6 +15,7 @@
 - Generate IDs in application code with UUID7-compatible sortable strings or deterministic SHA-256 hashes where the design requires idempotency.
 - Never put clients, sessions, embeddings, model objects or large Parent text in Graph state.
 - Local integration tests are marked `integration`; the default unit suite uses fakes and temporary files.
+- Execute every command in Conda environment `agentic-rag`; non-interactive examples use `conda run -n agentic-rag ...`.
 
 ---
 
