@@ -233,6 +233,39 @@ async def test_job_creation_stages_job_and_matching_outbox_in_same_transaction()
     assert outbox_values["aggregate_id"] == job.id
 
 
+@pytest.mark.asyncio
+async def test_outbox_claim_and_retry_leave_transaction_commit_to_the_caller() -> None:
+    """Dispatcher coordination must not silently commit its caller's transaction."""
+    now = datetime.now(UTC)
+    transaction = RecordingSession(
+        rows=[
+            {
+                "id": "outbox-1",
+                "aggregate_type": "query_run",
+                "aggregate_id": "run-1",
+                "stream_name": "agenticrag:jobs:query",
+                "status": "pending",
+                "attempt_count": 0,
+                "next_attempt_at": now,
+                "created_at": now,
+            }
+        ]
+    )
+    repository = SqlAlchemyOutboxRepository(cast(AsyncSession, transaction))
+
+    records = await repository.claim_pending(limit=1)
+    await repository.schedule_retry("outbox-1")
+
+    assert records[0].aggregate_id == "run-1"
+    assert records[0].created_at == now
+    assert transaction.statements[0].get_final_froms()[0].name == "task_outbox"
+    assert transaction.statements[0]._for_update_arg.skip_locked is True
+    assert transaction.statements[1].table.name == "task_outbox"
+    assert "next_attempt_at" in transaction.statements[1].compile().params
+    assert transaction.statements[2].table.name == "task_outbox"
+    assert transaction.commit_called is False
+
+
 @pytest.mark.parametrize(
     ("status", "expected"),
     [

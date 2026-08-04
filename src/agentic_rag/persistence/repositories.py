@@ -311,6 +311,7 @@ TERMINAL_RUN_STATUSES = {
     RunStatus.COMPLETED,
     RunStatus.FAILED,
 }
+OUTBOX_CLAIM_LEASE = timedelta(seconds=30)
 
 
 def _now() -> datetime:
@@ -425,6 +426,7 @@ class OutboxRecord:
     status: str
     attempt_count: int
     next_attempt_at: datetime
+    created_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,7 +532,11 @@ class EventRepository(Protocol):
 class OutboxRepository(Protocol):
     async def list_pending(self, limit: int) -> list[OutboxRecord]: ...
 
+    async def claim_pending(self, limit: int) -> list[OutboxRecord]: ...
+
     async def mark_dispatched(self, outbox_id: str) -> None: ...
+
+    async def schedule_retry(self, outbox_id: str) -> None: ...
 
 
 @runtime_checkable
@@ -1100,15 +1106,20 @@ class SqlAlchemyEventRepository(_SqlAlchemyRepository):
 
 class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
     async def list_pending(self, limit: int) -> list[OutboxRecord]:
+        return await self.claim_pending(limit)
+
+    async def claim_pending(self, limit: int) -> list[OutboxRecord]:
         if limit <= 0:
             return []
+        now = _now()
+        session = self._session()
         rows = (
             (
-                await self._session().execute(
+                await session.execute(
                     select(task_outbox)
                     .where(
                         task_outbox.c.status == "pending",
-                        task_outbox.c.next_attempt_at <= _now(),
+                        task_outbox.c.next_attempt_at <= now,
                     )
                     .order_by(task_outbox.c.next_attempt_at, task_outbox.c.id)
                     .limit(limit)
@@ -1118,6 +1129,15 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
             .mappings()
             .all()
         )
+        if rows:
+            await session.execute(
+                update(task_outbox)
+                .where(
+                    task_outbox.c.id.in_([row["id"] for row in rows]),
+                    task_outbox.c.status == "pending",
+                )
+                .values(next_attempt_at=now + OUTBOX_CLAIM_LEASE)
+            )
         return [
             OutboxRecord(
                 id=row["id"],
@@ -1127,6 +1147,7 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
                 status=row["status"],
                 attempt_count=row["attempt_count"],
                 next_attempt_at=row["next_attempt_at"],
+                created_at=row["created_at"],
             )
             for row in rows
         ]
@@ -1136,6 +1157,16 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
             update(task_outbox)
             .where(task_outbox.c.id == outbox_id, task_outbox.c.status == "pending")
             .values(status="dispatched", dispatched_at=_now())
+        )
+
+    async def schedule_retry(self, outbox_id: str) -> None:
+        await self._session().execute(
+            update(task_outbox)
+            .where(task_outbox.c.id == outbox_id, task_outbox.c.status == "pending")
+            .values(
+                attempt_count=task_outbox.c.attempt_count + 1,
+                next_attempt_at=_now() + timedelta(seconds=5),
+            )
         )
 
 
