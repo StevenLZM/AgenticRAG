@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,11 +39,32 @@ class ArtifactStore(Protocol):
 
 
 class LocalArtifactStore:
-    """Store artifacts beneath one filesystem root using atomic replacement."""
+    """Store artifacts beneath one trusted, exclusively managed root.
+
+    The configured root is a security boundary: it and its descendants must not be
+    mutated by untrusted or same-identity processes while operations are in flight.
+    The constructor rejects a symlink root and, on POSIX, roots not owned by the
+    current user or writable by group/other users. Existing symlink escapes inside
+    the root are also rejected, but path-based operations do not claim protection
+    against a hostile same-owner process racing directory changes.
+    """
 
     def __init__(self, root: Path) -> None:
-        self._root = root.resolve()
-        self._root.mkdir(parents=True, exist_ok=True)
+        requested_root = Path(root)
+        if requested_root.is_symlink():
+            raise ValueError("artifact root must not be a symbolic link")
+        requested_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not requested_root.is_dir():
+            raise ValueError("artifact root must be a directory")
+
+        root_stat = requested_root.stat()
+        getuid = getattr(os, "getuid", None)
+        if getuid is not None and root_stat.st_uid != getuid():
+            raise PermissionError("artifact root must be exclusively managed")
+        if root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise PermissionError("artifact root must be exclusively managed")
+
+        self._root = requested_root.resolve()
 
     def put_json(self, relative_path: str, value: Mapping[str, Any]) -> ArtifactRef:
         encoded = json.dumps(
@@ -91,9 +113,13 @@ class LocalArtifactStore:
 
     def read_json(self, ref: ArtifactRef) -> Any:
         path = self._path_from_ref(ref)
-        if not self.verify(ref):
+        payload = path.read_bytes()
+        if (
+            len(payload) != ref.size_bytes
+            or hashlib.sha256(payload).hexdigest() != ref.sha256
+        ):
             raise ValueError("artifact content does not match its reference")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(payload.decode("utf-8"))
 
     def verify(self, ref: ArtifactRef) -> bool:
         try:

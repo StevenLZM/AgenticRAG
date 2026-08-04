@@ -59,6 +59,26 @@ def test_write_rejects_symlink_escape(tmp_path: Path) -> None:
     assert not (outside / "escape.bin").exists()
 
 
+def test_store_rejects_symlink_as_trusted_root(tmp_path: Path) -> None:
+    managed_root = tmp_path / "managed"
+    managed_root.mkdir()
+    root_alias = tmp_path / "root-alias"
+    root_alias.symlink_to(managed_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must not be a symbolic link"):
+        LocalArtifactStore(root_alias)
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX ownership contract")
+def test_store_rejects_root_writable_by_other_users(tmp_path: Path) -> None:
+    shared_root = tmp_path / "shared"
+    shared_root.mkdir()
+    shared_root.chmod(0o777)
+
+    with pytest.raises(PermissionError, match="exclusively managed"):
+        LocalArtifactStore(shared_root)
+
+
 def test_read_rejects_forged_ref_outside_artifact_root(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path / "artifacts")
     forged_ref = ArtifactRef(
@@ -87,6 +107,24 @@ def test_failed_fsync_preserves_previous_artifact(
 
     assert store.read_json(original) == {"version": 1}
     assert not list((tmp_path / "runs/r1").glob("*.tmp"))
+
+
+def test_read_json_never_returns_replacement_after_old_verification_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    ref = store.put_json("runs/r1/state.json", {"trusted": True})
+    artifact_path = tmp_path / "runs/r1/state.json"
+    original_verify = store.verify
+
+    def verify_then_replace(candidate_ref: ArtifactRef) -> bool:
+        verified = original_verify(candidate_ref)
+        artifact_path.write_bytes(b'{"trusted":false}')
+        return verified
+
+    monkeypatch.setattr(store, "verify", verify_then_replace)
+
+    assert store.read_json(ref) == {"trusted": True}
 
 
 def test_read_json_rejects_invalid_json_without_weakening_verification(
