@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
+from sqlalchemy import CheckConstraint
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +30,7 @@ from agentic_rag.persistence.repositories import (
     SqlAlchemyOutboxRepository,
     SqlAlchemyParentRepository,
     SqlAlchemyRunRepository,
+    agent_runs,
     AgentEvent,
     ActiveRunConflict,
     active_slot_for_status,
@@ -122,7 +124,9 @@ def _run_row(
     }
 
 
-def _event(*, summary: str = "retrieval complete") -> AgentEvent:
+def _event(
+    *, summary: str = "retrieval complete", created_at: datetime | None = None
+) -> AgentEvent:
     return AgentEvent(
         event_key="event-key-1",
         trace_id="trace-1",
@@ -131,6 +135,7 @@ def _event(*, summary: str = "retrieval complete") -> AgentEvent:
         event_type="RETRIEVAL_COMPLETED",
         summary=summary,
         runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        created_at=created_at,
     )
 
 
@@ -146,7 +151,7 @@ def _event_row(event: AgentEvent) -> dict[str, Any]:
         "summary": event.summary,
         "payload_ref": event.payload_ref,
         "runtime_config_snapshot_id": event.runtime_config_snapshot_id,
-        "created_at": datetime.now(UTC),
+        "created_at": event.created_at or datetime.now(UTC),
     }
 
 
@@ -246,6 +251,21 @@ def test_active_slot_tracks_only_non_terminal_run_states(
     assert active_slot_for_status(status) == expected
 
 
+def test_agent_runs_schema_binds_status_to_its_only_valid_active_slot() -> None:
+    """The durable constraint must reject both directions of slot drift."""
+    constraint = next(
+        item
+        for item in agent_runs.constraints
+        if isinstance(item, CheckConstraint) and item.name == "ck_active_slot"
+    )
+
+    assert str(constraint.sqltext) == (
+        "((status IN ('queued','running','cancel_requested') "
+        "AND active_slot IS NOT NULL AND active_slot = 1) "
+        "OR (status IN ('cancelled','completed','failed') AND active_slot IS NULL))"
+    )
+
+
 @pytest.mark.asyncio
 async def test_queued_cancellation_atomically_releases_active_slot() -> None:
     """Cancelling before Claim must not leave an unclaimable active run."""
@@ -336,6 +356,21 @@ async def test_event_key_reuse_with_conflicting_payload_is_rejected() -> None:
     """A deterministic key cannot silently alias two semantic events."""
     existing = _event()
     replay = _event(summary="different summary")
+    transaction = RecordingSession(
+        scripted=[RecordingResult(), RecordingResult([_event_row(existing)])]
+    )
+    repository = SqlAlchemyEventRepository(cast(AsyncSession, transaction))
+
+    with pytest.raises(EventKeyConflict):
+        await repository.append(replay)
+
+
+@pytest.mark.asyncio
+async def test_explicit_event_timestamp_is_part_of_replay_identity() -> None:
+    """Two explicit creation times cannot silently share one event key."""
+    persisted_at = datetime(2026, 8, 5, 10, 0, tzinfo=UTC)
+    existing = _event(created_at=persisted_at)
+    replay = _event(created_at=persisted_at + timedelta(seconds=1))
     transaction = RecordingSession(
         scripted=[RecordingResult(), RecordingResult([_event_row(existing)])]
     )

@@ -228,7 +228,10 @@ def upgrade() -> None:
             name="ck_agent_runs_status",
         ),
         sa.CheckConstraint(
-            "active_slot IS NULL OR active_slot = 1", name="ck_active_slot"
+            "((status IN ('queued','running','cancel_requested') "
+            "AND active_slot IS NOT NULL AND active_slot = 1) "
+            "OR (status IN ('cancelled','completed','failed') AND active_slot IS NULL))",
+            name="ck_active_slot",
         ),
         sa.UniqueConstraint(
             "user_id", "thread_id", "active_slot", name="uq_runs_active_slot"

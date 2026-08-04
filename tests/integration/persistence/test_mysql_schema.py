@@ -295,6 +295,35 @@ async def test_queued_cancel_finalizes_and_allows_next_run(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "active_slot"),
+    [(RunStatus.QUEUED, None), (RunStatus.COMPLETED, 1)],
+)
+async def test_database_rejects_status_active_slot_mismatch(
+    session_factory: async_sessionmaker[AsyncSession],
+    status: RunStatus,
+    active_slot: int | None,
+) -> None:
+    """MySQL itself protects the exclusivity invariant in both directions."""
+    with pytest.raises(IntegrityError):
+        async with session_factory.begin() as transaction:
+            await transaction.execute(
+                insert(agent_runs).values(
+                    id=f"invalid-slot-{status.value}",
+                    user_id="invalid-slot-user",
+                    thread_id=f"thread-{status.value}",
+                    checkpoint_thread_id=f"query:invalid:{status.value}",
+                    status=status.value,
+                    active_slot=active_slot,
+                    attempt_count=0,
+                    runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+                    runtime_config_snapshot=SNAPSHOT.model_dump(mode="json"),
+                    created_at=datetime.now(UTC),
+                )
+            )
+
+
+@pytest.mark.asyncio
 async def test_claim_is_single_winner_and_cancel_requested_is_reclaimable(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -418,6 +447,31 @@ async def test_event_append_is_idempotent_and_rejects_key_conflicts(
                     runtime_config_snapshot_id=event.runtime_config_snapshot_id,
                 )
             )
+        explicit_at = datetime(2026, 8, 5, 10, 0, tzinfo=UTC)
+        timestamped = AgentEvent(
+            event_key="event-key:timestamped",
+            trace_id="trace-1",
+            run_id=run.id,
+            user_id=scope.user_id,
+            event_type="TODO_UPDATED",
+            summary="todo updated",
+            runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+            created_at=explicit_at,
+        )
+        await repository.append(timestamped)
+        with pytest.raises(EventKeyConflict):
+            await repository.append(
+                AgentEvent(
+                    event_key=timestamped.event_key,
+                    trace_id=timestamped.trace_id,
+                    run_id=timestamped.run_id,
+                    user_id=timestamped.user_id,
+                    event_type=timestamped.event_type,
+                    summary=timestamped.summary,
+                    runtime_config_snapshot_id=(timestamped.runtime_config_snapshot_id),
+                    created_at=explicit_at + timedelta(seconds=1),
+                )
+            )
 
 
 @pytest.mark.asyncio
@@ -453,6 +507,60 @@ async def test_outbox_insert_failure_rolls_back_run(
         assert (
             await transaction.execute(
                 select(agent_runs.c.id).where(agent_runs.c.id == run_id)
+            )
+        ).one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_outbox_insert_failure_rolls_back_ingestion_job(
+    session_factory: async_sessionmaker[AsyncSession], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scope = UserScope(user_id="job-rollback-user")
+    duplicate_outbox_id = "00000000-0000-7000-8000-000000000003"
+    job_id = "00000000-0000-7000-8000-000000000004"
+    now = datetime.now(UTC)
+    async with session_factory.begin() as transaction:
+        document, version = await SqlAlchemyDocumentRepository(transaction).create(
+            scope,
+            source_type="text",
+            filename="rollback.txt",
+            mime_type="text/plain",
+            content_hash="b" * 64,
+            parser_version="parser-v1",
+            pipeline_version="pipeline-v1",
+            embedding_version="embedding-v1",
+            index_generation="index-v1",
+        )
+        await transaction.execute(
+            insert(task_outbox).values(
+                id=duplicate_outbox_id,
+                aggregate_type="ingestion_job",
+                aggregate_id="existing-job",
+                stream_name="agenticrag:jobs:ingestion",
+                status="pending",
+                attempt_count=0,
+                next_attempt_at=now,
+                created_at=now,
+            )
+        )
+
+    ids = iter([job_id, duplicate_outbox_id])
+    monkeypatch.setattr(repositories, "new_id", lambda: next(ids))
+    with pytest.raises(IntegrityError):
+        async with session_factory.begin() as transaction:
+            await SqlAlchemyIngestionJobRepository(transaction).create_queued(
+                scope, document.id, version.id
+            )
+
+    async with session_factory() as transaction:
+        assert (
+            await transaction.execute(
+                select(ingestion_jobs.c.id).where(ingestion_jobs.c.id == job_id)
+            )
+        ).one_or_none() is None
+        assert (
+            await transaction.execute(
+                select(task_outbox.c.id).where(task_outbox.c.aggregate_id == job_id)
             )
         ).one_or_none() is None
 

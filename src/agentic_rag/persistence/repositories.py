@@ -207,7 +207,12 @@ agent_runs = Table(
         "status IN ('queued','running','cancel_requested','cancelled','completed','failed')",
         name="ck_agent_runs_status",
     ),
-    CheckConstraint("active_slot IS NULL OR active_slot = 1", name="ck_active_slot"),
+    CheckConstraint(
+        "((status IN ('queued','running','cancel_requested') "
+        "AND active_slot IS NOT NULL AND active_slot = 1) "
+        "OR (status IN ('cancelled','completed','failed') AND active_slot IS NULL))",
+        name="ck_active_slot",
+    ),
     UniqueConstraint("user_id", "thread_id", "active_slot", name="uq_runs_active_slot"),
     Index("ix_runs_status_lease", "status", "lease_expires_at"),
     Index("ix_runs_user_thread_created", "user_id", "thread_id", "created_at"),
@@ -310,6 +315,13 @@ TERMINAL_RUN_STATUSES = {
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _mysql_datetime(value: datetime) -> datetime:
+    """Normalize an explicit timestamp to MySQL DATETIME's UTC-naive form."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def active_slot_for_status(status: RunStatus) -> int | None:
@@ -1055,7 +1067,10 @@ class SqlAlchemyEventRepository(_SqlAlchemyRepository):
             row["payload_ref"],
             row["runtime_config_snapshot_id"],
         )
-        if actual != expected:
+        timestamp_conflicts = event.created_at is not None and _mysql_datetime(
+            row["created_at"]
+        ) != _mysql_datetime(event.created_at)
+        if actual != expected or timestamp_conflicts:
             raise EventKeyConflict(event.event_key)
         return cast(int, row["id"])
 
