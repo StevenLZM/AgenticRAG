@@ -37,6 +37,8 @@ class ArtifactStore(Protocol):
 
     def verify(self, ref: ArtifactRef) -> bool: ...
 
+    def delete(self, ref: ArtifactRef) -> None: ...
+
 
 class LocalArtifactStore:
     """Store artifacts beneath one trusted, exclusively managed root.
@@ -128,6 +130,10 @@ class LocalArtifactStore:
         except (FileNotFoundError, IsADirectoryError, OSError, ValueError):
             return False
         return sha256 == ref.sha256 and size_bytes == ref.size_bytes
+
+    def delete(self, ref: ArtifactRef) -> None:
+        """Delete exactly one referenced artifact, if it still exists."""
+        self._path_from_ref(ref).unlink(missing_ok=True)
 
     def _path_from_ref(self, ref: ArtifactRef) -> Path:
         if not ref.uri.startswith(_ARTIFACT_URI_PREFIX):

@@ -22,6 +22,17 @@ def test_artifact_write_is_content_verified(tmp_path: Path) -> None:
     assert store.read_json(ref) == {"evidence_ids": ["e1"]}
 
 
+def test_artifact_delete_removes_only_the_referenced_object(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    probe = store.put_json("_health/probe.json", {"status": "checking"})
+    durable = store.put_json("runs/r1/evidence.json", {"evidence_ids": ["e1"]})
+
+    store.delete(probe)
+
+    assert not store.verify(probe)
+    assert store.read_json(durable) == {"evidence_ids": ["e1"]}
+
+
 def test_verify_detects_content_and_size_mismatch(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     ref = store.put_bytes("runs/r1/payload.bin", b"trusted")
