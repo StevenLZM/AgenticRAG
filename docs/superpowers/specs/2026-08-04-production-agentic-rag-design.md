@@ -804,6 +804,12 @@ reranker_version
 retrieval_config_version
 index_generation
 memory_config_version
+max_research_rounds
+max_answer_revisions
+query_run_timeout_seconds
+max_evidence_tokens
+research_context_soft_limit_tokens
+max_parallel_subagents_per_run
 ```
 
 Prompt 使用仓库内版本化文件并记录内容 Hash；模型响应同时记录服务端实际返回的 Model ID。运行恢复、审计重放和离线评测都使用该快照解释结果。V1 不建设独立配置中心。
@@ -1179,7 +1185,7 @@ flowchart LR
   "reference_parent_ids": ["parent_1"],
   "expected_route": "fast_rag",
   "tags": ["single_hop", "pdf"],
-  "runtime_config_snapshot_id": "baseline_v1"
+  "baseline_label": "baseline_v1"
 }
 ```
 
