@@ -1,0 +1,74 @@
+[
+  {
+    "envelope": {
+      "document_id": "doc-1",
+      "document_version_id": "ver-1",
+      "user_id": "user-1",
+      "source_type": "pdf",
+      "source_uri": "artifact://documents/user-1/doc-1/ver-1/source/report.pdf",
+      "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parser_version": "docling-v1",
+      "pipeline_version": "ingestion-v1",
+      "created_at": "2026-08-05T00:00:00Z"
+    },
+    "batch_no": 1,
+    "page_from": 1,
+    "page_to": 1,
+    "docling_document": {
+      "schema_name": "DoclingDocument",
+      "version": "1.0.0",
+      "name": "report",
+      "blocks": [
+        {
+          "self_ref": "#/texts/0",
+          "label": "text",
+          "text": "完整的跨",
+          "continues_on_next": true,
+          "prov": [{"page_no": 1, "bbox": {"l": 50, "t": 780, "r": 550, "b": 760}}]
+        },
+        {
+          "self_ref": "#/texts/1",
+          "label": "page_footer",
+          "text": "CONFIDENTIAL",
+          "prov": [{"page_no": 1, "bbox": {"l": 50, "t": 20, "r": 550, "b": 5}}]
+        }
+      ]
+    }
+  },
+  {
+    "envelope": {
+      "document_id": "doc-1",
+      "document_version_id": "ver-1",
+      "user_id": "user-1",
+      "source_type": "pdf",
+      "source_uri": "artifact://documents/user-1/doc-1/ver-1/source/report.pdf",
+      "content_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parser_version": "docling-v1",
+      "pipeline_version": "ingestion-v1",
+      "created_at": "2026-08-05T00:00:00Z"
+    },
+    "batch_no": 2,
+    "page_from": 2,
+    "page_to": 2,
+    "docling_document": {
+      "schema_name": "DoclingDocument",
+      "version": "1.0.0",
+      "name": "report",
+      "blocks": [
+        {
+          "self_ref": "#/texts/2",
+          "label": "text",
+          "text": "页段落",
+          "continued_from_previous": true,
+          "prov": [{"page_no": 2, "bbox": {"l": 50, "t": 800, "r": 550, "b": 780}}]
+        },
+        {
+          "self_ref": "#/texts/3",
+          "label": "page_footer",
+          "text": "CONFIDENTIAL",
+          "prov": [{"page_no": 2, "bbox": {"l": 50, "t": 20, "r": 550, "b": 5}}]
+        }
+      ]
+    }
+  }
+]
