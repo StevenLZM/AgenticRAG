@@ -234,6 +234,42 @@ def test_row_fallback_children_resolve_exact_ordered_source_segments(
     assert len({(span.char_from, span.char_to) for span in spans}) == len(spans)
 
 
+@pytest.mark.parametrize("kind", ["code", "other"])
+def test_multiline_row_fallback_children_narrow_to_intersecting_rows(
+    kind: Literal["code", "other"],
+) -> None:
+    lines = [
+        f"{'ERROR ' if kind == 'other' and index == 0 else ''}{_words(index * 220, 220)}"
+        for index in range(15)
+    ]
+    source = "\n".join(lines)
+    canonical = _canonical((_block(0, kind=kind, text=source),))
+
+    parents = ChunkingPipeline(_tokenizer()).build(canonical)
+    children = [child for parent in parents for child in parent.children]
+    spans = [child.ast_locator.spans[0] for child in children]
+
+    assert len(parents) >= 2
+    assert " ".join(
+        resolve_ast_locator(canonical, child.ast_locator) for child in children
+    ).split() == source.split()
+    for child, span in zip(children, spans, strict=True):
+        intersected = [
+            row_index
+            for row_index, (char_from, char_to) in enumerate(_line_ranges(source))
+            if max(span.char_from, char_from) < min(span.char_to, char_to)
+        ]
+        assert span.row_from == min(intersected)
+        assert span.row_to == max(intersected) + 1
+        assert source[span.char_from : span.char_to] == resolve_ast_locator(
+            canonical, child.ast_locator
+        )
+    assert all(
+        (previous.row_from, previous.row_to) <= (current.row_from, current.row_to)
+        for previous, current in zip(spans, spans[1:], strict=False)
+    )
+
+
 def test_parent_builder_uses_docling_semantic_split_for_large_paragraph() -> None:
     canonical = _canonical((_block(0, text=_words(0, 4000)),))
 
@@ -311,6 +347,26 @@ def test_header_only_and_single_body_row_tables_remain_traceable(table: str) -> 
     assert resolve_ast_locator(canonical, children[0].ast_locator) == table
 
 
+@pytest.mark.parametrize("with_separator", [False, True])
+def test_oversized_header_only_table_fails_closed_at_child_limit(
+    with_separator: bool,
+) -> None:
+    header = " | ".join(f"w{index}" for index in range(500))
+    table = f"{header}\n{'--- | ' * 499}---" if with_separator else header
+    canonical = _canonical((_block(0, kind="table", text=table),))
+
+    with pytest.raises(ChunkingError, match="header-only table exceeds Child limit"):
+        ChunkingPipeline(_tokenizer()).build(canonical)
+
+
+def test_header_only_table_over_parent_hard_limit_fails_closed() -> None:
+    header = " | ".join(f"w{index}" for index in range(2500))
+    canonical = _canonical((_block(0, kind="table", text=header),))
+
+    with pytest.raises(ChunkingError, match="header-only table exceeds Parent hard limit"):
+        ChunkingPipeline(_tokenizer()).build(canonical)
+
+
 def test_markdown_table_separator_uses_exact_raw_body_offsets() -> None:
     header = "name | value"
     separator = "--- | ---"
@@ -381,3 +437,13 @@ def test_child_builder_fails_closed_when_heading_context_exhausts_limit() -> Non
 def test_parent_builder_rejects_an_empty_canonical_document() -> None:
     with pytest.raises(ValueError, match="at least one content block"):
         ParentBuilder(_tokenizer()).build(_canonical(()))
+
+
+def _line_ranges(content: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for line in content.splitlines(keepends=True):
+        text_length = len(line.rstrip("\r\n"))
+        ranges.append((cursor, cursor + text_length))
+        cursor += len(line)
+    return ranges

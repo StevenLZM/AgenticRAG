@@ -356,6 +356,25 @@ class ParentBuilder:
     ) -> list[_ParentPiece]:
         content_type = _content_type(block)
         token_count = self._count(block.text)
+        if content_type == "table":
+            rows = block.text.splitlines() or [block.text]
+            header_row_to = _table_header_row_to(rows)
+            if header_row_to >= len(rows):
+                if token_count > self._hard_max:
+                    raise ChunkingError(
+                        f"header-only table exceeds Parent hard limit for {block.id}"
+                    )
+                if token_count > CHILD_MAX_TOKENS:
+                    raise ChunkingError(
+                        f"header-only table exceeds Child limit for {block.id}"
+                    )
+                return [
+                    _piece_from_block(
+                        block,
+                        block_index,
+                        content_type=content_type,
+                    )
+                ]
         if token_count <= self._hard_max:
             if content_type == "table":
                 rows = block.text.splitlines() or [block.text]
@@ -490,15 +509,9 @@ class ParentBuilder:
     ) -> list[_ParentPiece]:
         header_row_to = _table_header_row_to(rows)
         if header_row_to >= len(rows):
-            return [
-                _piece_from_block(
-                    block,
-                    block_index,
-                    content_type="table",
-                    row_from=0,
-                    row_to=len(rows),
-                )
-            ]
+            raise ChunkingError(
+                f"header-only table cannot use row fallback for {block.id}"
+            )
         header = "\n".join(rows[:header_row_to])
         output: list[_ParentPiece] = []
         current: list[str] = []
@@ -642,6 +655,14 @@ class ChildBuilder:
             docling_chunks = [
                 chunk for chunk in docling_chunks if chunk.text.strip() != "```"
             ]
+        if (
+            parent.content_type == "table"
+            and parent.ast_locator.spans[0].row_from is None
+            and len(docling_chunks) > 1
+        ):
+            raise ChunkingError(
+                f"header-only table cannot be mapped across multiple Children for {parent.id}"
+            )
         if not docling_chunks:
             raise ChunkingError(f"Docling emitted no Child chunks for {parent.id}")
 
@@ -691,6 +712,7 @@ class ChildBuilder:
                         char_from,
                         char_to,
                         segment_ordinal=ordinal,
+                        parent_content=parent.content,
                     )
                     source_cursor = char_to
             digest = _sha256(contextualized)
@@ -880,6 +902,7 @@ def _clip_locator(
     char_to: int,
     *,
     segment_ordinal: int,
+    parent_content: str,
 ) -> AstLocator:
     if not 0 <= char_from < char_to <= parent.parent_char_to:
         raise ChunkingError("Child character range is outside its Parent")
@@ -895,11 +918,28 @@ def _clip_locator(
             separator = source.separator_before
         canonical_from = source.char_from + overlap_from - source.parent_char_from
         canonical_to = source.char_from + overlap_to - source.parent_char_from
+        row_from = source.row_from
+        row_to = source.row_to
+        if (
+            row_from is not None
+            and row_to is not None
+            and source.table_header_row_to == 0
+        ):
+            row_from, row_to = _intersecting_row_range(
+                parent_content[
+                    source.parent_char_from : source.parent_char_to
+                ],
+                overlap_from - source.parent_char_from,
+                overlap_to - source.parent_char_from,
+                base_row=row_from,
+            )
         spans.append(
             source.model_copy(
                 update={
                     "char_from": canonical_from,
                     "char_to": canonical_to,
+                    "row_from": row_from,
+                    "row_to": row_to,
                     "parent_char_from": overlap_from,
                     "parent_char_to": overlap_to,
                     "separator_before": separator,
@@ -994,6 +1034,36 @@ def _raw_row_char_range(content: str, row_from: int, row_to: int) -> tuple[int, 
     return char_from, char_to
 
 
+def _intersecting_row_range(
+    content: str,
+    char_from: int,
+    char_to: int,
+    *,
+    base_row: int,
+) -> tuple[int, int]:
+    """Return rows with at least one non-newline source character in the Child.
+
+    The returned range is half-open. A Child beginning or ending inside a row
+    includes that row; blank physical rows between two intersected rows remain
+    structurally covered by the outer half-open range.
+    """
+
+    if not 0 <= char_from < char_to <= len(content):
+        raise ChunkingError("Child row intersection is outside its Parent span")
+    intersected: list[int] = []
+    cursor = 0
+    for row_index, line in enumerate(content.splitlines(keepends=True) or [content]):
+        source_length = len(line.rstrip("\r\n"))
+        line_from = cursor
+        line_to = cursor + source_length
+        if max(char_from, line_from) < min(char_to, line_to):
+            intersected.append(row_index)
+        cursor += len(line)
+    if not intersected:
+        raise ChunkingError("Child source contains no row characters")
+    return base_row + min(intersected), base_row + max(intersected) + 1
+
+
 def _list_child_locator(
     parent: ParentChunk,
     child_content: str,
@@ -1012,6 +1082,7 @@ def _list_child_locator(
             char_from,
             char_to,
             segment_ordinal=ordinal,
+            parent_content=parent.content,
         ),
         char_to,
     )
@@ -1038,6 +1109,7 @@ def _formatted_child_locator(
             char_from,
             char_to,
             segment_ordinal=ordinal,
+            parent_content=parent.content,
         ),
         char_to,
     )
