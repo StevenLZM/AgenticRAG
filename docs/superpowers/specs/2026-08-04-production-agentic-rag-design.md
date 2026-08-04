@@ -18,7 +18,7 @@
 - 强制证据、忠实度和引用审核；
 - Checkpoint 恢复、幂等重放、有限重试和降级；
 - 原始消息、Tool Event 和审核事件审计；
-- 离线 RAG 与 AgentLoop 评测。
+- 请求内审核、在线质量监控与离线 RAG/AgentLoop 基准评测。
 
 系统遵循三层职责边界：
 
@@ -40,7 +40,7 @@
 - 使用 Docling 统一文档解析结果并建立 Canonical AST。
 - 使用 mem0ai 作为长期记忆实现，不复制或重写 Mem0 核心。
 - 使用 Redis Streams 实现简单、可恢复的本地摄取任务队列。
-- 提供可复现的离线检索、生成和 AgentLoop 评测。
+- 提供请求内质量保护、在线运行指标与反馈，以及可复现的离线检索、生成和 AgentLoop 评测。
 
 ### 2.2 V1 非目标
 
@@ -578,6 +578,7 @@ CITATION_VALIDATED
 CONTEXT_COMPACTED
 NODE_RETRIED
 COMPONENT_DEGRADED
+USER_FEEDBACK
 ```
 
 V1 不为每类事件建立独立表。大 Payload 写入本地 Artifact，事件表只保存摘要与引用。
@@ -794,6 +795,7 @@ GET    /v1/ingestion-jobs/{job_id}
 DELETE /v1/documents/{document_id}
 GET    /v1/memories
 DELETE /v1/memories/{memory_id}
+POST   /v1/feedback
 ```
 
 约束：
@@ -802,6 +804,7 @@ DELETE /v1/memories/{memory_id}
 - `thread_id` 可由服务生成。
 - 用户范围由 API 注入，Agent 不能覆盖。
 - `/v1/query` 只返回审核后的最终答案，不流式输出未审核草稿。
+- `/v1/feedback` 接收 `run_id`、`rating: up | down` 和可选 `comment`；服务端校验 Run 属于当前 `user_id` 后写入 `USER_FEEDBACK` Event。
 - 文档删除使 MySQL Parent 与 ES Child 失效。长期记忆不保存文档证据，因此通过独立 Memory API 管理。
 
 ## 16. 推荐代码结构
@@ -844,9 +847,46 @@ scripts/
 
 按业务能力分包，不建立复杂 DDD、插件框架或多仓库结构。
 
-## 17. RAG 与 Agent 评测
+## 17. 三层质量评测体系
 
-评测作为独立离线 Eval Runner，不放入线上 QueryGraph。
+生产质量闭环分为三层，职责不能混用：
+
+| 层次 | 执行时机 | 责任 |
+|---|---|---|
+| 请求内强制审核 | 每次线上请求 | 阻止无证据、幻觉或无效引用答案返回 |
+| 在线质量监控与反馈 | 每次线上请求 | 发现真实流量异常、退化和用户不满意 |
+| 离线基准评测 | 发布前或人工触发 | 使用固定数据集可复现地比较系统版本 |
+
+三层形成闭环：请求内审核保护单次回答，线上失败和反馈补充离线数据集，离线回归验证修复后再发布。
+
+### 17.1 请求内审核
+
+Evidence Grader、Faithfulness Audit 和 Citation Validator 是 QueryGraph 的固定质量门禁，定义见第 12 节。它们属于运行时 Guardrail，不用于比较不同版本的整体质量。
+
+### 17.2 在线质量监控与反馈
+
+每次请求基于 `agent_runs` 和 `agent_events` 记录：
+
+```text
+请求总延迟与节点延迟
+路由类型
+检索轮数
+拒答与澄清率
+审核失败与答案修正率
+Loop 上限触发率
+Dense / BM25 / Reranker 降级率
+引用有效率
+用户数据泄漏数
+用户正向与负向反馈
+```
+
+V1 不为这些指标建设独立实时平台；通过 MySQL 审计数据进行查询和汇总。用户反馈通过 `/v1/feedback` 写入现有 `agent_events`，不新增反馈表。
+
+V1 不对每个线上请求同步或异步运行完整 Ragas。线上问题通常没有参考答案，而且额外 LLM Judge 会增加延迟、非确定性和敏感数据处理范围。真实流量增加后，才考虑脱敏后的异步抽样语义评测。
+
+### 17.3 离线基准 Eval Runner
+
+离线评测不放入线上 QueryGraph，而是通过独立 Runner 调用真实 QueryGraph：
 
 ```mermaid
 flowchart LR
@@ -858,7 +898,7 @@ flowchart LR
     RAGAS --> REP
 ```
 
-### 17.1 数据集
+### 17.4 离线数据集
 
 ```json
 {
@@ -874,7 +914,7 @@ flowchart LR
 
 V1 使用人工整理的小规模高质量数据集，不使用自动测试集生成。
 
-### 17.2 指标
+### 17.5 离线指标
 
 确定性检索指标：
 
@@ -893,7 +933,7 @@ Answer Relevancy
 Context Precision
 ```
 
-AgentLoop 运行指标：
+离线 AgentLoop 运行指标：
 
 ```text
 average_retrieval_rounds
@@ -902,7 +942,7 @@ loop_limit_hit_rate
 
 不使用严格 Tool Call Sequence Accuracy，因为同一研究任务可能存在多条正确 Tool 路径。
 
-### 17.3 硬门禁
+### 17.6 线上与离线硬门禁
 
 ```text
 user_leak_count = 0
@@ -910,7 +950,7 @@ user_leak_count = 0
 未通过审核的答案返回数 = 0
 ```
 
-首次运行建立其他指标的基线；后续发布比较相对回归，不在设计阶段拍脑袋设置全部阈值。
+硬门禁在线请求和离线回归都必须满足。首次运行建立其他指标的基线；后续发布比较相对回归，不在设计阶段拍脑袋设置全部阈值。
 
 ## 18. 测试策略
 
@@ -948,6 +988,8 @@ user_leak_count = 0
 
 - 所有日志包含 `trace_id`、`run_id`、`thread_id`、`user_id` 和 `node_name`。
 - 原始用户消息、最终回答和 Tool Event 写入 MySQL。
+- 在线质量指标从 `agent_runs` 与 `agent_events` 汇总，不在请求路径中额外调用 LLM Judge。
+- 用户反馈与对应 `run_id` 关联，负向反馈用于补充离线失败用例。
 - 不保存隐藏 Chain-of-Thought 或模型内部推理 Token。
 - 敏感值和密钥在日志及事件 Payload 中脱敏。
 - V1 使用结构化应用日志和 MySQL 审计，不引入独立可观测性平台。
@@ -966,7 +1008,8 @@ user_leak_count = 0
 8. Checkpoint 恢复不会因节点重放产生重复 Parent、Child 或 Event。
 9. Redis 重复投递和 Worker 崩溃不会丢失摄取任务。
 10. mem0ai 故障可降级，审核与核心检索故障 Fail Closed。
-11. 离线评测输出检索、语义和 AgentLoop 指标，用户泄漏数始终为零。
+11. 在线监控记录质量与运行指标，用户反馈可追溯到 Run。
+12. 离线评测输出检索、语义和 AgentLoop 指标，用户泄漏数始终为零。
 
 ## 21. 后续迭代边界
 
@@ -976,7 +1019,7 @@ user_leak_count = 0
 - Redis 查询缓存或 Embedding 缓存；
 - 完整认证、RBAC 与知识库级权限；
 - 人工确认 UI；
-- 在线评测与评测结果数据库；
+- 脱敏后的线上异步 Ragas 抽样、A/B 实验与独立评测结果平台；
 - 更复杂的 Memory 遗忘和衰减策略；
 - 流式进度事件；
 - Kubernetes、微服务和自动扩缩容。
