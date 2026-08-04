@@ -39,6 +39,13 @@ class UploadRejectedError(ValueError):
         self.decision = decision
 
 
+class UploadTooLargeError(ValueError):
+    """Raised before scanning or persistence when a byte limit is exceeded."""
+
+    def __init__(self) -> None:
+        super().__init__("upload exceeds configured size limit")
+
+
 class DocumentService:
     """Coordinate artifact durability with one caller-owned MySQL transaction."""
 
@@ -51,13 +58,17 @@ class DocumentService:
         documents: DocumentRepository,
         jobs: IngestionJobRepository,
         versions: UploadVersions,
+        max_upload_bytes: int,
     ) -> None:
+        if max_upload_bytes <= 0:
+            raise ValueError("maximum upload size must be positive")
         self._scanner = scanner
         self._artifacts = artifacts
         self._session_factory = session_factory
         self._documents = documents
         self._jobs = jobs
         self._versions = versions
+        self._max_upload_bytes = max_upload_bytes
 
     async def create_upload(
         self,
@@ -66,6 +77,8 @@ class DocumentService:
         declared_mime: str,
         content: bytes,
     ) -> IngestionJob:
+        if len(content) > self._max_upload_bytes:
+            raise UploadTooLargeError()
         decision = await asyncio.to_thread(
             self._scanner.scan, filename, declared_mime, content
         )

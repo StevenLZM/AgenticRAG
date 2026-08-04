@@ -9,7 +9,11 @@ from pydantic import BaseModel
 
 from agentic_rag.api.errors import ApiException
 from agentic_rag.domain.models import JobStatus, UserScope
-from agentic_rag.ingestion.models import DocumentService, UploadRejectedError
+from agentic_rag.ingestion.models import (
+    DocumentService,
+    UploadRejectedError,
+    UploadTooLargeError,
+)
 from agentic_rag.persistence.repositories import IngestionJob
 
 
@@ -30,6 +34,7 @@ class IngestionJobResponse(BaseModel):
 
 
 documents_router = APIRouter(prefix="/v1", tags=["documents"])
+_UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 
 
 def _request_service(request: Request) -> tuple[DocumentService, UserScope]:
@@ -38,6 +43,18 @@ def _request_service(request: Request) -> tuple[DocumentService, UserScope]:
         container.document_service,
         UserScope(user_id=container.settings.default_user_id),
     )
+
+
+async def _read_bounded_upload(file: UploadFile, max_upload_bytes: int) -> bytes:
+    payload = bytearray()
+    while True:
+        remaining = max_upload_bytes - len(payload)
+        chunk = await file.read(min(_UPLOAD_READ_CHUNK_BYTES, remaining + 1))
+        if not chunk:
+            return bytes(payload)
+        if len(chunk) > remaining:
+            raise UploadTooLargeError()
+        payload.extend(chunk)
 
 
 @documents_router.post(
@@ -50,14 +67,23 @@ async def create_document(
     file: Annotated[UploadFile, File(description="PDF, UTF-8 text, or Excel file")],
 ) -> IngestionJobResponse:
     service, scope = _request_service(request)
-    content = await file.read()
     try:
+        content = await _read_bounded_upload(
+            file, request.app.state.container.settings.max_upload_bytes
+        )
         job = await service.create_upload(
             scope,
             filename=file.filename or "",
             declared_mime=file.content_type or "application/octet-stream",
             content=content,
         )
+    except UploadTooLargeError as error:
+        raise ApiException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            error_code="UPLOAD_TOO_LARGE",
+            message="The uploaded file exceeds the allowed size.",
+            retryable=False,
+        ) from error
     except UploadRejectedError as error:
         raise ApiException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,

@@ -75,11 +75,14 @@ def build_container(settings: Settings) -> AppContainer:
     )
     repositories = Repositories(create_session_factory(mysql_engine))
     document_service = DocumentService(
-        scanner=DefaultUploadSafetyScanner(),
+        scanner=DefaultUploadSafetyScanner(
+            max_upload_bytes=settings.max_upload_bytes
+        ),
         artifacts=artifacts,
         session_factory=repositories.session_factory,
         documents=SqlAlchemyDocumentRepository(),
         jobs=SqlAlchemyIngestionJobRepository(),
+        max_upload_bytes=settings.max_upload_bytes,
         versions=UploadVersions(
             parser=settings.parser_version,
             pipeline=settings.ingestion_pipeline_version,

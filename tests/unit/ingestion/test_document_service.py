@@ -40,8 +40,10 @@ class FakeArtifactStore:
 class FixedScanner:
     def __init__(self, status: UploadSafetyStatus) -> None:
         self.status = status
+        self.calls: list[bytes] = []
 
     def scan(self, filename: str, declared_mime: str, content: bytes) -> UploadDecision:
+        self.calls.append(content)
         return UploadDecision(
             status=self.status,
             detected_mime="text/plain",
@@ -149,22 +151,28 @@ class ServiceFixture:
     sessions: FakeSessionFactory
     documents: FakeDocuments
     jobs: FakeJobs
+    scanner: FixedScanner
 
 
 def _service(
-    status: UploadSafetyStatus, *, fail_commit: bool = False
+    status: UploadSafetyStatus,
+    *,
+    fail_commit: bool = False,
+    max_upload_bytes: int = 50 * 1024 * 1024,
 ) -> ServiceFixture:
     artifacts = FakeArtifactStore()
     sessions = FakeSessionFactory(fail_commit=fail_commit)
     documents = FakeDocuments()
     jobs = FakeJobs()
+    scanner = FixedScanner(status)
     return ServiceFixture(
         service=DocumentService(
-            scanner=FixedScanner(status),
+            scanner=scanner,
             artifacts=artifacts,
             session_factory=sessions,  # type: ignore[arg-type]
             documents=documents,  # type: ignore[arg-type]
             jobs=jobs,  # type: ignore[arg-type]
+            max_upload_bytes=max_upload_bytes,
             versions=UploadVersions(
                 parser="parser-v1",
                 pipeline="pipeline-v1",
@@ -176,6 +184,7 @@ def _service(
         sessions=sessions,
         documents=documents,
         jobs=jobs,
+        scanner=scanner,
     )
 
 
@@ -258,3 +267,18 @@ async def test_job_reads_and_document_deletes_are_user_scoped() -> None:
     assert await fixture.service.delete_document(scope, "owned-document") is True
     assert await fixture.service.delete_document(scope, "missing-document") is False
     assert all(call[1] == scope for call in fixture.documents.deleted)
+
+
+async def test_service_rejects_oversize_content_before_scanning_or_persistence() -> None:
+    """A non-HTTP caller must not bypass the configured byte limit."""
+    fixture = _service(UploadSafetyStatus.ACCEPTED, max_upload_bytes=4)
+
+    with pytest.raises(ValueError, match="upload exceeds configured size limit"):
+        await fixture.service.create_upload(
+            UserScope(user_id="user-1"), "notes.txt", "text/plain", b"12345"
+        )
+
+    assert fixture.artifacts.puts == []
+    assert fixture.documents.created == []
+    assert fixture.jobs.created == []
+    assert fixture.scanner.calls == []

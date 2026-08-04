@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from agentic_rag.config import Settings
 
 
@@ -14,3 +17,14 @@ def test_settings_use_local_defaults(monkeypatch):
     assert settings.embedding_dimensions == 1024
     assert settings.query_worker_count == 1
     assert settings.ingestion_worker_count == 1
+    assert settings.max_upload_bytes == 50 * 1024 * 1024
+
+
+def test_upload_size_limit_must_be_positive() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            mysql_dsn="mysql+asyncmy://rag:rag@127.0.0.1/rag",
+            deepseek_base_url="https://models.example.invalid/v1",
+            qwen_embedding_base_url="https://embeddings.example.invalid/v1",
+            max_upload_bytes=0,
+        )

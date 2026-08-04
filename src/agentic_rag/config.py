@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     research_context_soft_limit_tokens: int = 16_000
     query_worker_count: Literal[1] = 1
     ingestion_worker_count: Literal[1] = 1
+    max_upload_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        gt=0,
+        le=1024 * 1024 * 1024,
+    )
     parser_version: str = "docling-v1"
     ingestion_pipeline_version: str = "ingestion-v1"
     index_generation: str = "index-v1"

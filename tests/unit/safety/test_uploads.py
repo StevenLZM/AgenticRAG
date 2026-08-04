@@ -19,7 +19,7 @@ def scanner() -> DefaultUploadSafetyScanner:
     return DefaultUploadSafetyScanner()
 
 
-def _xlsx_bytes() -> bytes:
+def _xlsx_bytes(*, extra_entries: dict[str, bytes | str] | None = None) -> bytes:
     payload = BytesIO()
     with ZipFile(payload, "w", ZIP_DEFLATED) as workbook:
         workbook.writestr(
@@ -27,6 +27,15 @@ def _xlsx_bytes() -> bytes:
             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
         )
         workbook.writestr("xl/workbook.xml", "<workbook/>")
+        for name, value in (extra_entries or {}).items():
+            workbook.writestr(name, value)
+    return payload.getvalue()
+
+
+def _zip_bytes() -> bytes:
+    payload = BytesIO()
+    with ZipFile(payload, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("payload.txt", "nested archive")
     return payload.getvalue()
 
 
@@ -142,6 +151,71 @@ def test_arbitrary_zip_is_not_accepted_as_an_excel_workbook(
 
 
 @pytest.mark.parametrize(
+    "member_name",
+    [
+        r"xl\..\payload.dat",
+        r"C:\payload.dat",
+        "C:/payload.dat",
+        "/xl/payload.dat",
+        "xl/./payload.dat",
+        "xl//payload.dat",
+    ],
+)
+def test_xlsx_rejects_host_independent_unsafe_member_paths(
+    scanner: DefaultUploadSafetyScanner, member_name: str
+) -> None:
+    """POSIX-only path checks must not admit Windows or ambiguous ZIP paths."""
+    workbook = _xlsx_bytes(extra_entries={member_name: b"payload"})
+
+    decision = scanner.scan(
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        workbook,
+    )
+
+    assert decision.status is UploadSafetyStatus.REJECTED
+    assert decision.detected_mime == "application/zip"
+
+
+def test_xlsx_rejects_nested_zip_disguised_with_non_archive_suffix(
+    scanner: DefaultUploadSafetyScanner,
+) -> None:
+    workbook = _xlsx_bytes(
+        extra_entries={"xl/worksheets/innocent-looking.xml": _zip_bytes()}
+    )
+
+    decision = scanner.scan(
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        workbook,
+    )
+
+    assert decision.status is UploadSafetyStatus.REJECTED
+    assert decision.detected_mime == "application/zip"
+    assert "unsupported_container" in decision.reasons
+
+
+def test_xlsx_rejects_archives_above_the_configured_entry_count() -> None:
+    scanner = DefaultUploadSafetyScanner(max_xlsx_entries=4)
+    workbook = _xlsx_bytes(
+        extra_entries={
+            "xl/worksheets/sheet1.xml": "<sheet/>",
+            "xl/styles.xml": "<styles/>",
+            "docProps/core.xml": "<properties/>",
+        }
+    )
+
+    decision = scanner.scan(
+        "ledger.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        workbook,
+    )
+
+    assert decision.status is UploadSafetyStatus.REJECTED
+    assert decision.detected_mime == "application/zip"
+
+
+@pytest.mark.parametrize(
     ("content", "reason"),
     [
         ("visible\u200bhidden".encode(), "invisible_unicode"),
@@ -166,3 +240,13 @@ def test_empty_or_non_utf8_text_is_rejected(
     decision = scanner.scan("notes.txt", "text/plain", content)
 
     assert decision.status is UploadSafetyStatus.REJECTED
+
+
+def test_scanner_rejects_content_above_its_configured_byte_limit() -> None:
+    """Direct scanner callers must not bypass the HTTP upload-size policy."""
+    scanner = DefaultUploadSafetyScanner(max_upload_bytes=4)
+
+    decision = scanner.scan("notes.txt", "text/plain", b"12345")
+
+    assert decision.status is UploadSafetyStatus.REJECTED
+    assert "file_too_large" in decision.reasons
