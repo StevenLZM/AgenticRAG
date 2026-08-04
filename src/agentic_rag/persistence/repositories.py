@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast, runtime_checkable
@@ -1106,7 +1107,24 @@ class SqlAlchemyEventRepository(_SqlAlchemyRepository):
 
 class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
     async def list_pending(self, limit: int) -> list[OutboxRecord]:
-        return await self.claim_pending(limit)
+        if limit <= 0:
+            return []
+        rows = (
+            (
+                await self._session().execute(
+                    select(task_outbox)
+                    .where(
+                        task_outbox.c.status == "pending",
+                        task_outbox.c.next_attempt_at <= _now(),
+                    )
+                    .order_by(task_outbox.c.next_attempt_at, task_outbox.c.id)
+                    .limit(limit)
+                )
+            )
+            .mappings()
+            .all()
+        )
+        return _outbox_records(rows)
 
     async def claim_pending(self, limit: int) -> list[OutboxRecord]:
         if limit <= 0:
@@ -1138,19 +1156,7 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
                 )
                 .values(next_attempt_at=now + OUTBOX_CLAIM_LEASE)
             )
-        return [
-            OutboxRecord(
-                id=row["id"],
-                aggregate_type=row["aggregate_type"],
-                aggregate_id=row["aggregate_id"],
-                stream_name=row["stream_name"],
-                status=row["status"],
-                attempt_count=row["attempt_count"],
-                next_attempt_at=row["next_attempt_at"],
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        return _outbox_records(rows)
 
     async def mark_dispatched(self, outbox_id: str) -> None:
         await self._session().execute(
@@ -1168,6 +1174,22 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
                 next_attempt_at=_now() + timedelta(seconds=5),
             )
         )
+
+
+def _outbox_records(rows: Sequence[Any]) -> list[OutboxRecord]:
+    return [
+        OutboxRecord(
+            id=row["id"],
+            aggregate_type=row["aggregate_type"],
+            aggregate_id=row["aggregate_id"],
+            stream_name=row["stream_name"],
+            status=row["status"],
+            attempt_count=row["attempt_count"],
+            next_attempt_at=row["next_attempt_at"],
+            created_at=row["created_at"],
+        )
+        for row in rows
+    ]
 
 
 class SqlAlchemyMemoryTombstoneRepository(_SqlAlchemyRepository):

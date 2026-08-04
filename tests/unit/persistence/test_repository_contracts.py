@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentic_rag.domain.models import JobStatus, RunStatus, UserScope
 from agentic_rag.persistence.mysql import create_mysql_engine, create_session_factory
+from agentic_rag.persistence.redis_queue import StreamMessage
 from agentic_rag.persistence.repositories import (
     DocumentRepository,
     EventKeyConflict,
@@ -264,6 +265,83 @@ async def test_outbox_claim_and_retry_leave_transaction_commit_to_the_caller() -
     assert "next_attempt_at" in transaction.statements[1].compile().params
     assert transaction.statements[2].table.name == "task_outbox"
     assert transaction.commit_called is False
+
+
+@pytest.mark.asyncio
+async def test_list_pending_does_not_claim_or_lease_outbox_rows() -> None:
+    """Read-only queue inspection must not delay a due row's dispatch."""
+    now = datetime.now(UTC)
+    transaction = RecordingSession(
+        rows=[
+            {
+                "id": "outbox-1",
+                "aggregate_type": "query_run",
+                "aggregate_id": "run-1",
+                "stream_name": "agenticrag:jobs:query",
+                "status": "pending",
+                "attempt_count": 0,
+                "next_attempt_at": now,
+                "created_at": now,
+            }
+        ]
+    )
+    repository = SqlAlchemyOutboxRepository(cast(AsyncSession, transaction))
+
+    records = await repository.list_pending(limit=1)
+
+    assert [record.id for record in records] == ["outbox-1"]
+    assert len(transaction.statements) == 1
+    assert transaction.statements[0]._for_update_arg is None
+    assert transaction.commit_called is False
+
+
+class AckRecordingBroker:
+    def __init__(self, transaction: RecordingSession) -> None:
+        self._transaction = transaction
+        self.ack_statement_counts: list[int] = []
+
+    async def ack(self, stream: str, group: str, message_id: str) -> None:
+        self.ack_statement_counts.append(len(self._transaction.statements))
+
+
+async def _claim_run_then_ack(
+    repository: SqlAlchemyRunRepository,
+    broker: AckRecordingBroker,
+    message: StreamMessage,
+) -> bool:
+    claimed = await repository.claim(message.aggregate_id, "worker-1", lease_seconds=30)
+    if claimed is None:
+        return False
+    await broker.ack("agenticrag:jobs:query", "workers", message.id)
+    return True
+
+
+@pytest.mark.asyncio
+async def test_worker_acks_only_after_durable_repository_claim() -> None:
+    """A rejected durable Claim leaves the Redis message pending for another worker."""
+    message = StreamMessage("1-0", "run-1", datetime.now(UTC))
+    rejected_transaction = RecordingSession(scripted=[RecordingResult(rowcount=0)])
+    rejected_broker = AckRecordingBroker(rejected_transaction)
+    rejected_repository = SqlAlchemyRunRepository(
+        cast(AsyncSession, rejected_transaction)
+    )
+
+    assert not await _claim_run_then_ack(
+        rejected_repository, rejected_broker, message
+    )
+    assert rejected_broker.ack_statement_counts == []
+
+    claimed_transaction = RecordingSession(
+        scripted=[
+            RecordingResult(rowcount=1),
+            RecordingResult([_run_row(status=RunStatus.RUNNING, attempt_count=1)]),
+        ]
+    )
+    claimed_broker = AckRecordingBroker(claimed_transaction)
+    claimed_repository = SqlAlchemyRunRepository(cast(AsyncSession, claimed_transaction))
+
+    assert await _claim_run_then_ack(claimed_repository, claimed_broker, message)
+    assert claimed_broker.ack_statement_counts == [2]
 
 
 @pytest.mark.parametrize(

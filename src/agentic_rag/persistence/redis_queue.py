@@ -115,8 +115,8 @@ def _read_messages(entries: list[Any]) -> list[StreamMessage]:
 def _message(message_id: Any, fields: dict[Any, Any]) -> StreamMessage:
     return StreamMessage(
         id=_text(message_id),
-        aggregate_id=_text(fields["aggregate_id"]),
-        enqueued_at=datetime.fromisoformat(_text(fields["enqueued_at"])),
+        aggregate_id=_text(_field(fields, "aggregate_id")),
+        enqueued_at=datetime.fromisoformat(_text(_field(fields, "enqueued_at"))),
     )
 
 
@@ -128,3 +128,9 @@ def _format_timestamp(value: datetime) -> str:
 
 def _text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _field(fields: dict[Any, Any], name: str) -> Any:
+    if name in fields:
+        return fields[name]
+    return fields[name.encode()]

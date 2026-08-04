@@ -33,7 +33,7 @@ expecting the missing claim-lease update statement.
 - `OutboxRepository` now exposes `claim_pending` and `schedule_retry`. The
   SQLAlchemy adapter claims with `SELECT ... FOR UPDATE SKIP LOCKED` plus the
   lease update under the caller-owned transaction; it intentionally does not
-  call `commit()`. `list_pending` remains as a compatibility alias.
+  call `commit()`. `list_pending` remains a read-only compatibility query.
 
 ## Changed files
 
@@ -84,3 +84,52 @@ stream message. Consumers must claim/process the aggregate durably before
 calling `ack`; the broker exposes the aggregate ID specifically for that fence.
 Callers must commit or roll back the session after `dispatch_once`; this task
 intentionally preserves Task 3's no-auto-commit repository rule.
+
+## Fix round 1
+
+### Review fixes
+
+- `RedisStreamsBroker` now accepts both redis-py decoded (`str`) stream fields
+  and its default byte (`bytes`) stream fields in `consume` and `reclaim`.
+  Focused tests exercise both response shapes.
+- `OutboxRepository.list_pending` is restored as a side-effect-free due-row
+  query. It does not lock rows or move `next_attempt_at`; only
+  `claim_pending`, used by the dispatcher, creates the caller-owned lock and
+  30-second lease.
+- The durable acknowledgement test now calls the Task 3
+  `SqlAlchemyRunRepository.claim` boundary. A rejected claim records no ACK;
+  a successful claim performs its durable update/read before the ACK recorder
+  observes acknowledgement. This replaces the previous in-memory set as the
+  safety assertion.
+
+### Fix-round TDD evidence
+
+The new byte/string and read-only-list tests were run before production edits:
+
+```text
+conda run -n agentic-rag pytest tests/unit/persistence/test_redis_queue.py \
+  tests/unit/persistence/test_repository_contracts.py::test_list_pending_does_not_claim_or_lease_outbox_rows -q
+
+2 failed, 1 passed
+KeyError: 'aggregate_id'  # byte-keyed Redis fields
+assert 2 == 1             # list_pending performed a lease update
+```
+
+### Fix-round verification
+
+```text
+conda run -n agentic-rag ruff check src tests
+All checks passed!
+
+conda run -n agentic-rag mypy src/agentic_rag/persistence --ignore-missing-imports
+Success: no issues found in 5 source files
+
+conda run -n agentic-rag pytest -q
+34 passed, 13 skipped in 0.21s
+
+conda run -n agentic-rag pytest -m integration tests/integration/persistence/test_redis_streams.py -q
+1 skipped in 0.02s
+```
+
+The explicit loopback-only `AGENTIC_RAG_TEST_REDIS_DSN` gate remains unchanged;
+no Redis instance was started for this fix round.

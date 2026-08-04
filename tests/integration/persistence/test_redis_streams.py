@@ -30,10 +30,8 @@ def _local_redis_dsn() -> str:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_duplicate_aggregate_delivery_is_acknowledged_after_processing_claim() -> (
-    None
-):
-    """A redelivery retains its aggregate ID until a durable worker claim can fence it."""
+async def test_duplicate_aggregate_delivery_retains_the_aggregate_id() -> None:
+    """A worker can use the stable aggregate ID to fence duplicate deliveries."""
     client = Redis.from_url(_local_redis_dsn(), decode_responses=True)
     suffix = uuid4().hex
     stream = f"agenticrag:test:jobs:{suffix}"
@@ -54,11 +52,8 @@ async def test_duplicate_aggregate_delivery_is_acknowledged_after_processing_cla
         delivered = await broker.consume(stream, "workers", "worker-a", block_ms=100)
         assert [message.aggregate_id for message in delivered] == ["run-1", "run-1"]
 
-        durable_claims: set[str] = set()
         for message in delivered:
-            durable_claims.add(message.aggregate_id)
             await broker.ack(stream, "workers", message.id)
-        assert durable_claims == {"run-1"}
 
         await broker.publish(stream, "run-2", enqueued_at)
         pending = await broker.consume(stream, "workers", "worker-a", block_ms=100)
