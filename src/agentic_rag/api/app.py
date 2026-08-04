@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from agentic_rag.api.errors import register_error_handlers
 from agentic_rag.api.health import health_router
+from agentic_rag.api.documents import documents_router
 from agentic_rag.bootstrap import build_container
 from agentic_rag.config import Settings
 
@@ -27,5 +28,6 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="Agentic RAG", version="0.1.0", lifespan=lifespan)
     app.state.container = container
     app.include_router(health_router)
+    app.include_router(documents_router)
     register_error_handlers(app)
     return app

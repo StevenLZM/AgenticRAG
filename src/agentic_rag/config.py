@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     research_context_soft_limit_tokens: int = 16_000
     query_worker_count: Literal[1] = 1
     ingestion_worker_count: Literal[1] = 1
+    parser_version: str = "docling-v1"
+    ingestion_pipeline_version: str = "ingestion-v1"
+    index_generation: str = "index-v1"
     query_checkpoint_path: Path = Path("var/query_checkpoints.sqlite")
     ingestion_checkpoint_path: Path = Path("var/ingestion_checkpoints.sqlite")
     artifact_root: Path = Path("var/artifacts")

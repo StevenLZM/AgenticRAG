@@ -11,7 +11,12 @@ from sqlalchemy import CheckConstraint
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agentic_rag.domain.models import JobStatus, RunStatus, UserScope
+from agentic_rag.domain.models import (
+    DocumentVersionStatus,
+    JobStatus,
+    RunStatus,
+    UserScope,
+)
 from agentic_rag.persistence.mysql import create_mysql_engine, create_session_factory
 from agentic_rag.persistence.redis_queue import StreamMessage
 from agentic_rag.persistence.repositories import (
@@ -232,6 +237,72 @@ async def test_job_creation_stages_job_and_matching_outbox_in_same_transaction()
     outbox_values = transaction.statements[1].compile().params
     assert outbox_values["aggregate_type"] == "ingestion_job"
     assert outbox_values["aggregate_id"] == job.id
+
+
+@pytest.mark.asyncio
+async def test_quarantined_job_still_stages_matching_outbox_for_atomic_audit() -> None:
+    """Dropping the outbox for quarantined input would violate atomic job creation."""
+    transaction = RecordingSession()
+    repository = SqlAlchemyIngestionJobRepository()
+
+    job = await repository.create(
+        scope=UserScope(user_id="user-1"),
+        document_id="document-1",
+        document_version_id="version-1",
+        status=JobStatus.QUARANTINED,
+        transaction=cast(AsyncSession, transaction),
+    )
+
+    assert job.status is JobStatus.QUARANTINED
+    assert _statement_tables(transaction) == ["ingestion_jobs", "task_outbox"]
+    assert transaction.statements[0].compile().params["status"] == "quarantined"
+    assert transaction.statements[1].compile().params["aggregate_id"] == job.id
+
+
+@pytest.mark.asyncio
+async def test_document_create_accepts_preallocated_ids_and_quarantine_status() -> None:
+    """Generating IDs in the repository would prevent a traceable pre-transaction artifact."""
+    transaction = RecordingSession()
+
+    document, version = await SqlAlchemyDocumentRepository().create(
+        UserScope(user_id="user-1"),
+        source_type="text",
+        filename="notes.txt",
+        mime_type="text/plain",
+        content_hash="a" * 64,
+        parser_version="parser-v1",
+        pipeline_version="pipeline-v1",
+        embedding_version="embedding-v1",
+        index_generation="index-v1",
+        document_id="document-1",
+        document_version_id="version-1",
+        version_status=DocumentVersionStatus.QUARANTINED,
+        transaction=cast(AsyncSession, transaction),
+    )
+
+    assert document.id == "document-1"
+    assert version.id == "version-1"
+    assert version.status is DocumentVersionStatus.QUARANTINED
+    assert transaction.statements[1].compile().params["status"] == "quarantined"
+
+
+@pytest.mark.asyncio
+async def test_document_soft_delete_is_scoped_and_clears_active_version() -> None:
+    """An unscoped delete could hide another user's document."""
+    transaction = RecordingSession(scripted=[RecordingResult(rowcount=1)])
+
+    deleted = await SqlAlchemyDocumentRepository().soft_delete(
+        "document-1",
+        UserScope(user_id="user-1"),
+        transaction=cast(AsyncSession, transaction),
+    )
+
+    assert deleted is True
+    statement = transaction.statements[0]
+    params = statement.compile().params
+    assert params["status"] == "deleted"
+    assert params["active_version_id"] is None
+    assert "documents.user_id" in str(statement.whereclause)
 
 
 @pytest.mark.asyncio

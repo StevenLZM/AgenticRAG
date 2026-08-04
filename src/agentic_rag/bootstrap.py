@@ -11,10 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from agentic_rag.api.health import ReadinessChecks, build_readiness_checks
 from agentic_rag.config import Settings
+from agentic_rag.ingestion.models import DocumentService, UploadVersions
 from agentic_rag.persistence.artifacts import ArtifactStore, LocalArtifactStore
 from agentic_rag.persistence.checkpoint import CheckpointBackend
 from agentic_rag.persistence.mysql import create_mysql_engine, create_session_factory
 from agentic_rag.persistence.redis_queue import RedisStreamsBroker, StreamBroker
+from agentic_rag.persistence.repositories import (
+    SqlAlchemyDocumentRepository,
+    SqlAlchemyIngestionJobRepository,
+)
+from agentic_rag.safety.uploads import DefaultUploadSafetyScanner
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +41,7 @@ class AppContainer:
     checkpoints: CheckpointBackend
     elasticsearch: AsyncElasticsearch
     readiness_checks: ReadinessChecks
+    document_service: DocumentService
     mysql_engine: AsyncEngine
     redis: Redis
     reranker_initialized: bool
@@ -66,14 +73,29 @@ def build_container(settings: Settings) -> AppContainer:
         checkpoints=checkpoints,
         reranker_initialized=reranker_initialized,
     )
+    repositories = Repositories(create_session_factory(mysql_engine))
+    document_service = DocumentService(
+        scanner=DefaultUploadSafetyScanner(),
+        artifacts=artifacts,
+        session_factory=repositories.session_factory,
+        documents=SqlAlchemyDocumentRepository(),
+        jobs=SqlAlchemyIngestionJobRepository(),
+        versions=UploadVersions(
+            parser=settings.parser_version,
+            pipeline=settings.ingestion_pipeline_version,
+            embedding=settings.embedding_model,
+            index_generation=settings.index_generation,
+        ),
+    )
     return AppContainer(
         settings=settings,
-        repositories=Repositories(create_session_factory(mysql_engine)),
+        repositories=repositories,
         broker=RedisStreamsBroker(redis),
         artifacts=artifacts,
         checkpoints=checkpoints,
         elasticsearch=elasticsearch,
         readiness_checks=readiness_checks,
+        document_service=document_service,
         mysql_engine=mysql_engine,
         redis=redis,
         reranker_initialized=reranker_initialized,

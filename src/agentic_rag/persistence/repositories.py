@@ -481,6 +481,16 @@ class RunRepository(Protocol):
 
 @runtime_checkable
 class IngestionJobRepository(Protocol):
+    async def create(
+        self,
+        scope: UserScope,
+        document_id: str,
+        document_version_id: str,
+        *,
+        status: JobStatus,
+        transaction: AsyncSession | None = None,
+    ) -> IngestionJob: ...
+
     async def create_queued(
         self,
         scope: UserScope,
@@ -490,7 +500,13 @@ class IngestionJobRepository(Protocol):
         transaction: AsyncSession | None = None,
     ) -> IngestionJob: ...
 
-    async def get(self, job_id: str, scope: UserScope) -> IngestionJob | None: ...
+    async def get(
+        self,
+        job_id: str,
+        scope: UserScope,
+        *,
+        transaction: AsyncSession | None = None,
+    ) -> IngestionJob | None: ...
 
 
 @runtime_checkable
@@ -507,10 +523,21 @@ class DocumentRepository(Protocol):
         pipeline_version: str,
         embedding_version: str,
         index_generation: str,
+        document_id: str | None = None,
+        document_version_id: str | None = None,
+        version_status: DocumentVersionStatus = DocumentVersionStatus.UPLOADED,
         transaction: AsyncSession | None = None,
     ) -> tuple[Document, DocumentVersion]: ...
 
     async def get(self, document_id: str, scope: UserScope) -> Document | None: ...
+
+    async def soft_delete(
+        self,
+        document_id: str,
+        scope: UserScope,
+        *,
+        transaction: AsyncSession | None = None,
+    ) -> bool: ...
 
 
 @runtime_checkable
@@ -843,12 +870,13 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
 
 
 class SqlAlchemyIngestionJobRepository(_SqlAlchemyRepository):
-    async def create_queued(
+    async def create(
         self,
         scope: UserScope,
         document_id: str,
         document_version_id: str,
         *,
+        status: JobStatus,
         transaction: AsyncSession | None = None,
     ) -> IngestionJob:
         session = self._session(transaction)
@@ -858,7 +886,7 @@ class SqlAlchemyIngestionJobRepository(_SqlAlchemyRepository):
             user_id=scope.user_id,
             document_id=document_id,
             document_version_id=document_version_id,
-            status=JobStatus.QUEUED,
+            status=status,
         )
         await session.execute(
             insert(ingestion_jobs).values(
@@ -886,10 +914,32 @@ class SqlAlchemyIngestionJobRepository(_SqlAlchemyRepository):
         )
         return job
 
-    async def get(self, job_id: str, scope: UserScope) -> IngestionJob | None:
+    async def create_queued(
+        self,
+        scope: UserScope,
+        document_id: str,
+        document_version_id: str,
+        *,
+        transaction: AsyncSession | None = None,
+    ) -> IngestionJob:
+        return await self.create(
+            scope,
+            document_id,
+            document_version_id,
+            status=JobStatus.QUEUED,
+            transaction=transaction,
+        )
+
+    async def get(
+        self,
+        job_id: str,
+        scope: UserScope,
+        *,
+        transaction: AsyncSession | None = None,
+    ) -> IngestionJob | None:
         row = (
             (
-                await self._session().execute(
+                await self._session(transaction).execute(
                     select(ingestion_jobs).where(
                         ingestion_jobs.c.id == job_id,
                         ingestion_jobs.c.user_id == scope.user_id,
@@ -923,21 +973,24 @@ class SqlAlchemyDocumentRepository(_SqlAlchemyRepository):
         pipeline_version: str,
         embedding_version: str,
         index_generation: str,
+        document_id: str | None = None,
+        document_version_id: str | None = None,
+        version_status: DocumentVersionStatus = DocumentVersionStatus.UPLOADED,
         transaction: AsyncSession | None = None,
     ) -> tuple[Document, DocumentVersion]:
         session = self._session(transaction)
         now = _now()
         document = Document(
-            id=new_id(),
+            id=document_id or new_id(),
             user_id=scope.user_id,
             status=DocumentStatus.PROCESSING,
             active_version_id=None,
         )
         version = DocumentVersion(
-            id=new_id(),
+            id=document_version_id or new_id(),
             document_id=document.id,
             version_no=1,
-            status=DocumentVersionStatus.UPLOADED,
+            status=version_status,
         )
         await session.execute(
             insert(documents).values(
@@ -969,6 +1022,28 @@ class SqlAlchemyDocumentRepository(_SqlAlchemyRepository):
             )
         )
         return document, version
+
+    async def soft_delete(
+        self,
+        document_id: str,
+        scope: UserScope,
+        *,
+        transaction: AsyncSession | None = None,
+    ) -> bool:
+        result = await self._session(transaction).execute(
+            update(documents)
+            .where(
+                documents.c.id == document_id,
+                documents.c.user_id == scope.user_id,
+                documents.c.status != DocumentStatus.DELETED.value,
+            )
+            .values(
+                status=DocumentStatus.DELETED.value,
+                active_version_id=None,
+                updated_at=_now(),
+            )
+        )
+        return cast(CursorResult[Any], result).rowcount == 1
 
     async def get(self, document_id: str, scope: UserScope) -> Document | None:
         row = (

@@ -20,6 +20,7 @@ dependencies = [
   "orjson",
   "pydantic>=2",
   "pydantic-settings",
+  "python-multipart",
   "redis",
   "sentence-transformers",
   "sqlalchemy[asyncio]>=2",
