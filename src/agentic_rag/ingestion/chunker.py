@@ -196,6 +196,14 @@ class _ParentPiece:
     oversize_reason: Literal["indivisible_row_exceeds_parent_hard_limit"] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ParsedTableRow:
+    cells: tuple[str, ...]
+    raw_index: int
+    char_from: int
+    char_to: int
+
+
 class _LimitedTokenizer(BaseTokenizer):
     """Docling tokenizer view with a narrower maximum token window."""
 
@@ -353,11 +361,18 @@ class ParentBuilder:
                 rows = block.text.splitlines() or [block.text]
                 header_row_to = _table_header_row_to(rows)
                 if header_row_to < len(rows):
+                    char_from, char_to = _raw_row_char_range(
+                        block.text,
+                        header_row_to,
+                        len(rows),
+                    )
                     return [
                         _piece_from_block(
                             block,
                             block_index,
                             content_type=content_type,
+                            char_from=char_from,
+                            char_to=char_to,
                             row_from=header_row_to,
                             row_to=len(rows),
                             table_header_row_to=header_row_to,
@@ -424,14 +439,19 @@ class ParentBuilder:
             if not current:
                 return
             content = "\n".join(current)
+            char_from, char_to = _raw_row_char_range(
+                block.text,
+                current_from,
+                row_to,
+            )
             output.append(
                 _piece_from_block(
                     block,
                     block_index,
                     content_type=content_type,
                     content=content,
-                    char_from=0,
-                    char_to=len(block.text),
+                    char_from=char_from,
+                    char_to=char_to,
                     row_from=current_from,
                     row_to=row_to,
                     oversize_reason=(
@@ -489,14 +509,19 @@ class ParentBuilder:
             if not current:
                 return
             content = "\n".join((header, *current))
+            char_from, char_to = _raw_row_char_range(
+                block.text,
+                current_from,
+                row_to,
+            )
             output.append(
                 _piece_from_block(
                     block,
                     block_index,
                     content_type="table",
                     content=content,
-                    char_from=0,
-                    char_to=len(block.text),
+                    char_from=char_from,
+                    char_to=char_to,
                     row_from=current_from,
                     row_to=row_to,
                     table_header_row_to=header_row_to,
@@ -612,6 +637,11 @@ class ChildBuilder:
                 for chunk in docling_chunks
                 if chunk.text.strip() not in {"-", "*", "+"}
             ]
+        elif parent.content_type == "code":
+            # Markdown code fences are serializer syntax, not Canonical source.
+            docling_chunks = [
+                chunk for chunk in docling_chunks if chunk.text.strip() != "```"
+            ]
         if not docling_chunks:
             raise ChunkingError(f"Docling emitted no Child chunks for {parent.id}")
 
@@ -648,10 +678,11 @@ class ChildBuilder:
             else:
                 char_from = parent.content.find(chunk.text, source_cursor)
                 if char_from < 0:
-                    locator = _formatted_child_locator(
+                    locator, source_cursor = _formatted_child_locator(
                         parent,
                         chunk.text,
                         ordinal=ordinal,
+                        char_cursor=source_cursor,
                     )
                 else:
                     char_to = char_from + len(chunk.text)
@@ -728,7 +759,11 @@ def resolve_ast_locator(canonical_ast: CanonicalAst, locator: AstLocator) -> str
             raise ChunkingError(
                 f"Canonical AST character range exceeds {span.canonical_path}"
             )
-        if span.row_from is None or span.row_to is None:
+        if (
+            span.row_from is None
+            or span.row_to is None
+            or span.table_header_row_to == 0
+        ):
             text = block.text[span.char_from : span.char_to]
         else:
             rows = block.text.splitlines() or [block.text]
@@ -793,10 +828,18 @@ def _table_data(content: str) -> TableData:
 
 
 def _table_cells(content: str) -> list[list[str]]:
-    parsed: list[list[str]] = []
-    for line in content.splitlines():
+    return [list(row.cells) for row in _table_layout(content)]
+
+
+def _table_layout(content: str) -> list[_ParsedTableRow]:
+    parsed: list[_ParsedTableRow] = []
+    lines = content.splitlines(keepends=True) or [content]
+    cursor = 0
+    for raw_index, raw_line in enumerate(lines):
+        line = raw_line.rstrip("\r\n")
         stripped = line.strip()
         if not stripped or _is_markdown_separator(stripped):
+            cursor += len(raw_line)
             continue
         if "|" in stripped:
             cells = [cell.strip() for cell in stripped.strip("|").split("|")]
@@ -804,7 +847,17 @@ def _table_cells(content: str) -> list[list[str]]:
             cells = [cell.strip() for cell in stripped.split("\t")]
         else:
             cells = [stripped]
-        parsed.append(cells)
+        leading = len(line) - len(line.lstrip())
+        trailing = len(line.rstrip())
+        parsed.append(
+            _ParsedTableRow(
+                cells=tuple(cells),
+                raw_index=raw_index,
+                char_from=cursor + leading,
+                char_to=cursor + trailing,
+            )
+        )
+        cursor += len(raw_line)
     return parsed
 
 
@@ -840,12 +893,8 @@ def _clip_locator(
         separator_start = source.parent_char_from - len(source.separator_before)
         if spans and char_from <= separator_start:
             separator = source.separator_before
-        if source.row_from is None:
-            canonical_from = source.char_from + overlap_from - source.parent_char_from
-            canonical_to = source.char_from + overlap_to - source.parent_char_from
-        else:
-            canonical_from = source.char_from
-            canonical_to = source.char_to
+        canonical_from = source.char_from + overlap_from - source.parent_char_from
+        canonical_to = source.char_from + overlap_to - source.parent_char_from
         spans.append(
             source.model_copy(
                 update={
@@ -878,23 +927,38 @@ def _table_child_locator(
         raise ChunkingError("table Parent must have exactly one Canonical AST span")
     source = parent.ast_locator.spans[0]
     if source.row_from is None or source.row_to is None:
-        raise ChunkingError("table Parent is missing row provenance")
-    parent_rows = _table_cells(parent.content)
-    child_rows = _table_cells(child_content)
-    if len(parent_rows) < 2 or len(child_rows) < 2:
+        locator = AstLocator(
+            spans=(source.model_copy(update={"separator_before": ""}),),
+            segment_ordinal=ordinal,
+            parent_char_from=source.parent_char_from,
+            parent_char_to=source.parent_char_to,
+        )
+        return locator, row_cursor
+    parent_layout = _table_layout(parent.content)
+    child_layout = _table_layout(child_content)
+    if len(parent_layout) < 2 or len(child_layout) < 2:
         raise ChunkingError("table Child has no traceable body rows")
-    parent_body = parent_rows[1:]
-    child_body = child_rows[1:]
+    parent_body = [row.cells for row in parent_layout[1:]]
+    child_body = [row.cells for row in child_layout[1:]]
     local_start = _find_row_sequence(parent_body, child_body, row_cursor)
     local_to = local_start + len(child_body)
     canonical_from = source.row_from + local_start
     canonical_to = source.row_from + local_to
+    parent_char_from = parent_layout[local_start + 1].char_from
+    parent_char_to = parent_layout[local_to].char_to
+    parent_body_char_from = parent_layout[1].char_from
+    canonical_char_from = source.char_from + (
+        parent_char_from - parent_body_char_from
+    )
+    canonical_char_to = source.char_from + (parent_char_to - parent_body_char_from)
     span = source.model_copy(
         update={
+            "char_from": canonical_char_from,
+            "char_to": canonical_char_to,
             "row_from": canonical_from,
             "row_to": canonical_to,
-            "parent_char_from": _line_offset(parent.content, local_start + 1),
-            "parent_char_to": _line_offset(parent.content, local_to + 1),
+            "parent_char_from": parent_char_from,
+            "parent_char_to": parent_char_to,
             "separator_before": "",
         }
     )
@@ -920,9 +984,14 @@ def _find_row_sequence(
     raise ChunkingError("Docling table Child rows cannot be mapped to its Parent")
 
 
-def _line_offset(content: str, line_index: int) -> int:
-    lines = content.splitlines(keepends=True)
-    return min(len(content), sum(len(line) for line in lines[:line_index]))
+def _raw_row_char_range(content: str, row_from: int, row_to: int) -> tuple[int, int]:
+    lines = content.splitlines(keepends=True) or [content]
+    if not 0 <= row_from < row_to <= len(lines):
+        raise ChunkingError("row character range is outside its source")
+    char_from = sum(len(line) for line in lines[:row_from])
+    last_start = sum(len(line) for line in lines[: row_to - 1])
+    char_to = last_start + len(lines[row_to - 1].rstrip("\r\n"))
+    return char_from, char_to
 
 
 def _list_child_locator(
@@ -949,19 +1018,28 @@ def _list_child_locator(
 
 
 def _formatted_child_locator(
-    parent: ParentChunk, child_content: str, *, ordinal: int
-) -> AstLocator:
+    parent: ParentChunk,
+    child_content: str,
+    *,
+    ordinal: int,
+    char_cursor: int,
+) -> tuple[AstLocator, int]:
     unwrapped = child_content
-    if parent.content_type == "code" and child_content.startswith("```\n"):
-        unwrapped = child_content.removeprefix("```\n").removesuffix("\n```")
-    char_from = parent.content.find(unwrapped)
+    if parent.content_type == "code":
+        unwrapped = re.sub(r"^```[^\n]*\n", "", unwrapped)
+        unwrapped = re.sub(r"\n+```$", "", unwrapped)
+    char_from = parent.content.find(unwrapped, char_cursor)
     if char_from < 0:
         raise ChunkingError(f"Docling Child cannot be mapped to Parent {parent.id}")
-    return _clip_locator(
-        parent.ast_locator,
-        char_from,
-        char_from + len(unwrapped),
-        segment_ordinal=ordinal,
+    char_to = char_from + len(unwrapped)
+    return (
+        _clip_locator(
+            parent.ast_locator,
+            char_from,
+            char_to,
+            segment_ordinal=ordinal,
+        ),
+        char_to,
     )
 
 

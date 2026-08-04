@@ -208,6 +208,32 @@ def test_parent_builder_marks_only_an_indivisible_row_over_hard_limit() -> None:
     assert parents[0].row_to == 1
 
 
+@pytest.mark.parametrize(
+    ("kind", "prefix"),
+    [("code", ""), ("other", "ERROR request_failed ")],
+)
+def test_row_fallback_children_resolve_exact_ordered_source_segments(
+    kind: Literal["code", "other"], prefix: str
+) -> None:
+    source = f"{prefix}{_words(0, 2500)}"
+    canonical = _canonical((_block(0, kind=kind, text=source),))
+
+    parents = ChunkingPipeline(_tokenizer()).build(canonical)
+    children = parents[0].children
+    resolved = [resolve_ast_locator(canonical, child.ast_locator) for child in children]
+    spans = [child.ast_locator.spans[0] for child in children]
+
+    assert len(children) >= 7
+    assert all("```" not in segment for segment in resolved)
+    assert " ".join(resolved).split() == source.split()
+    assert [span.char_from for span in spans] == sorted(span.char_from for span in spans)
+    assert all(
+        previous.char_to <= current.char_from
+        for previous, current in zip(spans, spans[1:], strict=False)
+    )
+    assert len({(span.char_from, span.char_to) for span in spans}) == len(spans)
+
+
 def test_parent_builder_uses_docling_semantic_split_for_large_paragraph() -> None:
     canonical = _canonical((_block(0, text=_words(0, 4000)),))
 
@@ -263,6 +289,47 @@ def test_child_table_chunks_repeat_header_and_retain_row_locators() -> None:
     resolved = [resolve_ast_locator(canonical, child.ast_locator) for child in children]
     assert all(source.startswith(header) for source in resolved)
     assert all("row" in source for source in resolved)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "name | value",
+        "name | value\n--- | ---",
+        "name | value\n--- | ---\nrow0 | w0",
+    ],
+)
+def test_header_only_and_single_body_row_tables_remain_traceable(table: str) -> None:
+    canonical = _canonical((_block(0, kind="table", text=table),))
+
+    parents = ChunkingPipeline(_tokenizer()).build(canonical)
+    children = parents[0].children
+
+    assert len(parents) == 1
+    assert len(children) == 1
+    assert resolve_ast_locator(canonical, parents[0].ast_locator) == table
+    assert resolve_ast_locator(canonical, children[0].ast_locator) == table
+
+
+def test_markdown_table_separator_uses_exact_raw_body_offsets() -> None:
+    header = "name | value"
+    separator = "--- | ---"
+    rows = [f"row{index} | {_words(index * 40, 40)}" for index in range(24)]
+    table = "\n".join((header, separator, *rows))
+    canonical = _canonical((_block(0, kind="table", text=table),))
+
+    parent = ChunkingPipeline(_tokenizer()).build(canonical)[0]
+
+    assert len(parent.children) >= 2
+    for child in parent.children:
+        span = child.ast_locator.spans[0]
+        resolved = resolve_ast_locator(canonical, child.ast_locator)
+        resolved_body = "\n".join(resolved.splitlines()[2:])
+        parent_slice = parent.content[span.parent_char_from : span.parent_char_to]
+        canonical_slice = canonical.text_blocks[0].text[span.char_from : span.char_to]
+        assert resolved.startswith(f"{header}\n{separator}\n")
+        assert parent_slice == resolved_body
+        assert canonical_slice == resolved_body
 
 
 def test_parent_builder_keeps_paragraph_and_list_transitions_separate() -> None:
