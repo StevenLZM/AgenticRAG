@@ -418,6 +418,42 @@ def test_assembler_fails_closed_for_duplicate_non_root_docling_reference() -> No
         GlobalAssembler().assemble(fragments)
 
 
+@pytest.mark.parametrize(
+    "document",
+    [
+        {
+            "schema_name": "DoclingDocument",
+            "body": {"self_ref": "#/body", "children": "#/texts/0"},
+            "texts": [],
+        },
+        {
+            "schema_name": "DoclingDocument",
+            "body": {"self_ref": "#/body", "children": [{}]},
+            "texts": [],
+        },
+        {
+            "schema_name": "DoclingDocument",
+            "body": {"self_ref": "#/body", "children": []},
+            "texts": {"self_ref": "#/texts/0"},
+        },
+    ],
+    ids=("children-not-list", "child-not-reference", "collection-not-list"),
+)
+def test_assembler_rejects_malformed_fragment_graph_shape(
+    document: dict[str, object],
+) -> None:
+    fragment = FragmentAst(
+        envelope=_envelope(),
+        batch_no=1,
+        page_from=1,
+        page_to=1,
+        docling_document=document,
+    )
+
+    with pytest.raises(AstAssemblyError, match="fragment Docling graph"):
+        GlobalAssembler().assemble([fragment])
+
+
 def test_assembler_persists_versioned_canonical_json_artifact(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
 

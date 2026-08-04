@@ -610,8 +610,10 @@ def _known_references(fragments: Sequence[FragmentAst]) -> set[str]:
 
 def _validate_fragment_graphs(fragments: Sequence[FragmentAst]) -> None:
     global_locations: dict[str, int] = {}
+    collection_offsets = {collection: 0 for collection in _DOCLING_COLLECTIONS}
     for fragment in fragments:
         document = fragment.docling_document
+        _validate_fragment_graph_shape(document)
         references = _self_ref_counts(document)
         for reference, count in references.items():
             if count > 1:
@@ -627,6 +629,70 @@ def _validate_fragment_graphs(fragments: Sequence[FragmentAst]) -> None:
             raise AstAssemblyError(
                 f"complete Docling graph has unresolved reference {missing[0]!r}"
             )
+        for collection in _DOCLING_COLLECTIONS:
+            items = document.get(collection, [])
+            if not isinstance(items, list):
+                raise AstAssemblyError(
+                    f"fragment Docling graph collection {collection!r} must be a list"
+                )
+            offset = collection_offsets[collection]
+            for local_index, item in enumerate(items):
+                if not isinstance(item, Mapping):
+                    raise AstAssemblyError(
+                        f"fragment Docling graph collection {collection!r} "
+                        "has a non-object"
+                    )
+                if item.get("self_ref") != f"#/{collection}/{offset + local_index}":
+                    raise AstAssemblyError(
+                        "fragment Docling graph has invalid collection references"
+                    )
+            collection_offsets[collection] += len(items)
+
+
+def _validate_fragment_graph_shape(document: Mapping[str, Any]) -> None:
+    for root_name in ("body", "furniture"):
+        root = document.get(root_name)
+        if root is None:
+            continue
+        if not isinstance(root, Mapping) or root.get("self_ref") != f"#/{root_name}":
+            raise AstAssemblyError(
+                f"fragment Docling graph has invalid {root_name} root"
+            )
+        children = root.get("children")
+        if not isinstance(children, list):
+            raise AstAssemblyError(
+                f"fragment Docling graph {root_name} children must be a list"
+            )
+        if any(
+            not isinstance(child, Mapping)
+            or not isinstance(child.get("$ref"), str)
+            or not child["$ref"]
+            for child in children
+        ):
+            raise AstAssemblyError(
+                f"fragment Docling graph {root_name} child must be a reference"
+            )
+
+    for collection in _DOCLING_COLLECTIONS:
+        items = document.get(collection, [])
+        if not isinstance(items, list):
+            raise AstAssemblyError(
+                f"fragment Docling graph collection {collection!r} must be a list"
+            )
+        for item in items:
+            if not isinstance(item, Mapping):
+                raise AstAssemblyError(
+                    f"fragment Docling graph collection {collection!r} has a non-object"
+                )
+            self_ref = item.get("self_ref")
+            if (
+                not isinstance(self_ref, str)
+                or re.fullmatch(rf"#/{re.escape(collection)}/\d+", self_ref) is None
+            ):
+                raise AstAssemblyError(
+                    f"fragment Docling graph collection {collection!r} "
+                    "has an invalid item reference"
+                )
 
 
 def _self_ref_counts(value: Any) -> dict[str, int]:

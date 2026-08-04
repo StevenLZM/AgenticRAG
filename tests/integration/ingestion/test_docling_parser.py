@@ -16,8 +16,10 @@ import pytest
 from docling.document_converter import DocumentConverter
 from docling_core.types.doc import (
     BoundingBox,
+    ContentLayer,
     DocItemLabel,
     DoclingDocument,
+    GroupLabel,
     ProvenanceItem,
     Size,
 )
@@ -417,4 +419,146 @@ async def test_cross_batch_docling_item_keeps_global_provenance(
     assert [block.text for block in canonical.text_blocks] == ["cross page"]
     assert canonical.text_blocks[0].provenance.page_from == 2
     assert canonical.text_blocks[0].provenance.page_to == 3
+    DoclingDocument.model_validate(canonical.docling_document)
+
+
+@pytest.mark.asyncio
+async def test_real_multibatch_parser_preserves_furniture_groups(
+    tmp_path: Path,
+) -> None:
+    document = DoclingDocument(name="furniture-pages")
+    for page_no in (1, 2, 3):
+        document.add_page(page_no=page_no, size=Size(width=100, height=100))
+        body_text = f"body {page_no}"
+        document.add_text(
+            label=DocItemLabel.TEXT,
+            text=body_text,
+            orig=body_text,
+            prov=ProvenanceItem(
+                page_no=page_no,
+                bbox=BoundingBox(l=10, t=70, r=90, b=60),
+                charspan=(0, len(body_text)),
+            ),
+        )
+    furniture_group = document.add_group(
+        label=GroupLabel.SECTION,
+        name="headers",
+        parent=document.furniture,
+        content_layer=ContentLayer.FURNITURE,
+    )
+    for page_no in (1, 3):
+        document.add_text(
+            label=DocItemLabel.PAGE_HEADER,
+            text="CONFIDENTIAL",
+            orig="CONFIDENTIAL",
+            prov=ProvenanceItem(
+                page_no=page_no,
+                bbox=BoundingBox(l=10, t=10, r=90, b=5),
+                charspan=(0, 12),
+            ),
+            parent=furniture_group,
+            content_layer=ContentLayer.FURNITURE,
+        )
+    content = b"faithful furniture boundary"
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    original = artifacts.put_bytes("source/furniture.txt", content)
+    envelope = DocumentEnvelope(
+        document_id="doc-furniture",
+        document_version_id="ver-furniture",
+        user_id="user-1",
+        source_type="text",
+        source_uri=original.uri,
+        content_hash=original.sha256,
+        parser_version="docling-v1",
+        pipeline_version="ingestion-v1",
+        created_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+    parser = DocumentParser(
+        source_loader=lambda _ref: content,
+        artifacts=artifacts,
+        converter=_StaticConverter(document),
+        page_batch_size=2,
+    )
+
+    fragments = [
+        fragment async for fragment in parser.parse_batches(original, envelope)
+    ]
+    canonical = GlobalAssembler().assemble(fragments)
+
+    assert [
+        len(fragment.docling_document["furniture"]["children"])
+        for fragment in fragments
+    ] == [1, 1]
+    assert [len(fragment.docling_document["groups"]) for fragment in fragments] == [
+        1,
+        1,
+    ]
+    assembled_headers = [
+        item
+        for item in canonical.docling_document["texts"]
+        if item["label"] == "page_header"
+    ]
+    assert [item["prov"][0]["page_no"] for item in assembled_headers] == [1, 3]
+    assert all("CONFIDENTIAL" not in block.text for block in canonical.text_blocks)
+    DoclingDocument.model_validate(canonical.docling_document)
+
+
+@pytest.mark.asyncio
+async def test_default_twenty_page_batch_boundary_is_globally_traceable(
+    tmp_path: Path,
+) -> None:
+    document = DoclingDocument(name="twenty-one-pages")
+    for page_no in range(1, 22):
+        document.add_page(page_no=page_no, size=Size(width=100, height=100))
+        text = f"page {page_no}"
+        document.add_text(
+            label=DocItemLabel.TEXT,
+            text=text,
+            orig=text,
+            prov=ProvenanceItem(
+                page_no=page_no,
+                bbox=BoundingBox(l=10, t=60, r=90, b=50),
+                charspan=(0, len(text)),
+            ),
+        )
+    content = b"default twenty page batch boundary"
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    original = artifacts.put_bytes("source/twenty-one-pages.txt", content)
+    envelope = DocumentEnvelope(
+        document_id="doc-21",
+        document_version_id="ver-21",
+        user_id="user-1",
+        source_type="text",
+        source_uri=original.uri,
+        content_hash=original.sha256,
+        parser_version="docling-v1",
+        pipeline_version="ingestion-v1",
+        created_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+    parser = DocumentParser(
+        source_loader=lambda _ref: content,
+        artifacts=artifacts,
+        converter=_StaticConverter(document),
+    )
+
+    fragments = [
+        fragment async for fragment in parser.parse_batches(original, envelope)
+    ]
+    canonical = GlobalAssembler().assemble(fragments)
+
+    assert [(fragment.page_from, fragment.page_to) for fragment in fragments] == [
+        (1, 20),
+        (21, 21),
+    ]
+    assert [
+        item["self_ref"]
+        for fragment in fragments
+        for item in fragment.docling_document["texts"]
+    ] == [f"#/texts/{index}" for index in range(21)]
+    assert sorted(
+        int(page_no) for page_no in canonical.docling_document["pages"]
+    ) == list(range(1, 22))
+    assert [block.provenance.page_from for block in canonical.text_blocks] == list(
+        range(1, 22)
+    )
     DoclingDocument.model_validate(canonical.docling_document)

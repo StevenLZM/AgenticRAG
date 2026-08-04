@@ -112,8 +112,14 @@ class DocumentParser:
             batch_document = document
             if len(batch_ranges) > 1:
                 batch_document = document.filter(set(range(batch_from, batch_to + 1)))
-            batch_export = _globalize_batch_export(
+            batch_export = _restore_page_furniture(
                 _export_docling(batch_document),
+                exported,
+                page_from=batch_from,
+                page_to=batch_to,
+            )
+            batch_export = _globalize_batch_export(
+                batch_export,
                 page_from=batch_from,
                 collection_offsets=collection_offsets,
             )
@@ -206,6 +212,151 @@ def _page_ranges(
 ) -> Iterator[tuple[int, int]]:
     for start in range(page_from, page_to + 1, batch_size):
         yield start, min(start + batch_size - 1, page_to)
+
+
+def _restore_page_furniture(
+    filtered: dict[str, Any],
+    original: Mapping[str, Any],
+    *,
+    page_from: int,
+    page_to: int,
+) -> dict[str, Any]:
+    """Restore only furniture descendants belonging to one filtered page batch.
+
+    Docling 2.118 filters the body tree but does not traverse the furniture tree.
+    This adapter selects page-local furniture leaves from the full export, retains
+    their structural ancestors, and appends them to the filtered collections using
+    a fresh local namespace. The normal globalization pass then assigns references
+    shared by all persisted fragments.
+    """
+    original_root = original.get("furniture")
+    filtered_root = filtered.get("furniture")
+    if not isinstance(original_root, Mapping):
+        return filtered
+    if not isinstance(filtered_root, Mapping):
+        raise DoclingConversionError("Docling furniture root must be an object")
+    filtered_children = filtered_root.get("children")
+    if not isinstance(filtered_children, list):
+        raise DoclingConversionError("Docling furniture children must be a list")
+    if filtered_children:
+        return filtered
+
+    items_by_ref: dict[str, Mapping[str, Any]] = {}
+    collection_by_ref: dict[str, str] = {}
+    for collection in _DOCLING_COLLECTIONS:
+        items = original.get(collection, [])
+        if not isinstance(items, list):
+            raise DoclingConversionError(
+                f"Docling collection {collection!r} must be a list"
+            )
+        for item in items:
+            if not isinstance(item, Mapping) or not isinstance(
+                item.get("self_ref"), str
+            ):
+                raise DoclingConversionError(
+                    f"Docling collection {collection!r} contains an invalid item"
+                )
+            self_ref = str(item["self_ref"])
+            items_by_ref[self_ref] = item
+            collection_by_ref[self_ref] = collection
+
+    selected: set[str] = set()
+    selected_children: dict[str, list[str]] = {}
+
+    def select(reference: str, visiting: set[str]) -> bool:
+        item = items_by_ref.get(reference)
+        if item is None:
+            raise DoclingConversionError(
+                f"Docling furniture reference {reference!r} does not resolve"
+            )
+        if reference in visiting:
+            raise DoclingConversionError("Docling furniture tree contains a cycle")
+        child_refs = _child_references(item)
+        next_visiting = {*visiting, reference}
+        kept_children = [
+            child_ref for child_ref in child_refs if select(child_ref, next_visiting)
+        ]
+        relevant = bool(kept_children) or any(
+            page_from <= page_no <= page_to for page_no in _provenance_pages(item)
+        )
+        if relevant:
+            selected.add(reference)
+            selected_children[reference] = kept_children
+        return relevant
+
+    root_children = _child_references(original_root)
+    kept_root_children = [
+        reference for reference in root_children if select(reference, set())
+    ]
+    if not kept_root_children:
+        return filtered
+
+    restored = copy.deepcopy(filtered)
+    reference_map: dict[str, str] = {}
+    for collection in _DOCLING_COLLECTIONS:
+        existing = restored.get(collection, [])
+        if not isinstance(existing, list):
+            raise DoclingConversionError(
+                f"Docling collection {collection!r} must be a list"
+            )
+        original_items = original.get(collection, [])
+        if not isinstance(original_items, list):
+            raise DoclingConversionError(
+                f"Docling collection {collection!r} must be a list"
+            )
+        for item in original_items:
+            if not isinstance(item, Mapping) or not isinstance(
+                item.get("self_ref"), str
+            ):
+                raise DoclingConversionError(
+                    f"Docling collection {collection!r} contains an invalid item"
+                )
+            old_ref = str(item["self_ref"])
+            if old_ref in selected:
+                reference_map[old_ref] = f"#/{collection}/{len(existing)}"
+                existing.append(copy.deepcopy(dict(item)))
+        if existing or collection in restored:
+            restored[collection] = existing
+
+    restored_root = copy.deepcopy(dict(original_root))
+    restored_root["children"] = [{"$ref": ref} for ref in kept_root_children]
+    restored["furniture"] = restored_root
+    for old_ref in selected:
+        collection = collection_by_ref[old_ref]
+        new_ref = reference_map[old_ref]
+        index = int(new_ref.rsplit("/", maxsplit=1)[1])
+        item = restored[collection][index]
+        child_refs = selected_children[old_ref]
+        if "children" in item:
+            item["children"] = [{"$ref": ref} for ref in child_refs]
+        _rewrite_docling_references(item, reference_map)
+    _rewrite_docling_references(restored_root, reference_map)
+    return restored
+
+
+def _child_references(item: Mapping[str, Any]) -> list[str]:
+    children = item.get("children", [])
+    if not isinstance(children, list):
+        raise DoclingConversionError("Docling furniture children must be a list")
+    references: list[str] = []
+    for child in children:
+        if not isinstance(child, Mapping) or not isinstance(child.get("$ref"), str):
+            raise DoclingConversionError(
+                "Docling furniture children require string references"
+            )
+        references.append(str(child["$ref"]))
+    return references
+
+
+def _provenance_pages(item: Mapping[str, Any]) -> set[int]:
+    provenance = item.get("prov", [])
+    if not isinstance(provenance, list):
+        raise DoclingConversionError("Docling provenance must be a list")
+    return {
+        int(entry["page_no"])
+        for entry in provenance
+        if isinstance(entry, Mapping) and isinstance(entry.get("page_no"), int)
+    }
 
 
 def _globalize_batch_export(
