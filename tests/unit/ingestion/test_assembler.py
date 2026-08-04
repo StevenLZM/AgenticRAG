@@ -185,6 +185,67 @@ def test_assembler_detects_unflagged_cross_page_paragraph_from_page_edges() -> N
     assert canonical.text_blocks[0].provenance.page_to == 2
 
 
+@pytest.mark.parametrize(
+    ("label", "texts"), [("table", ("A | B", "C | D")), ("list_item", ("one", "two"))]
+)
+def test_page_edges_do_not_merge_independent_structural_blocks(
+    label: str, texts: tuple[str, str]
+) -> None:
+    fragment = FragmentAst(
+        envelope=_envelope(),
+        batch_no=1,
+        page_from=1,
+        page_to=2,
+        docling_document={
+            "schema_name": "DoclingDocument",
+            "pages": {
+                "1": {"page_no": 1, "size": {"width": 100, "height": 100}},
+                "2": {"page_no": 2, "size": {"width": 100, "height": 100}},
+            },
+            "blocks": [
+                {
+                    "self_ref": "#/texts/0",
+                    "label": label,
+                    "text": texts[0],
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {
+                                "l": 10,
+                                "t": 14,
+                                "r": 90,
+                                "b": 2,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "self_ref": "#/texts/1",
+                    "label": label,
+                    "text": texts[1],
+                    "prov": [
+                        {
+                            "page_no": 2,
+                            "bbox": {
+                                "l": 10,
+                                "t": 98,
+                                "r": 90,
+                                "b": 86,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    canonical = GlobalAssembler().assemble([fragment])
+
+    assert [block.text for block in canonical.text_blocks] == list(texts)
+
+
 def test_assembler_removes_only_same_page_overlapping_ocr_duplicates() -> None:
     fragment = _fragment(
         {
@@ -262,9 +323,7 @@ def test_assembler_uses_implicit_page_provenance_for_non_paginated_text() -> Non
         page_to=1,
         docling_document={
             "schema_name": "DoclingDocument",
-            "texts": [
-                {"self_ref": "#/texts/0", "label": "text", "text": "plain text"}
-            ],
+            "texts": [{"self_ref": "#/texts/0", "label": "text", "text": "plain text"}],
         },
     )
 
@@ -301,6 +360,62 @@ def test_assembler_fails_closed_for_invalid_provenance_or_references(
 ) -> None:
     with pytest.raises(AstAssemblyError, match=match):
         GlobalAssembler().assemble([_fragment(block)])
+
+
+def test_assembler_fails_closed_for_missing_body_child_reference() -> None:
+    fragment = FragmentAst(
+        envelope=_envelope(),
+        batch_no=1,
+        page_from=1,
+        page_to=1,
+        docling_document={
+            "schema_name": "DoclingDocument",
+            "body": {
+                "self_ref": "#/body",
+                "children": [{"$ref": "#/texts/404"}],
+            },
+            "texts": [
+                {
+                    "self_ref": "#/texts/0",
+                    "parent": {"$ref": "#/body"},
+                    "label": "text",
+                    "text": "present",
+                    "prov": [{"page_no": 1}],
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(AstAssemblyError, match="complete Docling graph.*#/texts/404"):
+        GlobalAssembler().assemble([fragment])
+
+
+def test_assembler_fails_closed_for_duplicate_non_root_docling_reference() -> None:
+    fragments = [
+        FragmentAst(
+            envelope=_envelope(),
+            batch_no=batch_no,
+            page_from=batch_no,
+            page_to=batch_no,
+            docling_document={
+                "schema_name": "DoclingDocument",
+                "texts": [
+                    {
+                        "self_ref": "#/texts/0",
+                        "label": "text",
+                        "text": f"page {batch_no}",
+                        "prov": [{"page_no": batch_no}],
+                    }
+                ],
+            },
+        )
+        for batch_no in (1, 2)
+    ]
+
+    with pytest.raises(
+        AstAssemblyError, match="duplicate Docling self_ref '#/texts/0'"
+    ):
+        GlobalAssembler().assemble(fragments)
 
 
 def test_assembler_persists_versioned_canonical_json_artifact(tmp_path: Path) -> None:
@@ -363,3 +478,16 @@ def test_content_safety_accepts_normal_text_without_rewriting_it() -> None:
 
     assert decision.status is UploadSafetyStatus.ACCEPTED
     assert canonical.text_blocks[0].text == "完整的跨页段落"
+
+
+def test_content_safety_quarantines_empty_extraction() -> None:
+    canonical = CanonicalAst(
+        envelope=_envelope().model_copy(update={"source_type": "scanned_pdf"}),
+        docling_document={"schema_name": "DoclingDocument"},
+        text_blocks=(),
+    )
+
+    decision = ContentSafetyScanner().scan(canonical)
+
+    assert decision.status is UploadSafetyStatus.QUARANTINED
+    assert decision.reasons == ("no_retrievable_text",)

@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from agentic_rag.ingestion.assembler import DocumentEnvelope
+from agentic_rag.ingestion.assembler import GlobalAssembler
 from agentic_rag.ingestion.parser import DocumentParser
 from agentic_rag.persistence.artifacts import LocalArtifactStore
 
@@ -22,28 +23,45 @@ class _Stream:
 
 
 class _Document:
-    def __init__(self, pages: set[int]) -> None:
-        self.pages = pages
+    def __init__(self, source_pages: list[int], *, rebase_pages: bool = False) -> None:
+        self.source_pages = source_pages
+        self.rebase_pages = rebase_pages
 
     def export_to_dict(self, **_kwargs: Any) -> dict[str, Any]:
+        page_numbers = (
+            list(range(1, len(self.source_pages) + 1))
+            if self.rebase_pages
+            else self.source_pages
+        )
         return {
             "schema_name": "DoclingDocument",
             "version": "1.0.0",
             "name": "source",
+            "body": {
+                "self_ref": "#/body",
+                "children": [
+                    {"$ref": f"#/texts/{index}"}
+                    for index, _page in enumerate(self.source_pages)
+                ],
+            },
             "texts": [
                 {
-                    "self_ref": f"#/texts/{page}",
+                    "self_ref": f"#/texts/{index}",
+                    "parent": {"$ref": "#/body"},
                     "label": "text",
-                    "text": f"page {page}",
-                    "prov": [{"page_no": page}],
+                    "text": f"page {source_page}",
+                    "prov": [{"page_no": output_page}],
                 }
-                for page in sorted(self.pages)
+                for index, (source_page, output_page) in enumerate(
+                    zip(self.source_pages, page_numbers, strict=True)
+                )
             ],
-            "pages": {str(page): {"page_no": page} for page in sorted(self.pages)},
+            "pages": {str(page): {"page_no": page} for page in page_numbers},
         }
 
     def filter(self, page_nrs: set[int] | None = None) -> _Document:
-        return _Document(self.pages & (page_nrs or self.pages))
+        selected = [page for page in self.source_pages if page in (page_nrs or set())]
+        return _Document(selected, rebase_pages=True)
 
 
 @dataclass
@@ -56,7 +74,7 @@ class _Converter:
         assert isinstance(source, _Stream)
         assert source.name == "report.pdf"
         assert source.stream.read() == b"source bytes"
-        return _Result(_Document({1, 2, 3}))
+        return _Result(_Document([1, 2, 3]))
 
 
 def _envelope(uri: str, sha256: str) -> DocumentEnvelope:
@@ -102,11 +120,25 @@ async def test_parser_filters_docling_document_into_versioned_page_batches(
         sorted(int(page) for page in item.docling_document["pages"])
         for item in fragments
     ] == [[1, 2], [3]]
-    assert all(item.artifact_ref and artifacts.verify(item.artifact_ref) for item in fragments)
+    assert all(
+        item.artifact_ref and artifacts.verify(item.artifact_ref) for item in fragments
+    )
     assert fragments[0].artifact_ref is not None
     assert fragments[0].artifact_ref.uri.endswith(
         "/fragments/docling-v1/ingestion-v1/batch-000001.json"
     )
+    source_refs = [
+        item["self_ref"]
+        for fragment in fragments
+        for item in fragment.docling_document["texts"]
+    ]
+    assert source_refs == ["#/texts/0", "#/texts/1", "#/texts/2"]
+    canonical = GlobalAssembler().assemble(fragments)
+    assert [block.text for block in canonical.text_blocks] == [
+        "page 1",
+        "page 2",
+        "page 3",
+    ]
 
 
 @pytest.mark.asyncio

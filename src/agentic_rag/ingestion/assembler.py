@@ -20,6 +20,16 @@ SourceType = Literal["pdf", "scanned_pdf", "excel", "text"]
 BlockKind = Literal[
     "heading", "paragraph", "list_item", "table", "code", "formula", "other"
 ]
+_DOCLING_COLLECTIONS = (
+    "groups",
+    "texts",
+    "pictures",
+    "tables",
+    "key_value_items",
+    "form_items",
+    "field_regions",
+    "field_items",
+)
 
 
 class AstAssemblyError(ValueError):
@@ -98,7 +108,9 @@ class SourceRegion(BaseModel):
     def _finite_bbox(
         cls, value: tuple[float, float, float, float] | None
     ) -> tuple[float, float, float, float] | None:
-        if value is not None and not all(math.isfinite(coordinate) for coordinate in value):
+        if value is not None and not all(
+            math.isfinite(coordinate) for coordinate in value
+        ):
             raise ValueError("bounding box coordinates must be finite")
         return value
 
@@ -197,6 +209,7 @@ class GlobalAssembler:
         ):
             raise AstAssemblyError("fragment batch numbers must be unique")
 
+        _validate_fragment_graphs(ordered_fragments)
         known_refs = _known_references(ordered_fragments)
         candidates = _normalize_reading_order(ordered_fragments, known_refs)
         candidates = _join_cross_page_content(
@@ -206,9 +219,11 @@ class GlobalAssembler:
         candidates = _repair_heading_hierarchy(candidates)
         blocks = _validate_and_materialize(candidates)
 
+        merged_docling_document = _merge_docling_documents(ordered_fragments)
+        _validate_complete_docling_graph(merged_docling_document)
         canonical = CanonicalAst(
             envelope=envelope,
-            docling_document=_merge_docling_documents(ordered_fragments),
+            docling_document=merged_docling_document,
             text_blocks=blocks,
         )
         if self._artifacts is None:
@@ -237,18 +252,24 @@ def _normalize_reading_order(
         raw_blocks: list[Mapping[str, Any]] = []
         custom_blocks = doc.get("blocks")
         if isinstance(custom_blocks, list):
-            raw_blocks.extend(item for item in custom_blocks if isinstance(item, Mapping))
+            raw_blocks.extend(
+                item for item in custom_blocks if isinstance(item, Mapping)
+            )
         else:
             for collection in ("texts", "tables", "key_value_items"):
                 items = doc.get(collection, [])
                 if isinstance(items, list):
-                    raw_blocks.extend(item for item in items if isinstance(item, Mapping))
+                    raw_blocks.extend(
+                        item for item in items if isinstance(item, Mapping)
+                    )
 
         for raw in raw_blocks:
             text = _block_text(raw)
             if not text.strip():
                 continue
-            self_ref = str(raw.get("self_ref") or f"#/fragments/{fragment.batch_no}/{source_order}")
+            self_ref = str(
+                raw.get("self_ref") or f"#/fragments/{fragment.batch_no}/{source_order}"
+            )
             targets = _reference_targets(raw)
             missing = sorted(target for target in targets if target not in known_refs)
             if missing:
@@ -280,16 +301,16 @@ def _normalize_reading_order(
                     continued_from_previous=(
                         bool(raw.get("continued_from_previous"))
                         or (
-                            kind in {"paragraph", "list_item", "table"}
+                            kind == "paragraph"
                             and _near_page_edge(raw, doc, edge="start")
                         )
                     ),
                     continues_on_next=(
                         bool(raw.get("continues_on_next"))
                         or (
-                            kind in {"paragraph", "list_item", "table"}
+                            kind == "paragraph"
                             and _near_page_edge(raw, doc, edge="end")
-                            and (kind == "table" or _text_may_continue(text))
+                            and _text_may_continue(text)
                         )
                     ),
                     continuation_id=(
@@ -321,8 +342,10 @@ def _join_cross_page_content(
             previous_index -= 1
         if previous_index >= 0 and _is_continuation(joined[previous_index], candidate):
             previous = joined[previous_index]
-            separator = "\n" if candidate.kind == "table" else _word_separator(
-                previous.text, candidate.text
+            separator = (
+                "\n"
+                if candidate.kind == "table"
+                else _word_separator(previous.text, candidate.text)
             )
             refs = tuple(dict.fromkeys((*previous.source_refs, *candidate.source_refs)))
             regions = (*previous.provenance.regions, *candidate.provenance.regions)
@@ -376,10 +399,14 @@ def _remove_repeated_furniture_and_ocr_duplicates(
     }
     kept: list[_Candidate] = []
     for candidate in candidates:
-        if candidate.role is not None and (
-            candidate.role,
-            _normalized_hash_text(candidate.text),
-        ) in repeated_furniture:
+        if (
+            candidate.role is not None
+            and (
+                candidate.role,
+                _normalized_hash_text(candidate.text),
+            )
+            in repeated_furniture
+        ):
             continue
         if any(_is_ocr_duplicate(existing, candidate) for existing in kept):
             continue
@@ -409,7 +436,9 @@ def _repair_heading_hierarchy(candidates: Sequence[_Candidate]) -> list[_Candida
         if candidate.kind != "heading":
             repaired.append(candidate)
             continue
-        requested = candidate.heading_level or (previous_level + 1 if previous_level else 1)
+        requested = candidate.heading_level or (
+            previous_level + 1 if previous_level else 1
+        )
         level = min(requested, previous_level + 1) if previous_level else 1
         repaired.append(replace(candidate, heading_level=max(1, level)))
         previous_level = max(1, level)
@@ -456,7 +485,9 @@ def _provenance(raw: Mapping[str, Any], fragment: FragmentAst) -> Provenance:
             raise AstAssemblyError("Docling provenance requires an integer page_no")
         page_no = int(item["page_no"])
         if page_no < fragment.page_from or page_no > fragment.page_to:
-            raise AstAssemblyError("block provenance lies outside its fragment page range")
+            raise AstAssemblyError(
+                "block provenance lies outside its fragment page range"
+            )
         regions.append(SourceRegion(page_no=page_no, bbox=_bbox(item.get("bbox"))))
     return Provenance(
         page_from=min(region.page_no for region in regions),
@@ -571,10 +602,78 @@ def _block_text(raw: Mapping[str, Any]) -> str:
 
 
 def _known_references(fragments: Sequence[FragmentAst]) -> set[str]:
-    references = {"#/body", "#/furniture"}
+    references: set[str] = set()
     for fragment in fragments:
         references.update(_all_self_refs(fragment.docling_document))
     return references
+
+
+def _validate_fragment_graphs(fragments: Sequence[FragmentAst]) -> None:
+    global_locations: dict[str, int] = {}
+    for fragment in fragments:
+        document = fragment.docling_document
+        references = _self_ref_counts(document)
+        for reference, count in references.items():
+            if count > 1:
+                raise AstAssemblyError(f"duplicate Docling self_ref {reference!r}")
+            if reference not in {"#/body", "#/furniture"}:
+                previous_batch = global_locations.get(reference)
+                if previous_batch is not None:
+                    raise AstAssemblyError(f"duplicate Docling self_ref {reference!r}")
+                global_locations[reference] = fragment.batch_no
+        targets = _reference_targets(document)
+        missing = sorted(target for target in targets if target not in references)
+        if missing:
+            raise AstAssemblyError(
+                f"complete Docling graph has unresolved reference {missing[0]!r}"
+            )
+
+
+def _self_ref_counts(value: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+
+    def collect(item: Any) -> None:
+        if isinstance(item, Mapping):
+            self_ref = item.get("self_ref")
+            if isinstance(self_ref, str):
+                counts[self_ref] = counts.get(self_ref, 0) + 1
+            for child in item.values():
+                collect(child)
+        elif isinstance(item, list):
+            for child in item:
+                collect(child)
+
+    collect(value)
+    return counts
+
+
+def _validate_complete_docling_graph(document: Mapping[str, Any]) -> None:
+    references = _self_ref_counts(document)
+    duplicates = sorted(
+        reference for reference, count in references.items() if count > 1
+    )
+    if duplicates:
+        raise AstAssemblyError(f"duplicate Docling self_ref {duplicates[0]!r}")
+    missing = sorted(
+        target for target in _reference_targets(document) if target not in references
+    )
+    if missing:
+        raise AstAssemblyError(
+            f"complete Docling graph has unresolved reference {missing[0]!r}"
+        )
+    for collection in _DOCLING_COLLECTIONS:
+        items = document.get(collection)
+        if items is None:
+            continue
+        if not isinstance(items, list):
+            raise AstAssemblyError(f"Docling collection {collection!r} must be a list")
+        for index, item in enumerate(items):
+            if not isinstance(item, Mapping) or item.get("self_ref") != (
+                f"#/{collection}/{index}"
+            ):
+                raise AstAssemblyError(
+                    f"Docling collection {collection!r} has invalid global references"
+                )
 
 
 def _all_self_refs(value: Any) -> set[str]:
@@ -628,7 +727,9 @@ def _body_reading_order(doc: Mapping[str, Any]) -> dict[str, int]:
         node_ref = node.get("self_ref")
         if isinstance(node_ref, str):
             if node_ref in visiting:
-                raise AstAssemblyError("cycle detected in Docling reading-order references")
+                raise AstAssemblyError(
+                    "cycle detected in Docling reading-order references"
+                )
             visiting.add(node_ref)
             if node_ref not in order and node_ref not in {"#/body", "#/furniture"}:
                 order[node_ref] = len(order)
@@ -652,30 +753,47 @@ def _merge_docling_documents(fragments: Sequence[FragmentAst]) -> dict[str, Any]
     if len(fragments) == 1:
         return json.loads(json.dumps(fragments[0].docling_document))
     first = fragments[0].docling_document
+    excluded = {*_DOCLING_COLLECTIONS, "pages", "blocks", "body", "furniture"}
     merged: dict[str, Any] = {
         key: json.loads(json.dumps(value))
         for key, value in first.items()
-        if key not in {"texts", "tables", "key_value_items", "pictures", "pages", "blocks"}
+        if key not in excluded
     }
-    for collection in ("texts", "tables", "key_value_items", "pictures", "blocks"):
+    for root_name in ("body", "furniture"):
+        valid_roots: list[Mapping[str, Any]] = []
+        for fragment in fragments:
+            root = fragment.docling_document.get(root_name)
+            if isinstance(root, Mapping):
+                valid_roots.append(root)
+        if valid_roots:
+            merged_root = json.loads(json.dumps(valid_roots[0]))
+            merged_root["children"] = [
+                json.loads(json.dumps(child))
+                for root in valid_roots
+                for child in root.get("children", [])
+                if isinstance(child, Mapping)
+            ]
+            merged[root_name] = merged_root
+
+    for collection in (*_DOCLING_COLLECTIONS, "blocks"):
         combined: list[Any] = []
-        seen: set[str] = set()
         for fragment in fragments:
             items = fragment.docling_document.get(collection, [])
             if not isinstance(items, list):
                 continue
             for item in items:
-                marker = json.dumps(item, sort_keys=True, separators=(",", ":"))
-                if marker not in seen:
-                    seen.add(marker)
-                    combined.append(json.loads(json.dumps(item)))
+                combined.append(json.loads(json.dumps(item)))
         if combined:
             merged[collection] = combined
     pages: dict[str, Any] = {}
     for fragment in fragments:
         raw_pages = fragment.docling_document.get("pages")
         if isinstance(raw_pages, Mapping):
-            pages.update(json.loads(json.dumps(raw_pages)))
+            for page_no, page in raw_pages.items():
+                page_key = str(page_no)
+                if page_key in pages:
+                    raise AstAssemblyError(f"duplicate Docling page {page_key}")
+                pages[page_key] = json.loads(json.dumps(page))
     if pages:
         merged["pages"] = pages
     return merged
@@ -683,9 +801,7 @@ def _merge_docling_documents(fragments: Sequence[FragmentAst]) -> dict[str, Any]
 
 def _block_id(namespace: str, source_refs: Sequence[str]) -> str:
     joined_refs = "\x1f".join(source_refs)
-    digest = hashlib.sha256(
-        f"{namespace}\x1f{joined_refs}".encode("utf-8")
-    ).hexdigest()
+    digest = hashlib.sha256(f"{namespace}\x1f{joined_refs}".encode("utf-8")).hexdigest()
     return f"blk_{digest[:24]}"
 
 
@@ -696,7 +812,12 @@ def _normalized_hash_text(text: str) -> str:
 def _word_separator(left: str, right: str) -> str:
     if not left or not right or left[-1].isspace() or right[0].isspace():
         return ""
-    if left[-1].isascii() and right[0].isascii() and left[-1].isalnum() and right[0].isalnum():
+    if (
+        left[-1].isascii()
+        and right[0].isascii()
+        and left[-1].isalnum()
+        and right[0].isalnum()
+    ):
         return " "
     return ""
 

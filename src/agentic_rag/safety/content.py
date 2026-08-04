@@ -27,6 +27,8 @@ class ContentSafetyScanner:
     def scan(self, canonical: CanonicalAst) -> UploadDecision:
         text = "\n".join(block.text for block in canonical.text_blocks)
         reasons: list[str] = []
+        if not text.strip():
+            reasons.append("no_retrievable_text")
         if any(unicodedata.category(character) == "Cf" for character in text):
             reasons.append("invisible_unicode")
         if any(pattern.search(text) for pattern in _INSTRUCTION_PATTERNS):
