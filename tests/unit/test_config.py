@@ -18,6 +18,7 @@ def test_settings_use_local_defaults(monkeypatch):
     assert settings.query_worker_count == 1
     assert settings.ingestion_worker_count == 1
     assert settings.max_upload_bytes == 50 * 1024 * 1024
+    assert settings.index_generation == "index-v2"
 
 
 def test_upload_size_limit_must_be_positive() -> None:
@@ -38,4 +39,14 @@ def test_index_generation_rejects_noncanonical_aliases(generation: str) -> None:
             deepseek_base_url="https://models.example.invalid/v1",
             qwen_embedding_base_url="https://embeddings.example.invalid/v1",
             index_generation=generation,
+        )
+
+
+def test_new_jobs_cannot_be_configured_for_legacy_index_v1() -> None:
+    with pytest.raises(ValidationError, match="legacy"):
+        Settings(
+            mysql_dsn="mysql+asyncmy://rag:rag@127.0.0.1/rag",
+            deepseek_base_url="https://models.example.invalid/v1",
+            qwen_embedding_base_url="https://embeddings.example.invalid/v1",
+            index_generation="index-v1",
         )

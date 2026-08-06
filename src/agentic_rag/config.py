@@ -7,7 +7,10 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from agentic_rag.models.indexing import validate_index_generation
+from agentic_rag.models.indexing import (
+    DEFAULT_INDEX_GENERATION,
+    validate_writable_index_generation,
+)
 
 
 class Settings(BaseSettings):
@@ -46,7 +49,7 @@ class Settings(BaseSettings):
     )
     parser_version: str = "docling-v1"
     ingestion_pipeline_version: str = "ingestion-v1"
-    index_generation: str = "index-v1"
+    index_generation: str = DEFAULT_INDEX_GENERATION
     query_checkpoint_path: Path = Path("var/query_checkpoints.sqlite")
     ingestion_checkpoint_path: Path = Path("var/ingestion_checkpoints.sqlite")
     artifact_root: Path = Path("var/artifacts")
@@ -54,7 +57,7 @@ class Settings(BaseSettings):
     @field_validator("index_generation")
     @classmethod
     def _canonical_index_generation(cls, value: str) -> str:
-        return validate_index_generation(value)
+        return validate_writable_index_generation(value)
 
 
 @lru_cache

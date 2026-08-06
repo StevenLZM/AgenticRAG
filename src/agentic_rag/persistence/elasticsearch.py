@@ -8,12 +8,25 @@ from typing import Any, cast
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.exceptions import BadRequestError
 
-from agentic_rag.ingestion.indexer import EmbeddedChild, StagingContext
-from agentic_rag.models.indexing import validate_index_generation
+from agentic_rag.ingestion.indexer import (
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
+    EmbeddedChild,
+    StagingContext,
+)
+from agentic_rag.models.indexing import (
+    DEFAULT_INDEX_GENERATION,
+    LEGACY_INDEX_GENERATIONS,
+    validate_index_generation,
+)
 
 
 class ChildIndexWriteError(RuntimeError):
     """Raised when an ES bulk batch does not fully stage."""
+
+
+class ChildIndexMappingError(ChildIndexWriteError):
+    """Raised before bulk when a generation index has an incompatible schema."""
 
 
 class ElasticsearchChildIndexStore:
@@ -101,43 +114,16 @@ class ElasticsearchChildIndexStore:
 
     async def _ensure_index(self, index_generation: str) -> None:
         index = self.index_name(index_generation)
+        if index_generation in LEGACY_INDEX_GENERATIONS:
+            raise ChildIndexMappingError(
+                f"Index Generation {index_generation!r} uses the legacy Child schema; "
+                f"stage new versions with {DEFAULT_INDEX_GENERATION!r}"
+            )
+        expected_mapping = _index_mapping(index_generation)
         try:
             await self._client.indices.create(
                 index=index,
-                mappings={
-                    "dynamic": "strict",
-                    "properties": {
-                        "id": {"type": "keyword"},
-                        "parent_id": {"type": "keyword"},
-                        "parent_ordinal": {"type": "integer"},
-                        "user_id": {"type": "keyword"},
-                        "document_id": {"type": "keyword"},
-                        "document_version_id": {"type": "keyword"},
-                        "version_no": {"type": "integer"},
-                        "pipeline_version": {"type": "keyword"},
-                        "embedding_version": {"type": "keyword"},
-                        "ordinal": {"type": "integer"},
-                        "heading_path": {"type": "keyword"},
-                        "heading_ast_locators": {"type": "keyword"},
-                        "content_type": {"type": "keyword"},
-                        "content": {"type": "text"},
-                        "contextualized_content": {"type": "text"},
-                        "token_count": {"type": "integer"},
-                        "page_from": {"type": "integer"},
-                        "page_to": {"type": "integer"},
-                        "ast_locator": {"type": "object", "enabled": False},
-                        "content_hash": {"type": "keyword"},
-                        "embedding": {
-                            "type": "dense_vector",
-                            "dims": 1024,
-                            "index": True,
-                            "similarity": "cosine",
-                        },
-                        "index_generation": {"type": "keyword"},
-                        "search_type": {"type": "keyword"},
-                        "is_active": {"type": "boolean"},
-                    },
-                },
+                mappings=expected_mapping,
             )
         except BadRequestError as error:
             body = error.body if isinstance(error.body, Mapping) else {}
@@ -145,6 +131,22 @@ class ElasticsearchChildIndexStore:
             error_type = detail.get("type") if isinstance(detail, Mapping) else None
             if error_type != "resource_already_exists_exception":
                 raise
+            response = await self._client.indices.get_mapping(index=index)
+            mapping_body = cast(Mapping[str, Any], response.body)
+            index_body = mapping_body.get(index)
+            actual_mapping = (
+                index_body.get("mappings") if isinstance(index_body, Mapping) else None
+            )
+            if not isinstance(actual_mapping, Mapping):
+                raise ChildIndexMappingError(
+                    f"existing index {index!r} did not return a readable strict mapping"
+                )
+            differences = _mapping_differences(actual_mapping, expected_mapping)
+            if differences:
+                raise ChildIndexMappingError(
+                    f"existing index {index!r} has an incompatible strict mapping: "
+                    + "; ".join(differences)
+                )
 
     @staticmethod
     def _validate_metadata(
@@ -212,3 +214,76 @@ def _bulk_failures(body: Mapping[str, Any]) -> list[str]:
             continue
         failures.append(f"{result.get('_id', '<unknown>')}:{result.get('status', '?')}")
     return failures or ["unknown bulk failure"]
+
+
+def _index_mapping(index_generation: str) -> dict[str, Any]:
+    return {
+        "dynamic": "strict",
+        "_meta": {
+            "index_generation": index_generation,
+            "embedding_model": EMBEDDING_MODEL,
+            "embedding_dimensions": EMBEDDING_DIMENSIONS,
+            "schema_version": 2,
+        },
+        "properties": {
+            "id": {"type": "keyword"},
+            "parent_id": {"type": "keyword"},
+            "parent_ordinal": {"type": "integer"},
+            "user_id": {"type": "keyword"},
+            "document_id": {"type": "keyword"},
+            "document_version_id": {"type": "keyword"},
+            "version_no": {"type": "integer"},
+            "pipeline_version": {"type": "keyword"},
+            "embedding_version": {"type": "keyword"},
+            "ordinal": {"type": "integer"},
+            "heading_path": {"type": "keyword"},
+            "heading_ast_locators": {"type": "keyword"},
+            "content_type": {"type": "keyword"},
+            "content": {"type": "text"},
+            "contextualized_content": {"type": "text"},
+            "token_count": {"type": "integer"},
+            "page_from": {"type": "integer"},
+            "page_to": {"type": "integer"},
+            "ast_locator": {"type": "object", "enabled": False},
+            "content_hash": {"type": "keyword"},
+            "embedding": {
+                "type": "dense_vector",
+                "dims": EMBEDDING_DIMENSIONS,
+                "index": True,
+                "similarity": "cosine",
+            },
+            "index_generation": {"type": "keyword"},
+            "search_type": {"type": "keyword"},
+            "is_active": {"type": "boolean"},
+        },
+    }
+
+
+def _mapping_differences(
+    actual: Mapping[str, Any], expected: Mapping[str, Any]
+) -> list[str]:
+    differences: list[str] = []
+    if actual.get("dynamic") != expected["dynamic"]:
+        differences.append("dynamic must be strict")
+    if actual.get("_meta") != expected["_meta"]:
+        differences.append("schema _meta does not match this generation")
+
+    actual_properties = actual.get("properties")
+    expected_properties = cast(Mapping[str, Any], expected["properties"])
+    if not isinstance(actual_properties, Mapping):
+        differences.append("properties are absent")
+        return differences
+    missing = sorted(set(expected_properties) - set(actual_properties))
+    unexpected = sorted(set(actual_properties) - set(expected_properties))
+    changed = sorted(
+        field
+        for field in set(actual_properties) & set(expected_properties)
+        if actual_properties[field] != expected_properties[field]
+    )
+    if missing:
+        differences.append("missing properties: " + ", ".join(missing))
+    if unexpected:
+        differences.append("unexpected properties: " + ", ".join(unexpected))
+    if changed:
+        differences.append("changed properties: " + ", ".join(changed))
+    return differences
