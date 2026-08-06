@@ -32,6 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects import mysql
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from agentic_rag.domain.models import (
@@ -46,6 +47,7 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
 metadata = MetaData()
+ast_locator_type = Text().with_variant(mysql.LONGTEXT(), "mysql")
 
 documents = Table(
     "documents",
@@ -144,7 +146,7 @@ parent_chunks = Table(
     Column("content", Text, nullable=False),
     Column("page_from", Integer, nullable=True),
     Column("page_to", Integer, nullable=True),
-    Column("ast_locator", String(512), nullable=False),
+    Column("ast_locator", ast_locator_type, nullable=False),
     Column("content_hash", String(64), nullable=False),
     Column("status", String(16), nullable=False),
     CheckConstraint("status IN ('active','inactive')", name="ck_parent_chunks_status"),

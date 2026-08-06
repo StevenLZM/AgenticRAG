@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentic_rag.domain.models import DocumentVersionStatus
 from agentic_rag.ingestion.chunker import ParentChunk
-from agentic_rag.ingestion.indexer import StagingContext
+from agentic_rag.ingestion.indexer import EMBEDDING_MODEL, StagingContext
 from agentic_rag.persistence.repositories import (
     document_versions,
     documents,
@@ -101,7 +101,7 @@ class SqlAlchemyParentStagingStore:
         child_count: int,
     ) -> None:
         async with self._session_factory.begin() as session:
-            await self._require_version(session, context)
+            version = await self._require_version(session, context, lock=True)
             actual_parent_count = int(
                 (
                     await session.execute(
@@ -121,11 +121,49 @@ class SqlAlchemyParentStagingStore:
                 raise ParentStagingConflict(
                     "Parent count changed before Manifest attachment"
                 )
+            requested_manifest = (
+                canonical_ast_uri,
+                canonical_ast_sha256,
+                manifest_uri,
+                manifest_hash,
+                parent_count,
+                child_count,
+            )
+            stored_manifest = (
+                version["canonical_ast_path"],
+                version["canonical_ast_hash"],
+                version["manifest_path"],
+                version["manifest_hash"],
+                version["parent_count"],
+                version["child_count"],
+            )
+            manifest_fields = (version["manifest_path"], version["manifest_hash"])
+            if manifest_fields != (None, None):
+                if stored_manifest != requested_manifest:
+                    raise ParentStagingConflict(
+                        "Manifest is already attached with a conflicting identity or count"
+                    )
+                return
+            canonical_fields = (
+                version["canonical_ast_path"],
+                version["canonical_ast_hash"],
+            )
+            if canonical_fields not in {
+                (None, None),
+                (canonical_ast_uri, canonical_ast_sha256),
+            }:
+                raise ParentStagingConflict(
+                    "Manifest canonical Artifact conflicts with durable version"
+                )
             result = cast(
                 CursorResult[Any],
                 await session.execute(
                     update(document_versions)
-                    .where(document_versions.c.id == context.document_version_id)
+                    .where(
+                        document_versions.c.id == context.document_version_id,
+                        document_versions.c.manifest_path.is_(None),
+                        document_versions.c.manifest_hash.is_(None),
+                    )
                     .values(
                         canonical_ast_path=canonical_ast_uri,
                         canonical_ast_hash=canonical_ast_sha256,
@@ -141,36 +179,54 @@ class SqlAlchemyParentStagingStore:
                 raise StagingVersionError(context.document_version_id)
 
     async def _require_version(
-        self, session: AsyncSession, context: StagingContext
-    ) -> None:
-        row = (
-            await session.execute(
-                select(
-                    document_versions.c.id,
-                    document_versions.c.embedding_version,
-                    document_versions.c.index_generation,
-                    document_versions.c.status,
-                )
-                .select_from(
-                    document_versions.join(
-                        documents,
-                        document_versions.c.document_id == documents.c.id,
-                    )
-                )
-                .where(
-                    document_versions.c.id == context.document_version_id,
-                    document_versions.c.document_id == context.document_id,
-                    documents.c.user_id == context.user_id,
-                    documents.c.status != "deleted",
+        self,
+        session: AsyncSession,
+        context: StagingContext,
+        *,
+        lock: bool = False,
+    ) -> Mapping[str, Any]:
+        statement = (
+            select(
+                document_versions.c.id,
+                document_versions.c.version_no,
+                document_versions.c.pipeline_version,
+                document_versions.c.embedding_version,
+                document_versions.c.index_generation,
+                document_versions.c.canonical_ast_path,
+                document_versions.c.canonical_ast_hash,
+                document_versions.c.manifest_path,
+                document_versions.c.manifest_hash,
+                document_versions.c.parent_count,
+                document_versions.c.child_count,
+                document_versions.c.status,
+            )
+            .select_from(
+                document_versions.join(
+                    documents,
+                    document_versions.c.document_id == documents.c.id,
                 )
             )
+            .where(
+                document_versions.c.id == context.document_version_id,
+                document_versions.c.document_id == context.document_id,
+                documents.c.user_id == context.user_id,
+                documents.c.status != "deleted",
+            )
+        )
+        if lock:
+            statement = statement.with_for_update()
+        row = (
+            await session.execute(statement)
         ).mappings().one_or_none()
         if row is None:
             raise StagingVersionError(
                 "document version is absent or outside the trusted user scope"
             )
         if (
-            row["embedding_version"] != "text-embedding-v3"
+            row["version_no"] != context.version_no
+            or row["pipeline_version"] != context.pipeline_version
+            or row["embedding_version"] != context.embedding_version
+            or context.embedding_version != EMBEDDING_MODEL
             or row["index_generation"] != context.index_generation
             or row["status"]
             not in {
@@ -181,6 +237,7 @@ class SqlAlchemyParentStagingStore:
             raise StagingVersionError(
                 "document version configuration/status does not permit staging"
             )
+        return dict(row)
 
     @staticmethod
     def _require_exact_rows(

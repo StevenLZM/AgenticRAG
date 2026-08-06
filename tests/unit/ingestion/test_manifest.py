@@ -174,6 +174,9 @@ def _context() -> StagingContext:
         user_id="user-1",
         document_id="document-1",
         document_version_id="version-1",
+        version_no=1,
+        pipeline_version="ingestion-v1",
+        embedding_version="text-embedding-v3",
         index_generation="index-v1",
     )
 
@@ -221,6 +224,22 @@ def test_manifest_hash_is_deterministic_and_changes_with_counts() -> None:
     assert first.manifest_hash == second.manifest_hash
     assert changed.manifest_hash != first.manifest_hash
     assert len(first.manifest_hash) == 64
+
+
+@pytest.mark.parametrize("generation", ["INDEX-V1", " index-v1 ", "index/v1"])
+def test_staging_context_rejects_noncanonical_index_generation(
+    generation: str,
+) -> None:
+    with pytest.raises(ValueError):
+        StagingContext(
+            user_id="user-1",
+            document_id="document-1",
+            document_version_id="version-1",
+            version_no=1,
+            pipeline_version="ingestion-v1",
+            embedding_version="text-embedding-v3",
+            index_generation=generation,
+        )
 
 
 @pytest.mark.asyncio

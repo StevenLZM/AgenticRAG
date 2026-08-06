@@ -28,3 +28,14 @@ def test_upload_size_limit_must_be_positive() -> None:
             qwen_embedding_base_url="https://embeddings.example.invalid/v1",
             max_upload_bytes=0,
         )
+
+
+@pytest.mark.parametrize("generation", ["INDEX-V1", " index-v1 ", "index/v1"])
+def test_index_generation_rejects_noncanonical_aliases(generation: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            mysql_dsn="mysql+asyncmy://rag:rag@127.0.0.1/rag",
+            deepseek_base_url="https://models.example.invalid/v1",
+            qwen_embedding_base_url="https://embeddings.example.invalid/v1",
+            index_generation=generation,
+        )

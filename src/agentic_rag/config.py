@@ -4,8 +4,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from agentic_rag.models.indexing import validate_index_generation
 
 
 class Settings(BaseSettings):
@@ -48,6 +50,11 @@ class Settings(BaseSettings):
     query_checkpoint_path: Path = Path("var/query_checkpoints.sqlite")
     ingestion_checkpoint_path: Path = Path("var/ingestion_checkpoints.sqlite")
     artifact_root: Path = Path("var/artifacts")
+
+    @field_validator("index_generation")
+    @classmethod
+    def _canonical_index_generation(cls, value: str) -> str:
+        return validate_index_generation(value)
 
 
 @lru_cache

@@ -8,11 +8,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agentic_rag.ingestion.chunker import ChildChunk, ParentChunk
 from agentic_rag.ingestion.manifest import VersionManifest
 from agentic_rag.models.embeddings import EmbeddingPort
+from agentic_rag.models.indexing import validate_index_generation
 from agentic_rag.persistence.artifacts import ArtifactRef, ArtifactStore
 
 
@@ -44,14 +45,28 @@ class StagingContext(BaseModel):
     user_id: str
     document_id: str
     document_version_id: str
+    version_no: int = Field(gt=0)
+    pipeline_version: str
+    embedding_version: str
     index_generation: str
 
-    @field_validator("user_id", "document_id", "document_version_id", "index_generation")
+    @field_validator(
+        "user_id",
+        "document_id",
+        "document_version_id",
+        "pipeline_version",
+        "embedding_version",
+    )
     @classmethod
     def _not_blank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("staging identity values must not be blank")
         return value
+
+    @field_validator("index_generation")
+    @classmethod
+    def _canonical_index_generation(cls, value: str) -> str:
+        return validate_index_generation(value)
 
 
 @dataclass(frozen=True, slots=True)

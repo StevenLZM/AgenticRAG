@@ -8,6 +8,7 @@ endpoint is guessed.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
@@ -17,10 +18,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from elasticsearch import AsyncElasticsearch
-from elasticsearch.exceptions import ApiError
-from elastic_transport import TransportError
 from sqlalchemy import delete, insert, select
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from agentic_rag.domain.models import DocumentVersionStatus
@@ -66,14 +64,9 @@ async def infrastructure() -> AsyncIterator[
         async with engine.connect() as connection:
             await connection.execute(select(1))
         await elasticsearch.info()
-    except (OSError, SQLAlchemyError, ApiError, TransportError) as error:
-        await engine.dispose()
-        await elasticsearch.close()
-        pytest.skip(f"disposable staging services unavailable: {type(error).__name__}")
-    migration = Config("alembic.ini")
-    migration.set_main_option("sqlalchemy.url", mysql_dsn)
-    await asyncio.to_thread(command.upgrade, migration, "head")
-    try:
+        migration = Config("alembic.ini")
+        migration.set_main_option("sqlalchemy.url", mysql_dsn)
+        await asyncio.to_thread(command.upgrade, migration, "head")
         yield create_session_factory(engine), elasticsearch
     finally:
         await engine.dispose()
@@ -81,22 +74,31 @@ async def infrastructure() -> AsyncIterator[
 
 
 def _chunks(context: StagingContext) -> list[ParentChunk]:
-    locator = AstLocator(
-        spans=(
+    span_width = 11
+    parent_locator = AstLocator(
+        spans=tuple(
             AstSpan(
-                canonical_path="#/text_blocks/0",
-                block_id="block-integration",
-                page_from=1,
-                page_to=1,
+                canonical_path=f"#/text_blocks/{index}",
+                block_id=f"block-integration-{index}-{'x' * 48}",
+                page_from=index + 1,
+                page_to=index + 1,
                 char_from=0,
-                char_to=11,
-                parent_char_from=0,
-                parent_char_to=11,
-            ),
+                char_to=span_width,
+                parent_char_from=index * (span_width + 2),
+                parent_char_to=index * (span_width + 2) + span_width,
+                separator_before="" if index == 0 else "\n\n",
+            )
+            for index in range(6)
         ),
         segment_ordinal=0,
         parent_char_from=0,
-        parent_char_to=11,
+        parent_char_to=6 * span_width + 5 * 2,
+    )
+    child_locator = AstLocator(
+        spans=(parent_locator.spans[0],),
+        segment_ordinal=0,
+        parent_char_from=0,
+        parent_char_to=span_width,
     )
     child = ChildChunk(
         id=f"child-{uuid4().hex}",
@@ -114,7 +116,7 @@ def _chunks(context: StagingContext) -> list[ParentChunk]:
         token_count=3,
         page_from=1,
         page_to=1,
-        ast_locator=locator,
+        ast_locator=child_locator,
         content_hash="b" * 64,
     )
     parent = ParentChunk(
@@ -126,11 +128,11 @@ def _chunks(context: StagingContext) -> list[ParentChunk]:
         heading_path=("Integration",),
         heading_ast_locators=("#/text_blocks/heading",),
         content_type="paragraph",
-        content="hello index",
-        token_count=2,
+        content="\n\n".join("hello index" for _ in range(6)),
+        token_count=18,
         page_from=1,
-        page_to=1,
-        ast_locator=locator,
+        page_to=6,
+        ast_locator=parent_locator,
         content_hash="c" * 64,
         children=(child,),
     )
@@ -148,6 +150,9 @@ async def test_staging_writes_inactive_parent_child_and_manifest_last(
         user_id=f"staging-user-{unique}",
         document_id=str(uuid4()),
         document_version_id=str(uuid4()),
+        version_no=1,
+        pipeline_version="ingestion-v1",
+        embedding_version="text-embedding-v3",
         index_generation=f"test-{unique}",
     )
     chunks = _chunks(context)
@@ -213,6 +218,10 @@ async def test_staging_writes_inactive_parent_child_and_manifest_last(
             ).mappings().one()
 
         assert parent_row["status"] == "inactive"
+        assert len(parent_row["ast_locator"].encode("utf-8")) > 512
+        assert json.loads(parent_row["ast_locator"]) == chunks[0].ast_locator.model_dump(
+            mode="json"
+        )
         assert version_row["status"] == DocumentVersionStatus.BUILDING.value
         assert version_row["parent_count"] == 1
         assert version_row["child_count"] == 1
@@ -220,6 +229,14 @@ async def test_staging_writes_inactive_parent_child_and_manifest_last(
         assert version_row["manifest_path"].startswith("artifact://")
         assert await child_store.count(context) == 1
         assert await child_store.count_active(context) == 0
+        child_response = await elasticsearch.get(
+            index=child_store.index_name(context.index_generation),
+            id=chunks[0].children[0].id,
+        )
+        child_source = child_response["_source"]
+        assert child_source["version_no"] == context.version_no
+        assert child_source["pipeline_version"] == context.pipeline_version
+        assert child_source["embedding_version"] == context.embedding_version
     finally:
         await elasticsearch.indices.delete(
             index=child_store.index_name(context.index_generation),

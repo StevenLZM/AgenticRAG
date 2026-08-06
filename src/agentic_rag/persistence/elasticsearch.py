@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
@@ -10,9 +9,7 @@ from elasticsearch import AsyncElasticsearch
 from elasticsearch.exceptions import BadRequestError
 
 from agentic_rag.ingestion.indexer import EmbeddedChild, StagingContext
-
-
-_INDEX_GENERATION = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+from agentic_rag.models.indexing import validate_index_generation
 
 
 class ChildIndexWriteError(RuntimeError):
@@ -40,12 +37,8 @@ class ElasticsearchChildIndexStore:
 
     @staticmethod
     def index_name(index_generation: str) -> str:
-        normalized = index_generation.strip().lower()
-        if _INDEX_GENERATION.fullmatch(normalized) is None:
-            raise ValueError(
-                "index_generation must be a lowercase ES-safe version label"
-            )
-        return f"agenticrag-children-{normalized}"
+        validate_index_generation(index_generation)
+        return f"agenticrag-children-{index_generation}"
 
     async def stage(
         self, context: StagingContext, children: Sequence[EmbeddedChild]
@@ -120,6 +113,9 @@ class ElasticsearchChildIndexStore:
                         "user_id": {"type": "keyword"},
                         "document_id": {"type": "keyword"},
                         "document_version_id": {"type": "keyword"},
+                        "version_no": {"type": "integer"},
+                        "pipeline_version": {"type": "keyword"},
+                        "embedding_version": {"type": "keyword"},
                         "ordinal": {"type": "integer"},
                         "heading_path": {"type": "keyword"},
                         "heading_ast_locators": {"type": "keyword"},
@@ -187,6 +183,9 @@ class ElasticsearchChildIndexStore:
             "user_id": context.user_id,
             "document_id": context.document_id,
             "document_version_id": context.document_version_id,
+            "version_no": context.version_no,
+            "pipeline_version": context.pipeline_version,
+            "embedding_version": context.embedding_version,
             "ordinal": child.ordinal,
             "heading_path": list(child.heading_path),
             "heading_ast_locators": list(child.heading_ast_locators),
