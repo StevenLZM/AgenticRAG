@@ -17,6 +17,7 @@ class FakeOutboxRow:
     stream_name: str
     created_at: datetime
     status: str = "pending"
+    attempt_count: int = 0
 
 
 class FakeOutbox:
@@ -50,7 +51,11 @@ class FakeBroker:
         self.published: list[tuple[str, str, datetime]] = []
 
     async def publish(
-        self, stream: str, aggregate_id: str, enqueued_at: datetime
+        self,
+        stream: str,
+        aggregate_id: str,
+        enqueued_at: datetime,
+        dedupe_key: str | None = None,
     ) -> str:
         if self.fail_once:
             self.fail_once = False

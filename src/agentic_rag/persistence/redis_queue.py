@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
+
+
+_PUBLISH_ONCE_SCRIPT = """
+local existing = redis.call('HGET', KEYS[1], ARGV[1])
+if existing then
+  return existing
+end
+local message_id = redis.call(
+  'XADD', KEYS[2], '*',
+  'aggregate_id', ARGV[3],
+  'enqueued_at', ARGV[2]
+)
+redis.call('HSET', KEYS[1], ARGV[1], message_id)
+return message_id
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +36,13 @@ class StreamMessage:
 
 
 class StreamBroker(Protocol):
-    async def publish(self, stream: str, aggregate_id: str, enqueued_at: datetime) -> str: ...
+    async def publish(
+        self,
+        stream: str,
+        aggregate_id: str,
+        enqueued_at: datetime,
+        dedupe_key: str | None = None,
+    ) -> str: ...
 
     async def consume(
         self, stream: str, group: str, consumer: str, block_ms: int
@@ -43,13 +65,33 @@ class RedisStreamsBroker:
     def __init__(self, client: Redis) -> None:
         self._client = client
 
-    async def publish(self, stream: str, aggregate_id: str, enqueued_at: datetime) -> str:
-        message_id = await self._client.xadd(
-            stream,
-            {
-                "aggregate_id": aggregate_id,
-                "enqueued_at": _format_timestamp(enqueued_at),
-            },
+    async def publish(
+        self,
+        stream: str,
+        aggregate_id: str,
+        enqueued_at: datetime,
+        dedupe_key: str | None = None,
+    ) -> str:
+        if dedupe_key is None:
+            message_id = await self._client.xadd(
+                stream,
+                {
+                    "aggregate_id": aggregate_id,
+                    "enqueued_at": _format_timestamp(enqueued_at),
+                },
+            )
+            return _text(message_id)
+        message_id = await cast(
+            Awaitable[Any],
+            self._client.eval(
+                _PUBLISH_ONCE_SCRIPT,
+                2,
+                f"{stream}:dedupe",
+                stream,
+                dedupe_key,
+                _format_timestamp(enqueued_at),
+                aggregate_id,
+            ),
         )
         return _text(message_id)
 

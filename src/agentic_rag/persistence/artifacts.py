@@ -131,6 +131,15 @@ class LocalArtifactStore:
             return False
         return sha256 == ref.sha256 and size_bytes == ref.size_bytes
 
+    def verify_hash(self, uri: str, sha256: str) -> bool:
+        """Verify an Artifact when durable metadata stores no byte length."""
+        try:
+            path = self._path_from_ref(ArtifactRef(uri=uri, sha256=sha256, size_bytes=0))
+            actual_sha256, _ = _hash_file(path)
+        except (FileNotFoundError, IsADirectoryError, OSError, ValueError):
+            return False
+        return actual_sha256 == sha256
+
     def delete(self, ref: ArtifactRef) -> None:
         """Delete exactly one referenced artifact, if it still exists."""
         self._path_from_ref(ref).unlink(missing_ok=True)

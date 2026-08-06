@@ -14,6 +14,7 @@ from agentic_rag.persistence.redis_queue import RedisStreamsBroker
 class FakeRedis:
     def __init__(self, fields: dict[str | bytes, str | bytes]) -> None:
         self._fields = fields
+        self.eval_calls: list[tuple[str, int, tuple[Any, ...]]] = []
 
     async def xgroup_create(self, *args: Any, **kwargs: Any) -> None:
         return None
@@ -23,6 +24,13 @@ class FakeRedis:
 
     async def xautoclaim(self, *args: Any, **kwargs: Any) -> list[Any]:
         return ["0-0", [("1-0", self._fields)], []]
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> bytes:
+        self.eval_calls.append((script, numkeys, args))
+        return b"7-0"
+
+    async def xadd(self, *args: Any, **kwargs: Any) -> bytes:
+        return b"8-0"
 
 
 @pytest.mark.asyncio
@@ -52,3 +60,23 @@ async def test_broker_normalizes_decoded_and_byte_stream_fields(
     assert [(message.aggregate_id, message.enqueued_at) for message in reclaimed] == [
         expected
     ]
+
+
+@pytest.mark.asyncio
+async def test_publish_uses_atomic_aggregate_deduplication() -> None:
+    client = FakeRedis({})
+    broker = RedisStreamsBroker(cast(Redis, client))
+
+    first = await broker.publish(
+        "jobs", "job-1", datetime(2026, 8, 5, tzinfo=UTC), dedupe_key="outbox-1:0"
+    )
+    second = await broker.publish(
+        "jobs", "job-1", datetime(2026, 8, 5, tzinfo=UTC), dedupe_key="outbox-1:0"
+    )
+
+    assert first == second == "7-0"
+    assert all(call[1] == 2 for call in client.eval_calls)
+    assert all(
+        call[2][:3] == ("jobs:dedupe", "jobs", "outbox-1:0")
+        for call in client.eval_calls
+    )

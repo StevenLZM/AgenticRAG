@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -88,6 +88,54 @@ class SqlAlchemyParentStagingStore:
                     )
                 ).scalar_one()
             )
+
+    async def count_total(self, context: StagingContext) -> int:
+        """Count this exact version across active and inactive lifecycle states."""
+        async with self._session_factory() as session:
+            return int(
+                (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(parent_chunks)
+                        .where(
+                            parent_chunks.c.user_id == context.user_id,
+                            parent_chunks.c.document_id == context.document_id,
+                            parent_chunks.c.document_version_id
+                            == context.document_version_id,
+                        )
+                    )
+                ).scalar_one()
+            )
+
+    async def activate(self, context: StagingContext) -> None:
+        await self._set_status(context, "active")
+
+    async def deactivate(self, context: StagingContext) -> None:
+        await self._set_status(context, "inactive")
+
+    async def delete(self, context: StagingContext) -> None:
+        async with self._session_factory.begin() as session:
+            await session.execute(
+                delete(parent_chunks).where(
+                    parent_chunks.c.user_id == context.user_id,
+                    parent_chunks.c.document_id == context.document_id,
+                    parent_chunks.c.document_version_id == context.document_version_id,
+                )
+            )
+
+    async def _set_status(self, context: StagingContext, status: str) -> None:
+        async with self._session_factory.begin() as session:
+            await session.execute(
+                update(parent_chunks)
+                .where(
+                    parent_chunks.c.user_id == context.user_id,
+                    parent_chunks.c.document_id == context.document_id,
+                    parent_chunks.c.document_version_id
+                    == context.document_version_id,
+                )
+                .values(status=status)
+            )
+            # Zero rows is a safe no-op for retries after deletion reconciliation.
 
     async def attach_manifest(
         self,

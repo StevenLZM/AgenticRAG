@@ -41,10 +41,20 @@ class _Indices:
 
 
 class _Client:
-    def __init__(self, *, existing_mapping: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        existing_mapping: dict[str, Any] | None = None,
+        lifecycle_response: dict[str, Any] | None = None,
+    ) -> None:
         self.indices = _Indices(existing_mapping=existing_mapping)
         self.operations: list[dict[str, Any]] = []
         self.bulk_calls = 0
+        self.lifecycle_response = lifecycle_response or {
+            "total": 1,
+            "version_conflicts": 0,
+            "failures": [],
+        }
 
     async def bulk(
         self,
@@ -57,6 +67,12 @@ class _Client:
         return _Response(
             {"errors": False, "items": [{"index": {"_id": "child-1", "status": 201}}]}
         )
+
+    async def update_by_query(self, **kwargs: Any) -> _Response:
+        return _Response(self.lifecycle_response)
+
+    async def delete_by_query(self, **kwargs: Any) -> _Response:
+        return _Response(self.lifecycle_response)
 
 
 def _embedded_child(*, index_generation: str = "index-v2") -> EmbeddedChild:
@@ -237,3 +253,17 @@ def test_es_index_name_does_not_alias_noncanonical_generations(
 ) -> None:
     with pytest.raises(ValueError):
         ElasticsearchChildIndexStore.index_name(generation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["activate", "deactivate", "delete"])
+async def test_lifecycle_write_fails_closed_on_partial_es_conflicts(
+    operation: str,
+) -> None:
+    client = _Client(
+        lifecycle_response={"total": 1, "version_conflicts": 1, "failures": []}
+    )
+    store = ElasticsearchChildIndexStore(cast(Any, client))
+
+    with pytest.raises(ChildIndexWriteError, match="did not fully apply"):
+        await getattr(store, operation)(_context())

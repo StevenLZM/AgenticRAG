@@ -91,26 +91,84 @@ class ElasticsearchChildIndexStore:
         """Return active records for publication/reconciliation validation."""
         return await self._count(context, is_active=True)
 
+    async def count_total(self, context: StagingContext) -> int:
+        response = await self._client.count(
+            index=self.index_name(context.index_generation),
+            query={"bool": {"filter": self._scope_filters(context)}},
+        )
+        return int(cast(Mapping[str, Any], response.body)["count"])
+
+    async def activate(self, context: StagingContext) -> None:
+        await self._set_active(context, is_active=True)
+
+    async def deactivate(self, context: StagingContext) -> None:
+        await self._set_active(context, is_active=False)
+
+    async def delete(self, context: StagingContext) -> None:
+        response = await self._client.delete_by_query(
+            index=self.index_name(context.index_generation),
+            query={"bool": {"filter": self._scope_filters(context)}},
+            allow_no_indices=True,
+            conflicts="abort",
+            ignore_unavailable=True,
+            refresh=True,
+        )
+        self._require_complete_lifecycle(
+            cast(Mapping[str, Any], response.body), operation="delete"
+        )
+
+    async def _set_active(
+        self, context: StagingContext, *, is_active: bool
+    ) -> None:
+        response = await self._client.update_by_query(
+            index=self.index_name(context.index_generation),
+            query={"bool": {"filter": self._scope_filters(context)}},
+            script={
+                "lang": "painless",
+                "source": "ctx._source.is_active = params.is_active",
+                "params": {"is_active": is_active},
+            },
+            allow_no_indices=True,
+            conflicts="abort",
+            ignore_unavailable=True,
+            refresh=True,
+        )
+        self._require_complete_lifecycle(
+            cast(Mapping[str, Any], response.body), operation="activation"
+        )
+
+    @staticmethod
+    def _require_complete_lifecycle(
+        body: Mapping[str, Any], *, operation: str
+    ) -> None:
+        failures = body.get("failures", ())
+        if body.get("timed_out") or int(body.get("version_conflicts", 0)) or failures:
+            raise ChildIndexWriteError(
+                f"Elasticsearch Child {operation} did not fully apply"
+            )
+
     async def _count(self, context: StagingContext, *, is_active: bool) -> int:
         response = await self._client.count(
             index=self.index_name(context.index_generation),
             query={
                 "bool": {
                     "filter": [
-                        {"term": {"user_id": context.user_id}},
-                        {"term": {"document_id": context.document_id}},
-                        {
-                            "term": {
-                                "document_version_id": context.document_version_id
-                            }
-                        },
-                        {"term": {"search_type": "document"}},
+                        *self._scope_filters(context),
                         {"term": {"is_active": is_active}},
                     ]
                 }
             },
         )
         return int(cast(Mapping[str, Any], response.body)["count"])
+
+    @staticmethod
+    def _scope_filters(context: StagingContext) -> list[Mapping[str, Any]]:
+        return [
+            {"term": {"user_id": context.user_id}},
+            {"term": {"document_id": context.document_id}},
+            {"term": {"document_version_id": context.document_version_id}},
+            {"term": {"search_type": "document"}},
+        ]
 
     async def _ensure_index(self, index_generation: str) -> None:
         index = self.index_name(index_generation)

@@ -1086,10 +1086,21 @@ class SqlAlchemyParentRepository(_SqlAlchemyRepository):
         rows = (
             (
                 await self._session().execute(
-                    select(parent_chunks).where(
+                    select(parent_chunks)
+                    .select_from(
+                        parent_chunks.join(
+                            documents,
+                            parent_chunks.c.document_id == documents.c.id,
+                        )
+                    )
+                    .where(
                         parent_chunks.c.id.in_(parent_ids),
                         parent_chunks.c.user_id == scope.user_id,
                         parent_chunks.c.status == "active",
+                        documents.c.user_id == scope.user_id,
+                        documents.c.status == DocumentStatus.ACTIVE.value,
+                        documents.c.active_version_id
+                        == parent_chunks.c.document_version_id,
                     )
                 )
             )
@@ -1253,10 +1264,7 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
         await self._session().execute(
             update(task_outbox)
             .where(task_outbox.c.id == outbox_id, task_outbox.c.status == "pending")
-            .values(
-                attempt_count=task_outbox.c.attempt_count + 1,
-                next_attempt_at=_now() + timedelta(seconds=5),
-            )
+            .values(next_attempt_at=_now() + timedelta(seconds=5))
         )
 
 
