@@ -36,6 +36,10 @@ class ArtifactStore(Protocol):
 
     def read_json(self, ref: ArtifactRef) -> Any: ...
 
+    def read_bytes(self, ref: ArtifactRef) -> bytes: ...
+
+    def describe(self, uri: str) -> ArtifactRef: ...
+
     def verify(self, ref: ArtifactRef) -> bool: ...
 
     def delete(self, ref: ArtifactRef) -> None: ...
@@ -115,14 +119,22 @@ class LocalArtifactStore:
         )
 
     def read_json(self, ref: ArtifactRef) -> Any:
-        path = self._path_from_ref(ref)
-        payload = path.read_bytes()
+        payload = self.read_bytes(ref)
+        return json.loads(payload.decode("utf-8"))
+
+    def read_bytes(self, ref: ArtifactRef) -> bytes:
+        payload = self._path_from_ref(ref).read_bytes()
         if (
             len(payload) != ref.size_bytes
             or hashlib.sha256(payload).hexdigest() != ref.sha256
         ):
             raise ValueError("artifact content does not match its reference")
-        return json.loads(payload.decode("utf-8"))
+        return payload
+
+    def describe(self, uri: str) -> ArtifactRef:
+        placeholder = ArtifactRef(uri=uri, sha256="0" * 64, size_bytes=0)
+        sha256, size_bytes = _hash_file(self._path_from_ref(placeholder))
+        return ArtifactRef(uri=uri, sha256=sha256, size_bytes=size_bytes)
 
     def verify(self, ref: ArtifactRef) -> bool:
         try:
