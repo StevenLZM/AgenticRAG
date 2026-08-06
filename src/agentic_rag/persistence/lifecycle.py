@@ -182,13 +182,18 @@ class SqlAlchemyPublicationRepository(PublicationRepository):
                 context.document_version_id,
             }:
                 winner = await session.execute(
-                    select(document_versions.c.id, document_versions.c.version_no).where(
+                    select(
+                        document_versions.c.id, document_versions.c.version_no
+                    ).where(
                         document_versions.c.id == current_pointer,
                         document_versions.c.document_id == context.document_id,
                     )
                 )
                 winner_row = winner.one_or_none()
-                if winner_row is not None and winner_row.version_no > context.version_no:
+                if (
+                    winner_row is not None
+                    and winner_row.version_no > context.version_no
+                ):
                     raise PublicationObsoleteError(context, cast(str, winner_row.id))
                 raise PublicationConflict("active version changed during publication")
 
@@ -326,7 +331,12 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
             rows = (
                 (
                     await session.execute(
-                        select(ingestion_jobs.c.id)
+                        select(
+                            ingestion_jobs.c.id,
+                            ingestion_jobs.c.document_id,
+                            ingestion_jobs.c.document_version_id,
+                            ingestion_jobs.c.attempt_count,
+                        )
                         .where(
                             ingestion_jobs.c.status == JobStatus.RUNNING.value,
                             or_(
@@ -334,20 +344,31 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                                 ingestion_jobs.c.lease_expires_at <= now,
                             ),
                         )
-                        .order_by(ingestion_jobs.c.lease_expires_at, ingestion_jobs.c.id)
+                        .order_by(
+                            ingestion_jobs.c.lease_expires_at, ingestion_jobs.c.id
+                        )
                         .limit(limit)
                         .with_for_update(skip_locked=True)
                     )
                 )
-                .scalars()
+                .mappings()
                 .all()
             )
-            job_ids = tuple(cast(str, value) for value in rows)
+            job_ids = tuple(cast(str, row["id"]) for row in rows)
             if job_ids:
+                failed_rows = [
+                    row for row in rows if int(row["attempt_count"]) + 1 >= 3
+                ]
+                failed_ids = tuple(cast(str, row["id"]) for row in failed_rows)
+                retry_ids = tuple(
+                    cast(str, row["id"])
+                    for row in rows
+                    if cast(str, row["id"]) not in failed_ids
+                )
                 await session.execute(
                     update(ingestion_jobs)
                     .where(
-                        ingestion_jobs.c.id.in_(job_ids),
+                        ingestion_jobs.c.id.in_(retry_ids),
                         ingestion_jobs.c.status == JobStatus.RUNNING.value,
                         or_(
                             ingestion_jobs.c.lease_expires_at.is_(None),
@@ -367,7 +388,7 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                     update(task_outbox)
                     .where(
                         task_outbox.c.aggregate_type == "ingestion_job",
-                        task_outbox.c.aggregate_id.in_(job_ids),
+                        task_outbox.c.aggregate_id.in_(retry_ids),
                     )
                     .values(
                         status="pending",
@@ -376,7 +397,95 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                         dispatched_at=None,
                     )
                 )
+                if failed_ids:
+                    await session.execute(
+                        update(ingestion_jobs)
+                        .where(
+                            ingestion_jobs.c.id.in_(failed_ids),
+                            ingestion_jobs.c.status == JobStatus.RUNNING.value,
+                        )
+                        .values(
+                            status=JobStatus.FAILED.value,
+                            lease_owner=None,
+                            lease_expires_at=None,
+                            heartbeat_at=None,
+                            attempt_count=ingestion_jobs.c.attempt_count + 1,
+                            error_code="lease_attempts_exhausted",
+                            dead_letter_status="pending",
+                            dead_letter_reason="lease_attempts_exhausted",
+                            updated_at=now,
+                        )
+                    )
+                    failed_version_ids = tuple(
+                        cast(str, row["document_version_id"]) for row in failed_rows
+                    )
+                    failed_document_ids = tuple(
+                        cast(str, row["document_id"]) for row in failed_rows
+                    )
+                    await session.execute(
+                        update(document_versions)
+                        .where(
+                            document_versions.c.id.in_(failed_version_ids),
+                            document_versions.c.status.in_(
+                                (
+                                    DocumentVersionStatus.UPLOADED.value,
+                                    DocumentVersionStatus.BUILDING.value,
+                                    DocumentVersionStatus.QUARANTINED.value,
+                                )
+                            ),
+                        )
+                        .values(status=DocumentVersionStatus.FAILED.value)
+                    )
+                    await session.execute(
+                        update(documents)
+                        .where(
+                            documents.c.id.in_(failed_document_ids),
+                            documents.c.active_version_id.is_(None),
+                            documents.c.status != DocumentStatus.DELETED.value,
+                        )
+                        .values(status=DocumentStatus.FAILED.value, updated_at=now)
+                    )
+                    await session.execute(
+                        update(task_outbox)
+                        .where(
+                            task_outbox.c.aggregate_type == "ingestion_job",
+                            task_outbox.c.aggregate_id.in_(failed_ids),
+                        )
+                        .values(
+                            status="pending",
+                            attempt_count=task_outbox.c.attempt_count + 1,
+                            next_attempt_at=now,
+                            dispatched_at=None,
+                        )
+                    )
             return job_ids
+
+    async def resolve_published_job(self, version_id: str) -> None:
+        now = _now()
+        async with self._session_factory.begin() as session:
+            await session.execute(
+                update(ingestion_jobs)
+                .where(
+                    ingestion_jobs.c.document_version_id == version_id,
+                    ingestion_jobs.c.status.in_(
+                        (
+                            JobStatus.QUEUED.value,
+                            JobStatus.RUNNING.value,
+                            JobStatus.FAILED.value,
+                        )
+                    ),
+                )
+                .values(
+                    status=JobStatus.COMPLETED.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None,
+                    error_code=None,
+                    dead_letter_status=None,
+                    dead_letter_reason=None,
+                    updated_at=now,
+                )
+            )
 
     async def list_stale_building_versions(self, limit: int) -> tuple[str, ...]:
         cutoff = _now() - self._stale_after
@@ -395,25 +504,31 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
         )
         async with self._session_factory() as session:
             values = (
-                await session.execute(
-                    select(document_versions.c.id)
-                    .select_from(
-                        document_versions.join(
-                            documents,
-                            document_versions.c.document_id == documents.c.id,
+                (
+                    await session.execute(
+                        select(document_versions.c.id)
+                        .select_from(
+                            document_versions.join(
+                                documents,
+                                document_versions.c.document_id == documents.c.id,
+                            )
                         )
+                        .where(
+                            document_versions.c.status
+                            == DocumentVersionStatus.BUILDING.value,
+                            document_versions.c.created_at <= cutoff,
+                            documents.c.status != DocumentStatus.DELETED.value,
+                            ~live_job,
+                        )
+                        .order_by(
+                            document_versions.c.created_at, document_versions.c.id
+                        )
+                        .limit(limit)
                     )
-                    .where(
-                        document_versions.c.status
-                        == DocumentVersionStatus.BUILDING.value,
-                        document_versions.c.created_at <= cutoff,
-                        documents.c.status != DocumentStatus.DELETED.value,
-                        ~live_job,
-                    )
-                    .order_by(document_versions.c.created_at, document_versions.c.id)
-                    .limit(limit)
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         return tuple(cast(str, value) for value in values)
 
     async def list_pointer_mismatches(self, limit: int) -> tuple[PointerMismatch, ...]:
@@ -433,75 +548,84 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
         )
         async with self._session_factory() as session:
             values = (
-                await session.execute(
-                    select(
-                        document_versions,
-                        documents.c.user_id.label("user_id"),
-                        documents.c.status.label("document_status"),
-                        documents.c.active_version_id,
-                        pointed.c.version_no.label("pointed_version_no"),
-                    )
-                    .select_from(
-                        document_versions.join(
-                            documents,
-                            document_versions.c.document_id == documents.c.id,
-                        ).outerjoin(
-                            pointed,
-                            documents.c.active_version_id == pointed.c.id,
+                (
+                    await session.execute(
+                        select(
+                            document_versions,
+                            documents.c.user_id.label("user_id"),
+                            documents.c.status.label("document_status"),
+                            documents.c.active_version_id,
+                            pointed.c.version_no.label("pointed_version_no"),
                         )
-                    )
-                    .where(
-                        documents.c.status != DocumentStatus.DELETED.value,
-                        ~live_job,
-                        or_(
-                            and_(
-                                document_versions.c.status
-                                == DocumentVersionStatus.BUILDING.value,
-                                document_versions.c.manifest_path.is_not(None),
-                                document_versions.c.manifest_hash.is_not(None),
-                                or_(
-                                    documents.c.active_version_id.is_(None),
-                                    document_versions.c.id
-                                    != documents.c.active_version_id,
-                                ),
-                            ),
-                            and_(
-                                document_versions.c.status
-                                == DocumentVersionStatus.ACTIVE.value,
-                                or_(
-                                    documents.c.active_version_id.is_(None),
-                                    document_versions.c.id
-                                    != documents.c.active_version_id,
-                                ),
-                            ),
-                            and_(
-                                documents.c.active_version_id
-                                == document_versions.c.id,
-                                pointed.c.status
-                                != DocumentVersionStatus.ACTIVE.value,
-                                or_(
+                        .select_from(
+                            document_versions.join(
+                                documents,
+                                document_versions.c.document_id == documents.c.id,
+                            ).outerjoin(
+                                pointed,
+                                documents.c.active_version_id == pointed.c.id,
+                            )
+                        )
+                        .where(
+                            documents.c.status != DocumentStatus.DELETED.value,
+                            ~live_job,
+                            or_(
+                                and_(
                                     document_versions.c.status
-                                    != DocumentVersionStatus.BUILDING.value,
-                                    and_(
-                                        document_versions.c.manifest_path.is_not(None),
-                                        document_versions.c.manifest_hash.is_not(None),
+                                    == DocumentVersionStatus.BUILDING.value,
+                                    document_versions.c.manifest_path.is_not(None),
+                                    document_versions.c.manifest_hash.is_not(None),
+                                    or_(
+                                        documents.c.active_version_id.is_(None),
+                                        document_versions.c.id
+                                        != documents.c.active_version_id,
                                     ),
                                 ),
+                                and_(
+                                    document_versions.c.status
+                                    == DocumentVersionStatus.ACTIVE.value,
+                                    or_(
+                                        documents.c.active_version_id.is_(None),
+                                        document_versions.c.id
+                                        != documents.c.active_version_id,
+                                    ),
+                                ),
+                                and_(
+                                    documents.c.active_version_id
+                                    == document_versions.c.id,
+                                    pointed.c.status
+                                    != DocumentVersionStatus.ACTIVE.value,
+                                    or_(
+                                        document_versions.c.status
+                                        != DocumentVersionStatus.BUILDING.value,
+                                        and_(
+                                            document_versions.c.manifest_path.is_not(
+                                                None
+                                            ),
+                                            document_versions.c.manifest_hash.is_not(
+                                                None
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                and_(
+                                    documents.c.active_version_id
+                                    == document_versions.c.id,
+                                    document_versions.c.status
+                                    == DocumentVersionStatus.ACTIVE.value,
+                                    documents.c.status != DocumentStatus.ACTIVE.value,
+                                ),
                             ),
-                            and_(
-                                documents.c.active_version_id
-                                == document_versions.c.id,
-                                document_versions.c.status
-                                == DocumentVersionStatus.ACTIVE.value,
-                                documents.c.status
-                                != DocumentStatus.ACTIVE.value,
-                            ),
-                        ),
+                        )
+                        .order_by(
+                            document_versions.c.created_at, document_versions.c.id
+                        )
+                        .limit(limit)
                     )
-                    .order_by(document_versions.c.created_at, document_versions.c.id)
-                    .limit(limit)
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
         mismatches: list[PointerMismatch] = []
         for row in values:
             version_id = cast(str, row["id"])
@@ -510,7 +634,9 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
             pointed_version_no = cast(int | None, row["pointed_version_no"])
             status = cast(str, row["status"])
             document_status = cast(str, row["document_status"])
-            has_manifest = row["manifest_path"] is not None and row["manifest_hash"] is not None
+            has_manifest = (
+                row["manifest_path"] is not None and row["manifest_hash"] is not None
+            )
             action: Literal["publish", "deactivate", "restore"]
             if (
                 version_id == pointer
@@ -520,11 +646,25 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                 action = "restore"
             else:
                 publish = has_manifest and (
-                    (version_id == pointer and status in {DocumentVersionStatus.BUILDING.value, DocumentVersionStatus.INACTIVE.value})
+                    (
+                        version_id == pointer
+                        and status
+                        in {
+                            DocumentVersionStatus.BUILDING.value,
+                            DocumentVersionStatus.INACTIVE.value,
+                        }
+                    )
                     or (
                         version_id != pointer
-                        and status in {DocumentVersionStatus.BUILDING.value, DocumentVersionStatus.ACTIVE.value}
-                        and (pointed_version_no is None or version_no > pointed_version_no)
+                        and status
+                        in {
+                            DocumentVersionStatus.BUILDING.value,
+                            DocumentVersionStatus.ACTIVE.value,
+                        }
+                        and (
+                            pointed_version_no is None
+                            or version_no > pointed_version_no
+                        )
                     )
                 )
                 action = "publish" if publish else "deactivate"
@@ -690,8 +830,7 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
             )
         grouped: dict[str, list[StagingContext]] = {value: [] for value in document_ids}
         user_by_document = {
-            cast(str, row["id"]): cast(str, row["user_id"])
-            for row in document_rows
+            cast(str, row["id"]): cast(str, row["user_id"]) for row in document_rows
         }
         for row in rows:
             grouped[cast(str, row["document_id"])].append(_context(row))
@@ -708,17 +847,21 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
         now = _now()
         async with self._session_factory.begin() as session:
             values = (
-                await session.execute(
-                    select(documents.c.id)
-                    .where(
-                        documents.c.status == DocumentStatus.DELETED.value,
-                        documents.c.deletion_status == "pending",
+                (
+                    await session.execute(
+                        select(documents.c.id)
+                        .where(
+                            documents.c.status == DocumentStatus.DELETED.value,
+                            documents.c.deletion_status == "pending",
+                        )
+                        .order_by(documents.c.updated_at, documents.c.id)
+                        .limit(limit)
+                        .with_for_update(skip_locked=True)
                     )
-                    .order_by(documents.c.updated_at, documents.c.id)
-                    .limit(limit)
-                    .with_for_update(skip_locked=True)
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             document_ids = tuple(cast(str, value) for value in values)
             if not document_ids:
                 return ()
@@ -746,7 +889,9 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                     documents.c.status == DocumentStatus.DELETED.value,
                     documents.c.deletion_status == "pending",
                 )
-                .values(deletion_status="fenced", deletion_fenced_at=now, updated_at=now)
+                .values(
+                    deletion_status="fenced", deletion_fenced_at=now, updated_at=now
+                )
             )
             return document_ids
 
@@ -756,8 +901,7 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                 update(document_versions)
                 .where(
                     document_versions.c.id == version_id,
-                    document_versions.c.status
-                    == DocumentVersionStatus.BUILDING.value,
+                    document_versions.c.status == DocumentVersionStatus.BUILDING.value,
                 )
                 .values(status=DocumentVersionStatus.QUARANTINED.value)
             )

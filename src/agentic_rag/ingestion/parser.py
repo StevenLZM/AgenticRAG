@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Any, Protocol, cast
@@ -73,7 +73,11 @@ class DocumentParser:
         self._max_file_size = max_file_size
 
     async def parse_batches(
-        self, original: ArtifactRef, envelope: DocumentEnvelope
+        self,
+        original: ArtifactRef,
+        envelope: DocumentEnvelope,
+        *,
+        before_artifact_write: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncIterator[FragmentAst]:
         if (
             original.uri != envelope.source_uri
@@ -136,6 +140,8 @@ class DocumentParser:
                 f"{envelope.document_version_id}/fragments/{envelope.parser_version}/"
                 f"{envelope.pipeline_version}/batch-{batch_no:06d}.json"
             )
+            if before_artifact_write is not None:
+                await before_artifact_write()
             artifact_ref = await asyncio.to_thread(
                 self._artifacts.put_json,
                 relative_path,

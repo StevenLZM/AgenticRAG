@@ -12,7 +12,7 @@ import pytest
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from agentic_rag.persistence.redis_queue import RedisStreamsBroker
+from agentic_rag.persistence.redis_queue import RedisStreamsBroker, StreamMessage
 from agentic_rag.persistence.outbox import OutboxDispatcher
 from agentic_rag.persistence.repositories import OutboxRecord
 
@@ -139,4 +139,38 @@ async def test_real_lua_dedupes_retry_and_allows_new_reclaim_generation() -> Non
         ]
     finally:
         await client.delete(stream, f"{stream}:dedupe")
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_dead_letter_publish_is_idempotent_per_attempt_generation() -> None:
+    """A crash between XADD and the SQL marker cannot duplicate the DLQ record."""
+    client = Redis.from_url(_local_redis_dsn(), decode_responses=True)
+    suffix = uuid4().hex
+    dead_stream = f"agenticrag:test:dead-once:{suffix}"
+    broker = RedisStreamsBroker(client)
+    message = StreamMessage(
+        id="1-0",
+        aggregate_id=f"job-{suffix}",
+        enqueued_at=datetime.now(UTC),
+    )
+    dedupe_key = f"ingestion-dead:{message.aggregate_id}:3"
+
+    try:
+        # Once explicitly configured, an unavailable service is a failed contract.
+        await client.ping()
+        await broker.dead_letter(
+            dead_stream, message, "parse_failed", dedupe_key=dedupe_key
+        )
+        await broker.dead_letter(
+            dead_stream, message, "parse_failed", dedupe_key=dedupe_key
+        )
+
+        entries = await client.xrange(dead_stream)
+        assert len(entries) == 1
+        assert entries[0][1]["aggregate_id"] == message.aggregate_id
+        assert entries[0][1]["reason"] == "parse_failed"
+    finally:
+        await client.delete(dead_stream, f"{dead_stream}:dedupe")
         await client.aclose()

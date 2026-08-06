@@ -197,7 +197,9 @@ class GlobalAssembler:
     def __init__(self, *, artifacts: ArtifactStore | None = None) -> None:
         self._artifacts = artifacts
 
-    def assemble(self, fragments: Sequence[FragmentAst]) -> CanonicalAst:
+    def assemble(
+        self, fragments: Sequence[FragmentAst], *, persist: bool = True
+    ) -> CanonicalAst:
         if not fragments:
             raise AstAssemblyError("at least one Fragment AST is required")
         envelope = fragments[0].envelope
@@ -226,7 +228,7 @@ class GlobalAssembler:
             docling_document=merged_docling_document,
             text_blocks=blocks,
         )
-        if self._artifacts is None:
+        if self._artifacts is None or not persist:
             return canonical
 
         relative_path = (

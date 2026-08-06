@@ -55,15 +55,21 @@ class ReconciliationRepository(Protocol):
 
     async def list_stale_building_versions(self, limit: int) -> tuple[str, ...]: ...
 
-    async def list_pointer_mismatches(self, limit: int) -> tuple[PointerMismatch, ...]: ...
+    async def list_pointer_mismatches(
+        self, limit: int
+    ) -> tuple[PointerMismatch, ...]: ...
 
     async def resolve_deactivated_version(self, version_id: str) -> None: ...
 
     async def restore_active_document(self, version_id: str) -> bool: ...
 
+    async def resolve_published_job(self, version_id: str) -> None: ...
+
     async def fence_pending_deletions(self, limit: int) -> tuple[str, ...]: ...
 
-    async def list_deleted_documents(self, limit: int) -> tuple[DeletedDocument, ...]: ...
+    async def list_deleted_documents(
+        self, limit: int
+    ) -> tuple[DeletedDocument, ...]: ...
 
     async def quarantine(self, version_id: str) -> None: ...
 
@@ -114,13 +120,18 @@ class IngestionReconciler:
             else:
                 redispatched.append(row.aggregate_id)
 
-        reclaimed = list(
-            await self._repository.reclaim_expired_jobs(self._scan_limit)
-        )
+        reclaimed = list(await self._repository.reclaim_expired_jobs(self._scan_limit))
         stale = await self._repository.list_stale_building_versions(self._scan_limit)
         mismatches = await self._repository.list_pointer_mismatches(self._scan_limit)
         publish_candidates = _unique(
-            (*stale, *(item.context.document_version_id for item in mismatches if item.action == "publish"))
+            (
+                *stale,
+                *(
+                    item.context.document_version_id
+                    for item in mismatches
+                    if item.action == "publish"
+                ),
+            )
         )
         repaired: list[str] = []
         quarantined: list[str] = []
@@ -147,13 +158,19 @@ class IngestionReconciler:
             except Exception:
                 continue
             else:
+                try:
+                    await self._repository.resolve_published_job(version_id)
+                except Exception:
+                    continue
                 repaired.append(version_id)
 
         for mismatch in mismatches:
             if mismatch.action == "restore":
                 version_id = mismatch.context.document_version_id
                 try:
-                    restored = await self._repository.restore_active_document(version_id)
+                    restored = await self._repository.restore_active_document(
+                        version_id
+                    )
                 except Exception:
                     continue
                 if restored:

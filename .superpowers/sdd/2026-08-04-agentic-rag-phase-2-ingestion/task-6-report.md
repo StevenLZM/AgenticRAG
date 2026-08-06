@@ -53,3 +53,89 @@ Final targeted GREEN:
 - Real MySQL/Elasticsearch/Redis end-to-end execution requires the existing explicit disposable DSN environment variables; the default suite never guesses or mutates developer services.
 - The local worker constructs the Docling tokenizer on startup and may require the configured Hugging Face model to already be cached or locally downloadable.
 - SQLite checkpointing deliberately retains the Phase 1 single-ingestion-worker constraint; horizontal workers require replacing the Checkpoint port first.
+
+## Official review fix round 1
+
+The review of `ce5edd0` found one Critical delivery-generation defect, five
+Important runtime/convergence defects, and two Important test-depth gaps. This
+round closes them without adding a second scheduler or an alternate ingestion
+architecture:
+
+- Quarantine approval now atomically rotates the outbox attempt generation and
+  recreates a missing row. Redis therefore appends a new notification after the
+  old quarantined notification was ACKed, while retries inside either generation
+  remain Lua-deduplicated. Explicit Redis regressions cover both upload-time and
+  post-parse quarantine states through approval, new Claim, and completion.
+- Terminal failure now atomically records durable DLQ intent, fails an
+  unpublished Version and pointerless Document, and preserves an existing active
+  Document. A failure after publication instead converges the Job to COMPLETED;
+  reconciler publication also resolves a stranded Job to COMPLETED.
+- DLQ publication is idempotent per `{job_id}:{attempt_count}`. A crash or Redis
+  failure between the SQL terminal commit and Dead Stream write leaves the
+  message pending; terminal fast-path delivery repairs the DLQ before ACK.
+  Expired leases use the same three-attempt ceiling and rotate the outbox
+  generation for both retries and terminal repair delivery.
+- The durable Claim fence is threaded through Parser Fragment writes, Canonical
+  and Chunk Artifact writes, embedding batches, Parent/Child staging, Manifest
+  persistence/attachment, Elasticsearch bulk batches, and every publication
+  mutation. Focused fault-injection tests prove work stops at parser,
+  cross-store staging, and publication boundaries after lease loss.
+- `run_forever()` isolates broker and per-message failures, applies bounded
+  exponential backoff with structured logs, keeps the reconciler resilient, and
+  supports stop-claiming/drain-current-work shutdown. Heartbeat lease loss
+  cancels and awaits the graph; tests cover broker recovery, graceful draining,
+  and cancellation without ACK.
+- The tokenizer model is an explicit validated setting aligned to the Qwen
+  embedding family (`Qwen/Qwen3-Embedding-0.6B`), instead of a hidden MiniLM
+  launcher constant.
+- Alembic revision `0005_ingestion_dead_letter_state` adds the paired durable DLQ
+  fields and invariant. Real MySQL schema inspection and real Redis DLQ Lua
+  behavior are opt-in behind explicit disposable local DSNs.
+- A new production-composition E2E covers text, Excel, text PDF, and scanned/OCR
+  PDF through real DocumentService, outbox/Redis, Worker, LangGraph with SQLite,
+  Docling, Artifact Store, MySQL Parent staging, Elasticsearch Child staging,
+  publication, and final lifecycle state. It injects a crash after real
+  cross-store staging and resumes the same message, then verifies active rows
+  and deterministic IDs. Only embedding is a deterministic test adapter, so no
+  external paid model API is required.
+
+Review-driven RED evidence included the durable DLQ crash window, the third
+expired-lease lifecycle, missing/unchanged quarantine outbox delivery generation,
+and publication-after-final-commit lifecycle mismatch. Focused GREEN evidence:
+
+```text
+compound side-effect lease boundaries + worker shutdown/heartbeat: 5 passed
+Task 6 focused worker/store/lifecycle/graph set: 93 passed, 3 DSN-gated skipped
+adjacent Task 5 lifecycle suites: 46 passed
+```
+
+Fresh verification after the fix round:
+
+```text
+conda run -n agentic-rag python -m pytest tests/unit/ingestion tests/unit/safety -q
+133 passed
+
+conda run -n agentic-rag python -m pytest -m integration tests/integration/ingestion -q
+9 passed, 9 skipped, 18 existing Docling warnings
+
+conda run -n agentic-rag python -m pytest -m e2e tests/e2e -q
+3 passed, 1 skipped
+
+conda run -n agentic-rag python -m pytest -q
+256 passed, 32 skipped, 18 existing Docling warnings
+
+conda run -n agentic-rag ruff check src scripts tests
+All checks passed!
+
+conda run -n agentic-rag mypy src scripts/run_ingestion_worker.py \
+  scripts/review_quarantined_version.py tests/unit/ingestion/test_worker.py \
+  tests/unit/ingestion/test_worker_store.py tests/e2e/test_ingestion_pipeline.py \
+  tests/e2e/test_ingestion_pipeline_real_services.py \
+  tests/integration/ingestion/test_quarantine_approval_delivery.py
+Success: no issues found in 48 source files
+```
+
+The three-service E2E and real Redis/MySQL contracts were collected but skipped
+because their explicit test DSNs were absent. Once any test DSN is configured,
+unavailable infrastructure fails the test rather than silently falling back to
+fakes or guessed developer services.

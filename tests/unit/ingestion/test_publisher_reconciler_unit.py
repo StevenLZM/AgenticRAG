@@ -47,7 +47,11 @@ class _Artifacts:
 
     def verify(self, ref: ArtifactRef) -> bool:
         value = self.payloads.get(ref.uri)
-        return value is not None and len(value) == ref.size_bytes and hashlib.sha256(value).hexdigest() == ref.sha256
+        return (
+            value is not None
+            and len(value) == ref.size_bytes
+            and hashlib.sha256(value).hexdigest() == ref.sha256
+        )
 
     def read_json(self, ref: ArtifactRef) -> object:
         if not self.verify(ref):
@@ -64,7 +68,9 @@ class _Artifacts:
             raise OSError("artifact cleanup failed")
         prefix = f"artifact://documents/{user_id}/{document_id}/"
         self.payloads = {
-            uri: value for uri, value in self.payloads.items() if not uri.startswith(prefix)
+            uri: value
+            for uri, value in self.payloads.items()
+            if not uri.startswith(prefix)
         }
         self.deleted_scopes.append(scope)
 
@@ -113,7 +119,9 @@ class _PublicationRepository:
     async def get_target(self, version_id: str) -> PublicationTarget | None:
         if version_id != self.target.context.document_version_id:
             return None
-        return self.target.model_copy(update={"active_version_id": self.active_version_id})
+        return self.target.model_copy(
+            update={"active_version_id": self.active_version_id}
+        )
 
     async def finalize(self, target: PublicationTarget) -> None:
         self.events.append(f"finalize:{target.context.document_version_id}")
@@ -168,6 +176,9 @@ class _ReconciliationRepository:
         self.restored_documents.append(version_id)
         return True
 
+    async def resolve_published_job(self, version_id: str) -> None:
+        return None
+
     async def fence_pending_deletions(self, limit: int) -> tuple[str, ...]:
         selected = self.pending_deletions[:limit]
         self.pending_deletions = self.pending_deletions[len(selected) :]
@@ -204,9 +215,7 @@ class _ReconciliationRepository:
             value for value in self.deleted if value.document_id != document_id
         )
         self.fenced_deletions = tuple(
-            value
-            for value in self.fenced_deletions
-            if value.document_id != document_id
+            value for value in self.fenced_deletions if value.document_id != document_id
         )
         if completed is not None:
             self.completed_deletions = (*self.completed_deletions, completed)
@@ -245,7 +254,9 @@ class _FirstDeactivateFails(_LifecycleStore):
         await super().deactivate(context)
 
 
-def _system(*, corrupt_manifest: bool = False, corrupt_canonical: bool = False) -> tuple[
+def _system(
+    *, corrupt_manifest: bool = False, corrupt_canonical: bool = False
+) -> tuple[
     VersionPublisher,
     _PublicationRepository,
     _LifecycleStore,
@@ -389,13 +400,34 @@ async def test_bad_manifest_is_quarantined_instead_of_published() -> None:
     assert repository.active_version_id == "version-1"
 
 
-async def test_publisher_rechecks_document_writability_before_each_physical_step() -> None:
+async def test_publisher_rechecks_document_writability_before_each_physical_step() -> (
+    None
+):
     publisher, repository, parents, children, _ = _system()
     repository.writable_until_check = 1
 
     with pytest.raises(PublicationIntegrityError, match="writable"):
         await publisher.publish("version-2")
 
+    assert parents.active == {"version-1", "version-2"}
+    assert children.active == {"version-1"}
+    assert repository.active_version_id == "version-1"
+
+
+async def test_publisher_checks_lease_before_every_physical_mutation() -> None:
+    publisher, repository, parents, children, events = _system()
+    checks = 0
+
+    async def lease_fence() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("lease lost before child activation")
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        await publisher.publish("version-2", before_side_effect=lease_fence)
+
+    assert events == ["parents.activate:version-2"]
     assert parents.active == {"version-1", "version-2"}
     assert children.active == {"version-1"}
     assert repository.active_version_id == "version-1"
@@ -546,7 +578,9 @@ async def test_outbox_sql_mark_failure_does_not_block_later_deletion() -> None:
     assert report.reconciled_deletions == ("document-1",)
 
 
-async def test_inactive_only_deleted_document_removes_all_physical_data_and_artifacts() -> None:
+async def test_inactive_only_deleted_document_removes_all_physical_data_and_artifacts() -> (
+    None
+):
     publisher, _, parents, children, _ = _system()
     artifacts = _Artifacts(
         {
@@ -658,7 +692,9 @@ async def test_deletion_fence_precedes_cleanup_of_late_inflight_writes() -> None
     assert state.deletion_marks == [context.document_id]
 
 
-async def test_completed_deletion_resweeps_late_physical_writes_without_rereporting() -> None:
+async def test_completed_deletion_resweeps_late_physical_writes_without_rereporting() -> (
+    None
+):
     publisher, _, parents, children, _ = _system()
     context = _context("version-late", 1)
     deleted = DeletedDocument(
@@ -746,7 +782,9 @@ async def test_failed_first_deactivation_does_not_starve_later_mismatch() -> Non
     assert state.resolved_mismatches == ["version-3"]
 
 
-async def test_obsolete_publication_is_physically_deactivated_before_terminal_state() -> None:
+async def test_obsolete_publication_is_physically_deactivated_before_terminal_state() -> (
+    None
+):
     from agentic_rag.ingestion.publisher import PublicationObsoleteError
 
     _, _, parents, children, _ = _system()

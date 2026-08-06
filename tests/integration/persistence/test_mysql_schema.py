@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from urllib.parse import urlparse
 from uuid import uuid4
+from typing import cast
 
 import pytest
 from alembic import command
@@ -248,6 +249,13 @@ async def test_migration_creates_exact_schema_with_required_keys(
             document_checks = {
                 item["name"] for item in inspector.get_check_constraints("documents")
             }
+            ingestion_job_columns = {
+                item["name"] for item in inspector.get_columns("ingestion_jobs")
+            }
+            ingestion_job_checks = {
+                item["name"]
+                for item in inspector.get_check_constraints("ingestion_jobs")
+            }
             return (
                 tables,
                 run_uniques,
@@ -256,6 +264,8 @@ async def test_migration_creates_exact_schema_with_required_keys(
                 foreign_keys,
                 document_columns,
                 document_checks,
+                ingestion_job_columns,
+                ingestion_job_checks,
             )
 
         (
@@ -266,18 +276,23 @@ async def test_migration_creates_exact_schema_with_required_keys(
             foreign_keys,
             document_columns,
             document_checks,
+            ingestion_job_columns,
+            ingestion_job_checks,
         ) = await schema.run_sync(inspect_schema)
 
     assert tables == EXPECTED_TABLES
     assert ("user_id", "thread_id", "active_slot") in run_uniques
     assert ("event_key",) in event_uniques
+    typed_indexes = cast(dict[str, dict[str, tuple[str, ...]]], indexes)
     required_indexes = {
-        table: {name: indexes[table].get(name) for name in definitions}
+        table: {name: typed_indexes[table].get(name) for name in definitions}
         for table, definitions in EXPECTED_INDEXES.items()
     }
     assert required_indexes == EXPECTED_INDEXES
     assert foreign_keys == EXPECTED_FOREIGN_KEYS
     assert document_columns["deletion_status"]["nullable"] is True
+    assert {"dead_letter_status", "dead_letter_reason"} <= ingestion_job_columns
+    assert "ck_ingestion_jobs_dead_letter_status" in ingestion_job_checks
     assert document_columns["deletion_fenced_at"]["nullable"] is True
     assert "ck_documents_deletion_status" in document_checks
 
@@ -321,16 +336,22 @@ async def test_concurrent_reconciliation_claims_are_disjoint_and_release_locks(
         # Both claim transactions have committed; a fresh transaction can lock rows.
         async with session_factory.begin() as transaction:
             locked = (
-                await transaction.execute(
-                    select(task_outbox.c.id)
-                    .where(task_outbox.c.id.in_(ids))
-                    .with_for_update()
+                (
+                    await transaction.execute(
+                        select(task_outbox.c.id)
+                        .where(task_outbox.c.id.in_(ids))
+                        .with_for_update()
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
         assert sorted(locked) == sorted(ids)
     finally:
         async with session_factory.begin() as transaction:
-            await transaction.execute(delete(task_outbox).where(task_outbox.c.id.in_(ids)))
+            await transaction.execute(
+                delete(task_outbox).where(task_outbox.c.id.in_(ids))
+            )
 
 
 @pytest.mark.asyncio

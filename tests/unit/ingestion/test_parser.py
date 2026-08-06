@@ -197,6 +197,48 @@ async def test_parser_filters_docling_document_into_versioned_page_batches(
 
 
 @pytest.mark.asyncio
+async def test_parser_checks_lease_immediately_before_each_fragment_write(
+    tmp_path: Path,
+) -> None:
+    artifacts = LocalArtifactStore(tmp_path)
+    original = artifacts.put_bytes("source/report.pdf", b"source bytes")
+    parser = DocumentParser(
+        source_loader=lambda _ref: b"source bytes",
+        artifacts=artifacts,
+        converter=_Converter(),
+        document_stream_factory=_Stream,
+        page_batch_size=2,
+    )
+    checks = 0
+
+    async def lease_fence() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("lease lost before fragment write")
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        _ = [
+            fragment
+            async for fragment in parser.parse_batches(
+                original,
+                _envelope(original.uri, original.sha256),
+                before_artifact_write=lease_fence,
+            )
+        ]
+
+    assert checks == 2
+    assert (
+        tmp_path
+        / "documents/user-1/doc-1/ver-1/fragments/docling-v1/ingestion-v1/batch-000001.json"
+    ).is_file()
+    assert not (
+        tmp_path
+        / "documents/user-1/doc-1/ver-1/fragments/docling-v1/ingestion-v1/batch-000002.json"
+    ).exists()
+
+
+@pytest.mark.asyncio
 async def test_parser_does_not_double_shift_restored_furniture_provenance(
     tmp_path: Path,
 ) -> None:

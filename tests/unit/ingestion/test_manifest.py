@@ -166,7 +166,11 @@ class RecordingChildStore(ChildIndexStore):
         self.staged: tuple[EmbeddedChild, ...] = ()
 
     async def stage(
-        self, context: StagingContext, children: Sequence[EmbeddedChild]
+        self,
+        context: StagingContext,
+        children: Sequence[EmbeddedChild],
+        *,
+        before_side_effect: Any = None,
     ) -> int:
         self.events.append("children.stage")
         self.staged = tuple(children)
@@ -325,6 +329,38 @@ async def test_staging_rechecks_document_writability_before_child_write(
 
     assert events == ["parents.stage"]
     assert children.staged == ()
+
+
+@pytest.mark.asyncio
+async def test_staging_checks_lease_at_each_cross_store_side_effect(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    embedding = FakeEmbedding([[[0.0] * 1024]])
+    parents = RecordingParentStore(events)
+    children = RecordingChildStore(events)
+    writer, artifacts = _writer(tmp_path, embedding, parents, children)
+    canonical = artifacts.put_bytes("canonical.json", b"canonical")
+    checks = 0
+
+    async def lease_fence() -> None:
+        nonlocal checks
+        checks += 1
+        # embedding, parent stage, then child-stage boundary
+        if checks == 3:
+            raise RuntimeError("lease lost before child stage")
+
+    with pytest.raises(RuntimeError, match="lease lost"):
+        await writer.stage(
+            _chunks(),
+            context=_context(),
+            canonical_ast=canonical,
+            before_side_effect=lease_fence,
+        )
+
+    assert events == ["parents.stage"]
+    assert children.staged == ()
+    assert parents.attachment is None
 
 
 @pytest.mark.asyncio

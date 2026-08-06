@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import socket
 import sys
 from collections.abc import Sequence
@@ -131,7 +132,7 @@ async def run(settings: Settings) -> None:
         artifacts=artifacts,
     )
     tokenizer = HuggingFaceTokenizer.from_pretrained(
-        "sentence-transformers/all-MiniLM-L6-v2", max_tokens=CHILD_MAX_TOKENS
+        settings.embedding_tokenizer_model, max_tokens=CHILD_MAX_TOKENS
     )
     parser = DocumentParser(
         source_loader=artifacts.read_bytes,
@@ -145,7 +146,7 @@ async def run(settings: Settings) -> None:
             max_upload_bytes=settings.max_upload_bytes
         ),
         parser=parser,
-        assembler=GlobalAssembler(artifacts=artifacts),
+        assembler=GlobalAssembler(),
         content_scanner=ContentSafetyScanner(),
         chunker=ChunkingPipeline(tokenizer),
         index_writer=IndexWriter(
@@ -166,7 +167,14 @@ async def run(settings: Settings) -> None:
                 reconciler=reconciler,
                 worker_id=f"{socket.gethostname()}:{os.getpid()}",
             )
-            await worker.run_forever()
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for event in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(event, stop.set)
+                except NotImplementedError:
+                    pass
+            await worker.run_forever(stop_event=stop)
     finally:
         await embedding.close()
         await container.close()

@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     light_model: str = "deepseek-v4-flash"
     embedding_model: str = "text-embedding-v3"
     embedding_dimensions: int = 1024
+    embedding_tokenizer_model: str = "Qwen/Qwen3-Embedding-0.6B"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     max_concurrent_query_runs: int = 4
     max_concurrent_llm_calls: int = 8
@@ -58,6 +59,13 @@ class Settings(BaseSettings):
     @classmethod
     def _canonical_index_generation(cls, value: str) -> str:
         return validate_writable_index_generation(value)
+
+    @field_validator("embedding_tokenizer_model")
+    @classmethod
+    def _nonblank_embedding_tokenizer(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("embedding_tokenizer_model must not be blank")
+        return value
 
 
 @lru_cache

@@ -47,11 +47,17 @@ class IngestionPipeline(Protocol):
     ) -> ArtifactPointer: ...
 
     async def parse_fragments(
-        self, runtime: IngestionRuntime, source: ArtifactPointer
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        source: ArtifactPointer,
     ) -> list[ArtifactPointer]: ...
 
     async def assemble_canonical(
-        self, runtime: IngestionRuntime, fragments: list[ArtifactPointer]
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        fragments: list[ArtifactPointer],
     ) -> ArtifactPointer: ...
 
     async def content_safety_gate(
@@ -61,17 +67,23 @@ class IngestionPipeline(Protocol):
     async def validate_canonical(self, canonical: ArtifactPointer) -> None: ...
 
     async def chunk(
-        self, runtime: IngestionRuntime, canonical: ArtifactPointer
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        canonical: ArtifactPointer,
     ) -> ArtifactPointer: ...
 
     async def embed_and_stage(
         self,
+        claim: IngestionJobClaim,
         runtime: IngestionRuntime,
         canonical: ArtifactPointer,
         chunks: ArtifactPointer,
     ) -> str: ...
 
-    async def publish(self, runtime: IngestionRuntime) -> None: ...
+    async def publish(
+        self, claim: IngestionJobClaim, runtime: IngestionRuntime
+    ) -> None: ...
 
     async def finalize(self, claim: IngestionJobClaim) -> None: ...
 
@@ -197,7 +209,9 @@ class IngestionGraph:
     async def _parse_fragments(self, state: IngestionState) -> dict[str, Any]:
         await self._pipeline.assert_lease(self._claim(state))
         refs = await self._pipeline.parse_fragments(
-            self._runtime(state), ArtifactPointer.model_validate(state["source_ref"])
+            self._claim(state),
+            self._runtime(state),
+            ArtifactPointer.model_validate(state["source_ref"]),
         )
         return {
             "fragment_refs": [ref.model_dump(mode="json") for ref in refs],
@@ -207,6 +221,7 @@ class IngestionGraph:
     async def _assemble_canonical(self, state: IngestionState) -> dict[str, Any]:
         await self._pipeline.assert_lease(self._claim(state))
         canonical = await self._pipeline.assemble_canonical(
+            self._claim(state),
             self._runtime(state),
             [ArtifactPointer.model_validate(value) for value in state["fragment_refs"]],
         )
@@ -245,7 +260,9 @@ class IngestionGraph:
     async def _chunk(self, state: IngestionState) -> dict[str, Any]:
         await self._pipeline.assert_lease(self._claim(state))
         chunks = await self._pipeline.chunk(
-            self._runtime(state), ArtifactPointer.model_validate(state["canonical_ref"])
+            self._claim(state),
+            self._runtime(state),
+            ArtifactPointer.model_validate(state["canonical_ref"]),
         )
         return {
             "chunks_ref": chunks.model_dump(mode="json"),
@@ -255,6 +272,7 @@ class IngestionGraph:
     async def _embed_and_stage(self, state: IngestionState) -> dict[str, Any]:
         await self._pipeline.assert_lease(self._claim(state))
         manifest_hash = await self._pipeline.embed_and_stage(
+            self._claim(state),
             self._runtime(state),
             ArtifactPointer.model_validate(state["canonical_ref"]),
             ArtifactPointer.model_validate(state["chunks_ref"]),
@@ -266,7 +284,7 @@ class IngestionGraph:
 
     async def _publish(self, state: IngestionState) -> dict[str, Any]:
         await self._pipeline.assert_lease(self._claim(state))
-        await self._pipeline.publish(self._runtime(state))
+        await self._pipeline.publish(self._claim(state), self._runtime(state))
         return {"completed_nodes": self._done(state, "publish")}
 
     async def _finalize(self, state: IngestionState) -> dict[str, Any]:
@@ -344,7 +362,10 @@ class DefaultIngestionPipeline:
         return _pointer(ref)
 
     async def parse_fragments(
-        self, runtime: IngestionRuntime, source: ArtifactPointer
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        source: ArtifactPointer,
     ) -> list[ArtifactPointer]:
         envelope = DocumentEnvelope(
             document_id=runtime.document_id,
@@ -358,7 +379,11 @@ class DefaultIngestionPipeline:
             created_at=runtime.created_at,
         )
         refs: list[ArtifactPointer] = []
-        async for fragment in self._parser.parse_batches(_artifact(source), envelope):
+        async for fragment in self._parser.parse_batches(
+            _artifact(source),
+            envelope,
+            before_artifact_write=lambda: self._jobs.assert_lease(claim),
+        ):
             if fragment.artifact_ref is None:
                 raise DeterministicIngestionError("parser did not persist Fragment AST")
             refs.append(_pointer(fragment.artifact_ref))
@@ -367,7 +392,10 @@ class DefaultIngestionPipeline:
         return refs
 
     async def assemble_canonical(
-        self, runtime: IngestionRuntime, fragments: list[ArtifactPointer]
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        fragments: list[ArtifactPointer],
     ) -> ArtifactPointer:
         values = []
         for pointer in fragments:
@@ -375,10 +403,20 @@ class DefaultIngestionPipeline:
                 self._artifacts.read_json, _artifact(pointer)
             )
             values.append(FragmentAst.model_validate(payload))
-        canonical = await asyncio.to_thread(self._assembler.assemble, values)
-        if canonical.artifact_ref is None:
-            raise DeterministicIngestionError("assembler did not persist Canonical AST")
-        return _pointer(canonical.artifact_ref)
+        canonical = await asyncio.to_thread(
+            self._assembler.assemble, values, persist=False
+        )
+        await self._jobs.assert_lease(claim)
+        ref = await asyncio.to_thread(
+            self._artifacts.put_json,
+            (
+                f"documents/{runtime.user_id}/{runtime.document_id}/"
+                f"{runtime.document_version_id}/canonical/{runtime.parser_version}/"
+                f"{runtime.pipeline_version}/{canonical.schema_version}.json"
+            ),
+            canonical.model_dump(mode="json"),
+        )
+        return _pointer(ref)
 
     async def content_safety_gate(
         self, runtime: IngestionRuntime, canonical: ArtifactPointer
@@ -399,10 +437,14 @@ class DefaultIngestionPipeline:
         await self._read_canonical(canonical)
 
     async def chunk(
-        self, runtime: IngestionRuntime, canonical: ArtifactPointer
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        canonical: ArtifactPointer,
     ) -> ArtifactPointer:
         ast = await self._read_canonical(canonical)
         parents = await asyncio.to_thread(self._chunker.build, ast)
+        await self._jobs.assert_lease(claim)
         ref = await asyncio.to_thread(
             self._artifacts.put_json,
             (
@@ -415,6 +457,7 @@ class DefaultIngestionPipeline:
 
     async def embed_and_stage(
         self,
+        claim: IngestionJobClaim,
         runtime: IngestionRuntime,
         canonical: ArtifactPointer,
         chunks: ArtifactPointer,
@@ -437,11 +480,17 @@ class DefaultIngestionPipeline:
                 index_generation=runtime.index_generation,
             ),
             canonical_ast=_artifact(canonical),
+            before_side_effect=lambda: self._jobs.assert_lease(claim),
         )
         return manifest.manifest_hash
 
-    async def publish(self, runtime: IngestionRuntime) -> None:
-        await self._publisher.publish(runtime.document_version_id)
+    async def publish(
+        self, claim: IngestionJobClaim, runtime: IngestionRuntime
+    ) -> None:
+        await self._publisher.publish(
+            runtime.document_version_id,
+            before_side_effect=lambda: self._jobs.assert_lease(claim),
+        )
 
     async def finalize(self, claim: IngestionJobClaim) -> None:
         await self._jobs.complete(claim)

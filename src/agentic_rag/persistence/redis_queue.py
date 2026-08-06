@@ -25,6 +25,22 @@ redis.call('HSET', KEYS[1], ARGV[1], message_id)
 return message_id
 """
 
+_DEAD_LETTER_ONCE_SCRIPT = """
+local existing = redis.call('HGET', KEYS[1], ARGV[1])
+if existing then
+  return existing
+end
+local message_id = redis.call(
+  'XADD', KEYS[2], '*',
+  'aggregate_id', ARGV[2],
+  'enqueued_at', ARGV[3],
+  'source_message_id', ARGV[1],
+  'reason', ARGV[4]
+)
+redis.call('HSET', KEYS[1], ARGV[1], message_id)
+return message_id
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class StreamMessage:
@@ -55,7 +71,11 @@ class StreamBroker(Protocol):
     ) -> list[StreamMessage]: ...
 
     async def dead_letter(
-        self, dead_stream: str, message: StreamMessage, reason: str
+        self,
+        dead_stream: str,
+        message: StreamMessage,
+        reason: str,
+        dedupe_key: str | None = None,
     ) -> None: ...
 
 
@@ -126,16 +146,24 @@ class RedisStreamsBroker:
         return [_message(message_id, fields) for message_id, fields in response[1]]
 
     async def dead_letter(
-        self, dead_stream: str, message: StreamMessage, reason: str
+        self,
+        dead_stream: str,
+        message: StreamMessage,
+        reason: str,
+        dedupe_key: str | None = None,
     ) -> None:
-        await self._client.xadd(
-            dead_stream,
-            {
-                "aggregate_id": message.aggregate_id,
-                "enqueued_at": _format_timestamp(message.enqueued_at),
-                "source_message_id": message.id,
-                "reason": reason,
-            },
+        await cast(
+            Awaitable[Any],
+            self._client.eval(
+                _DEAD_LETTER_ONCE_SCRIPT,
+                2,
+                f"{dead_stream}:dedupe",
+                dead_stream,
+                dedupe_key or message.id,
+                message.aggregate_id,
+                _format_timestamp(message.enqueued_at),
+                reason,
+            ),
         )
 
     async def _ensure_group(self, stream: str, group: str) -> None:

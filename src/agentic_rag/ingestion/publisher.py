@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from agentic_rag.ingestion.indexer import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL, StagingContext
+from agentic_rag.ingestion.indexer import (
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
+    StagingContext,
+)
 from agentic_rag.ingestion.manifest import VersionManifest
 from agentic_rag.models.indexing import LEGACY_INDEX_GENERATIONS
 from agentic_rag.persistence.artifacts import ArtifactRef
@@ -61,7 +66,9 @@ class PublicationTarget(BaseModel):
             self.previous_context.user_id != self.context.user_id
             or self.previous_context.document_id != self.context.document_id
         ):
-            raise ValueError("previous version must remain in the same user/document scope")
+            raise ValueError(
+                "previous version must remain in the same user/document scope"
+            )
         return self
 
 
@@ -115,24 +122,36 @@ class VersionPublisher:
         self._child_store = child_store
         self._artifacts = artifacts
 
-    async def publish(self, version_id: str) -> None:
+    async def publish(
+        self,
+        version_id: str,
+        *,
+        before_side_effect: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         target = await self._repository.get_target(version_id)
         if target is None:
-            raise PublicationIntegrityError(f"version {version_id!r} is not publishable")
+            raise PublicationIntegrityError(
+                f"version {version_id!r} is not publishable"
+            )
 
         await self._verify(target)
 
         # This order is a durable contract. Each operation is idempotent and scoped by
         # the trusted user/document/version identity in ``StagingContext``.
+        await _fence(before_side_effect)
         await self._require_writable(target.context)
         await self._parent_store.activate(target.context)
+        await _fence(before_side_effect)
         await self._require_writable(target.context)
         await self._child_store.activate(target.context)
         if target.previous_context is not None:
+            await _fence(before_side_effect)
             await self._require_writable(target.context)
             await self._child_store.deactivate(target.previous_context)
+            await _fence(before_side_effect)
             await self._require_writable(target.context)
             await self._parent_store.deactivate(target.previous_context)
+        await _fence(before_side_effect)
         await self._require_writable(target.context)
         await self._repository.finalize(target)
 
@@ -179,15 +198,23 @@ class VersionPublisher:
                 "Manifest Artifact URI is outside the trusted version scope"
             )
         if target.manifest_hash != manifest.manifest_hash:
-            raise PublicationIntegrityError("durable Manifest hash does not match counts")
+            raise PublicationIntegrityError(
+                "durable Manifest hash does not match counts"
+            )
         if not await asyncio.to_thread(self._artifacts.verify, manifest_ref):
-            raise PublicationIntegrityError("Manifest Artifact failed integrity verification")
+            raise PublicationIntegrityError(
+                "Manifest Artifact failed integrity verification"
+            )
         try:
             payload = await asyncio.to_thread(self._artifacts.read_json, manifest_ref)
         except (OSError, TypeError, ValueError) as error:
-            raise PublicationIntegrityError("Manifest Artifact is unreadable") from error
+            raise PublicationIntegrityError(
+                "Manifest Artifact is unreadable"
+            ) from error
         if payload != manifest.payload():
-            raise PublicationIntegrityError("Manifest Artifact payload does not match version")
+            raise PublicationIntegrityError(
+                "Manifest Artifact payload does not match version"
+            )
         canonical_prefix = (
             f"artifact://documents/{target.context.user_id}/"
             f"{target.context.document_id}/{target.context.document_version_id}/canonical/"
@@ -211,3 +238,8 @@ class VersionPublisher:
             raise PublicationIntegrityError(
                 "staged Parent/Child counts do not match the durable Manifest"
             )
+
+
+async def _fence(callback: Callable[[], Awaitable[None]] | None) -> None:
+    if callback is not None:
+        await callback()

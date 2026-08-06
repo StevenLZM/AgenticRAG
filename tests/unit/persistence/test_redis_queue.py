@@ -8,7 +8,7 @@ from typing import Any, cast
 import pytest
 from redis.asyncio import Redis
 
-from agentic_rag.persistence.redis_queue import RedisStreamsBroker
+from agentic_rag.persistence.redis_queue import RedisStreamsBroker, StreamMessage
 
 
 class FakeRedis:
@@ -78,5 +78,25 @@ async def test_publish_uses_atomic_aggregate_deduplication() -> None:
     assert all(call[1] == 2 for call in client.eval_calls)
     assert all(
         call[2][:3] == ("jobs:dedupe", "jobs", "outbox-1:0")
+        for call in client.eval_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_is_idempotent_for_one_source_message() -> None:
+    client = FakeRedis({})
+    broker = RedisStreamsBroker(cast(Redis, client))
+    message = StreamMessage(
+        id="1-0",
+        aggregate_id="job-1",
+        enqueued_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+
+    await broker.dead_letter("jobs:dead", message, "failed")
+    await broker.dead_letter("jobs:dead", message, "failed")
+
+    assert len(client.eval_calls) == 2
+    assert all(
+        call[2][:3] == ("jobs:dead:dedupe", "jobs:dead", "1-0")
         for call in client.eval_calls
     )

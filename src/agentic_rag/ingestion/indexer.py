@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -111,7 +111,11 @@ class ChildIndexStore(Protocol):
     """Replaceable vector-index staging boundary (ES now, Milvus later)."""
 
     async def stage(
-        self, context: StagingContext, children: Sequence[EmbeddedChild]
+        self,
+        context: StagingContext,
+        children: Sequence[EmbeddedChild],
+        *,
+        before_side_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> int: ...
 
     async def count(self, context: StagingContext) -> int: ...
@@ -166,28 +170,39 @@ class IndexWriter:
         *,
         context: StagingContext,
         canonical_ast: ArtifactRef,
+        before_side_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> VersionManifest:
         parents = tuple(chunks)
         children = self._validate_and_flatten(parents, context)
         if not await asyncio.to_thread(self._artifacts.verify, canonical_ast):
             raise StagingError("Canonical AST Artifact failed integrity verification")
 
-        embedded_children = await self._embed(children, context)
+        embedded_children = await self._embed(
+            children, context, before_side_effect=before_side_effect
+        )
 
+        await _fence(before_side_effect)
         await self._parent_store.assert_writable(context)
         staged_parents = await self._parent_store.stage(context, parents)
         if staged_parents != len(parents):
             raise StagingCountError(
                 f"Parent stage reported {staged_parents}; expected {len(parents)}"
             )
+        await _fence(before_side_effect)
         await self._parent_store.assert_writable(context)
-        staged_children = await self._child_store.stage(context, embedded_children)
+        staged_children = await self._child_store.stage(
+            context,
+            embedded_children,
+            before_side_effect=before_side_effect,
+        )
         if staged_children != len(children):
             raise StagingCountError(
                 f"Child stage reported {staged_children}; expected {len(children)}"
             )
 
+        await _fence(before_side_effect)
         parent_count = await self._parent_store.count(context)
+        await _fence(before_side_effect)
         child_count = await self._child_store.count(context)
         if parent_count != len(parents):
             raise StagingCountError(
@@ -206,6 +221,7 @@ class IndexWriter:
             embedding_dimensions=EMBEDDING_DIMENSIONS,
             index_generation=context.index_generation,
         )
+        await _fence(before_side_effect)
         await self._parent_store.assert_writable(context)
         manifest_ref = await asyncio.to_thread(
             self._artifacts.put_json,
@@ -218,6 +234,7 @@ class IndexWriter:
         # Keep a valid deterministic Artifact when attachment fails. It may already
         # be referenced by an earlier successful retry; deleting it would corrupt
         # that version. A later retry overwrites the same bytes and re-attaches it.
+        await _fence(before_side_effect)
         await self._parent_store.assert_writable(context)
         await self._parent_store.attach_manifest(
             context,
@@ -276,11 +293,16 @@ class IndexWriter:
             )
 
     async def _embed(
-        self, children: tuple[ChildChunk, ...], context: StagingContext
+        self,
+        children: tuple[ChildChunk, ...],
+        context: StagingContext,
+        *,
+        before_side_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[EmbeddedChild, ...]:
         staged: list[EmbeddedChild] = []
         for start in range(0, len(children), self._embedding_batch_size):
             batch = children[start : start + self._embedding_batch_size]
+            await _fence(before_side_effect)
             vectors = await self._embedding.embed_documents(
                 tuple(child.contextualized_content for child in batch)
             )
@@ -331,11 +353,14 @@ class IndexWriter:
         return tuple(vector)
 
     @staticmethod
-    def _manifest_path(
-        context: StagingContext, manifest: VersionManifest
-    ) -> str:
+    def _manifest_path(context: StagingContext, manifest: VersionManifest) -> str:
         return (
             f"documents/{context.user_id}/{context.document_id}/"
             f"{context.document_version_id}/manifests/{context.index_generation}/"
             f"{manifest.manifest_hash}.json"
         )
+
+
+async def _fence(callback: Callable[[], Awaitable[None]] | None) -> None:
+    if callback is not None:
+        await callback()

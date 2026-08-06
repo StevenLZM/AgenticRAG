@@ -188,11 +188,19 @@ ingestion_jobs = Table(
     Column("error_code", String(128), nullable=True),
     Column("attempt_count", Integer, nullable=False, default=0),
     Column("last_error_detail_ref", String(1024), nullable=True),
+    Column("dead_letter_status", String(16), nullable=True),
+    Column("dead_letter_reason", String(128), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
         "status IN ('queued','running','completed','quarantined','failed')",
         name="ck_ingestion_jobs_status",
+    ),
+    CheckConstraint(
+        "(dead_letter_status IS NULL AND dead_letter_reason IS NULL) OR "
+        "(status = 'failed' AND dead_letter_status IN ('pending','published') "
+        "AND dead_letter_reason IS NOT NULL)",
+        name="ck_ingestion_jobs_dead_letter_status",
     ),
     Index("ix_jobs_status_lease", "status", "lease_expires_at"),
     Index("ix_jobs_user_created", "user_id", "created_at"),

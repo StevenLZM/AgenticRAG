@@ -37,9 +37,12 @@ async def lifecycle_store() -> AsyncIterator[
         await connection.run_sync(metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        yield SqlAlchemyReconciliationRepository(
-            factory, stale_after=timedelta(minutes=15)
-        ), factory
+        yield (
+            SqlAlchemyReconciliationRepository(
+                factory, stale_after=timedelta(minutes=15)
+            ),
+            factory,
+        )
     finally:
         await engine.dispose()
 
@@ -63,11 +66,14 @@ async def _document(
                 filename="test.txt",
                 mime_type="text/plain",
                 content_hash="a" * 64,
-                status=(status or (
-                    DocumentStatus.ACTIVE
-                    if pointer is not None
-                    else DocumentStatus.PROCESSING
-                )).value,
+                status=(
+                    status
+                    or (
+                        DocumentStatus.ACTIVE
+                        if pointer is not None
+                        else DocumentStatus.PROCESSING
+                    )
+                ).value,
                 active_version_id=pointer,
                 deletion_status=deletion_status,
                 deletion_fenced_at=deletion_fenced_at,
@@ -168,10 +174,14 @@ async def test_live_or_reclaimed_job_excludes_building_version_from_repairs(
     assert await repository.list_pointer_mismatches(10) == ()
     async with factory() as session:
         outbox = (
-            await session.execute(
-                select(task_outbox).where(task_outbox.c.id == "outbox-live")
+            (
+                await session.execute(
+                    select(task_outbox).where(task_outbox.c.id == "outbox-live")
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
     assert outbox["status"] == "pending"
     assert outbox["attempt_count"] == 1
 
@@ -280,7 +290,9 @@ async def test_outbox_claim_is_ingestion_only_and_keeps_delivery_attempt_stable(
                 insert(task_outbox).values(
                     id=outbox_id,
                     aggregate_type=aggregate_type,
-                    aggregate_id=("job-1" if aggregate_type == "ingestion_job" else "run-1"),
+                    aggregate_id=(
+                        "job-1" if aggregate_type == "ingestion_job" else "run-1"
+                    ),
                     stream_name="jobs",
                     status="pending",
                     attempt_count=0,
@@ -290,9 +302,7 @@ async def test_outbox_claim_is_ingestion_only_and_keeps_delivery_attempt_stable(
             )
 
     first = await repository.claim_pending_outbox(10)
-    assert [(row.id, row.attempt_count) for row in first] == [
-        ("outbox-ingestion", 0)
-    ]
+    assert [(row.id, row.attempt_count) for row in first] == [("outbox-ingestion", 0)]
 
     async with factory.begin() as session:
         await session.execute(
@@ -301,9 +311,7 @@ async def test_outbox_claim_is_ingestion_only_and_keeps_delivery_attempt_stable(
             .values(next_attempt_at=now - timedelta(seconds=1))
         )
     second = await repository.claim_pending_outbox(10)
-    assert [(row.id, row.attempt_count) for row in second] == [
-        ("outbox-ingestion", 0)
-    ]
+    assert [(row.id, row.attempt_count) for row in second] == [("outbox-ingestion", 0)]
 
 
 async def test_pointer_scan_restores_document_status_for_pointed_active_version(
@@ -388,15 +396,19 @@ async def test_pointerless_active_document_fails_closed_after_active_versions_de
             )
         ).one()
         statuses = (
-            await session.execute(
-                select(document_versions.c.status)
-                .where(
-                    document_versions.c.document_id
-                    == "document-active-without-pointer"
+            (
+                await session.execute(
+                    select(document_versions.c.status)
+                    .where(
+                        document_versions.c.document_id
+                        == "document-active-without-pointer"
+                    )
+                    .order_by(document_versions.c.version_no)
                 )
-                .order_by(document_versions.c.version_no)
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert document.status == DocumentStatus.FAILED.value
     assert document.active_version_id is None
     assert statuses == [
@@ -453,13 +465,105 @@ async def test_running_job_with_missing_expiry_is_reclaimed(
     assert await repository.reclaim_expired_jobs(10) == ("job-invalid-lease",)
     async with factory() as session:
         job = (
-            await session.execute(
-                select(ingestion_jobs).where(ingestion_jobs.c.id == "job-invalid-lease")
+            (
+                await session.execute(
+                    select(ingestion_jobs).where(
+                        ingestion_jobs.c.id == "job-invalid-lease"
+                    )
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
     assert job["status"] == JobStatus.QUEUED.value
     assert job["lease_owner"] is None
     assert job["attempt_count"] == 2
+
+
+async def test_third_expired_lease_fails_lifecycle_and_records_dlq_intent(
+    lifecycle_store: tuple[
+        SqlAlchemyReconciliationRepository, async_sessionmaker[AsyncSession]
+    ],
+) -> None:
+    repository, factory = lifecycle_store
+    now = datetime.now(UTC)
+    await _document(factory, document_id="document-expired-third", pointer=None)
+    await _version(
+        factory,
+        version_id="version-expired-third",
+        document_id="document-expired-third",
+        version_no=1,
+        status=DocumentVersionStatus.BUILDING,
+    )
+    async with factory.begin() as session:
+        await session.execute(
+            insert(ingestion_jobs).values(
+                id="job-expired-third",
+                user_id="user-1",
+                document_id="document-expired-third",
+                document_version_id="version-expired-third",
+                status=JobStatus.RUNNING.value,
+                lease_owner="dead-worker",
+                lease_expires_at=now - timedelta(seconds=1),
+                heartbeat_at=now - timedelta(minutes=1),
+                attempt_count=2,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.execute(
+            insert(task_outbox).values(
+                id="outbox-expired-third",
+                aggregate_type="ingestion_job",
+                aggregate_id="job-expired-third",
+                stream_name="agenticrag:jobs:ingestion",
+                status="dispatched",
+                attempt_count=2,
+                next_attempt_at=now,
+                created_at=now,
+                dispatched_at=now,
+            )
+        )
+
+    assert await repository.reclaim_expired_jobs(10) == ("job-expired-third",)
+    async with factory() as session:
+        job = (
+            (
+                await session.execute(
+                    select(ingestion_jobs).where(
+                        ingestion_jobs.c.id == "job-expired-third"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        version_status = await session.scalar(
+            select(document_versions.c.status).where(
+                document_versions.c.id == "version-expired-third"
+            )
+        )
+        document_status = await session.scalar(
+            select(documents.c.status).where(documents.c.id == "document-expired-third")
+        )
+        outbox = (
+            (
+                await session.execute(
+                    select(task_outbox).where(
+                        task_outbox.c.id == "outbox-expired-third"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert job["status"] == JobStatus.FAILED.value
+    assert job["attempt_count"] == 3
+    assert job["dead_letter_status"] == "pending"
+    assert outbox["status"] == "pending"
+    assert outbox["attempt_count"] == 3
+    assert version_status == DocumentVersionStatus.FAILED.value
+    assert document_status == DocumentStatus.FAILED.value
 
 
 async def test_deleted_document_with_only_inactive_versions_remains_pending(
@@ -519,7 +623,9 @@ async def test_completed_deleted_document_remains_eligible_for_idempotent_reswee
     deleted = await repository.list_deleted_documents(10)
 
     assert [item.document_id for item in deleted] == ["document-completed-delete"]
-    assert await repository.mark_deletion_reconciled("document-completed-delete") is False
+    assert (
+        await repository.mark_deletion_reconciled("document-completed-delete") is False
+    )
 
 
 async def test_deletion_completion_terminates_running_worker_lease(
@@ -564,10 +670,16 @@ async def test_deletion_completion_terminates_running_worker_lease(
     assert await repository.fence_pending_deletions(10) == ("document-live-delete",)
     async with factory() as session:
         job = (
-            await session.execute(
-                select(ingestion_jobs).where(ingestion_jobs.c.id == "job-live-delete")
+            (
+                await session.execute(
+                    select(ingestion_jobs).where(
+                        ingestion_jobs.c.id == "job-live-delete"
+                    )
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         deletion_status = await session.scalar(
             select(documents.c.deletion_status).where(
                 documents.c.id == "document-live-delete"
@@ -584,9 +696,9 @@ async def test_deletion_completion_terminates_running_worker_lease(
             .where(documents.c.id == "document-live-delete")
             .values(deletion_fenced_at=now - timedelta(hours=1))
         )
-    assert [item.document_id for item in await repository.list_deleted_documents(10)] == [
-        "document-live-delete"
-    ]
+    assert [
+        item.document_id for item in await repository.list_deleted_documents(10)
+    ] == ["document-live-delete"]
     await repository.mark_deletion_reconciled("document-live-delete")
     async with factory() as session:
         deletion_status = await session.scalar(

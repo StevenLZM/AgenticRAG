@@ -8,6 +8,8 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agentic_rag.domain.models import JobStatus
+
 
 class ArtifactPointer(BaseModel):
     """Serializable reference to an immutable Artifact payload."""
@@ -30,6 +32,17 @@ class IngestionJobClaim(BaseModel):
     document_version_id: str
     owner: str
     claim_generation: int = Field(ge=0)
+
+
+class JobDeliveryState(BaseModel):
+    """Durable terminal and Dead Stream delivery state used before ACK."""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: JobStatus
+    attempt_count: int = Field(ge=0)
+    dead_letter_status: Literal["pending", "published"] | None = None
+    dead_letter_reason: str | None = None
 
 
 class IngestionRuntime(BaseModel):

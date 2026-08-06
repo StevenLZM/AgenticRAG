@@ -57,13 +57,19 @@ class RecoverablePipeline:
         return _ref("source")
 
     async def parse_fragments(
-        self, runtime: IngestionRuntime, source: ArtifactPointer
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        source: ArtifactPointer,
     ) -> list[ArtifactPointer]:
         self.calls.append("parse_fragments")
         return [_ref("fragment")]
 
     async def assemble_canonical(
-        self, runtime: IngestionRuntime, fragments: list[ArtifactPointer]
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        fragments: list[ArtifactPointer],
     ) -> ArtifactPointer:
         self.calls.append("assemble_canonical")
         return _ref("canonical")
@@ -78,13 +84,17 @@ class RecoverablePipeline:
         self.calls.append("validate_canonical")
 
     async def chunk(
-        self, runtime: IngestionRuntime, canonical: ArtifactPointer
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        canonical: ArtifactPointer,
     ) -> ArtifactPointer:
         self.calls.append("chunk")
         return _ref("chunks")
 
     async def embed_and_stage(
         self,
+        claim: IngestionJobClaim,
         runtime: IngestionRuntime,
         canonical: ArtifactPointer,
         chunks: ArtifactPointer,
@@ -97,7 +107,9 @@ class RecoverablePipeline:
             raise RuntimeError("crash after stage_index")
         return "b" * 64
 
-    async def publish(self, runtime: IngestionRuntime) -> None:
+    async def publish(
+        self, claim: IngestionJobClaim, runtime: IngestionRuntime
+    ) -> None:
         self.calls.append("publish")
 
     async def finalize(self, claim: IngestionJobClaim) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, cast
 
 from elasticsearch import AsyncElasticsearch
@@ -54,13 +54,19 @@ class ElasticsearchChildIndexStore:
         return f"agenticrag-children-{index_generation}"
 
     async def stage(
-        self, context: StagingContext, children: Sequence[EmbeddedChild]
+        self,
+        context: StagingContext,
+        children: Sequence[EmbeddedChild],
+        *,
+        before_side_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         await self._ensure_index(context.index_generation)
         index = self.index_name(context.index_generation)
         staged = 0
         for start in range(0, len(children), self._bulk_batch_size):
             batch = children[start : start + self._bulk_batch_size]
+            if before_side_effect is not None:
+                await before_side_effect()
             operations: list[Mapping[str, Any]] = []
             for child in batch:
                 self._validate_metadata(context, child)
@@ -117,9 +123,7 @@ class ElasticsearchChildIndexStore:
             cast(Mapping[str, Any], response.body), operation="delete"
         )
 
-    async def _set_active(
-        self, context: StagingContext, *, is_active: bool
-    ) -> None:
+    async def _set_active(self, context: StagingContext, *, is_active: bool) -> None:
         response = await self._client.update_by_query(
             index=self.index_name(context.index_generation),
             query={"bool": {"filter": self._scope_filters(context)}},
@@ -138,9 +142,7 @@ class ElasticsearchChildIndexStore:
         )
 
     @staticmethod
-    def _require_complete_lifecycle(
-        body: Mapping[str, Any], *, operation: str
-    ) -> None:
+    def _require_complete_lifecycle(body: Mapping[str, Any], *, operation: str) -> None:
         failures = body.get("failures", ())
         if body.get("timed_out") or int(body.get("version_conflicts", 0)) or failures:
             raise ChildIndexWriteError(
@@ -207,9 +209,7 @@ class ElasticsearchChildIndexStore:
                 )
 
     @staticmethod
-    def _validate_metadata(
-        context: StagingContext, child: EmbeddedChild
-    ) -> None:
+    def _validate_metadata(context: StagingContext, child: EmbeddedChild) -> None:
         actual = (
             child.user_id,
             child.document_id,
