@@ -184,3 +184,93 @@ The real-service tests were collected but skipped because explicit disposable
 MySQL, Elasticsearch, and Redis endpoints were not configured. When a DSN is
 configured, the new MySQL/Elasticsearch fixture and Redis Lua test allow
 connectivity failures to fail rather than silently substituting guessed services.
+
+## Official review fix round 2
+
+The scoped re-review of `114295c6ef264523e57de3106295c988df62f8ef`
+identified three remaining Important convergence gaps. This round addresses only
+those findings and adjacent Task 5 lifecycle checks:
+
+- Completed deletion tombstones remain eligible for bounded, idempotent physical
+  re-sweeps. A successful sweep rotates `updated_at` so completed tombstones share
+  the bounded scan, while eligible `fenced` deletions retain priority. SQL
+  completion now returns whether the row made its first `fenced -> completed`
+  transition, so `reconciled_deletions` reports the ID exactly once. The
+  interleaving regression performs cleanup and completion, recreates Parent,
+  Child, and Artifact data afterward, and proves the next pass removes it without
+  re-reporting completion.
+- Every complete outbox redispatch item now catches `Exception`, including a
+  Redis-publish-success followed by SQL-mark `RuntimeError`; `BaseException`
+  remains outside the catch. The failed row remains durable for same-generation
+  retry and Redis Lua deduplication, while later reclaim, pointer, publication,
+  and deletion classes continue during the same pass.
+- Pointerless `ACTIVE` Documents with non-publishable `ACTIVE` Versions now fail
+  closed. After each physical deactivation, the locked SQL resolution also moves
+  an `ACTIVE`/null-pointer Document to `FAILED`; remaining active Versions stay
+  mismatch-eligible until their physical and SQL states are inactive. This
+  eliminates the permanent `ACTIVE`/null state without selecting an unvalidated
+  winner.
+- Publication now rechecks durable Document/version writability before every
+  physical lifecycle boundary and before SQL finalization. Staging rechecks the
+  same SQL-backed guard before Parent, Child, Manifest Artifact, and Manifest
+  attachment writes. These checks reduce late writes, while completed tombstone
+  re-sweeps provide the eventual-convergence guarantee for any writer already
+  beyond a check boundary.
+
+Strict RED/GREEN evidence:
+
+```text
+completed tombstone resweep/reporting:
+  RED  2 failed (duplicate completion report) + 1 failed (completed row omitted)
+  GREEN 2 passed + 1 passed
+
+publish-success/SQL-mark failure isolation:
+  RED  RuntimeError escaped IngestionReconciler.run_once
+  GREEN 2 passed (SQL-mark failure and Redis outage isolation)
+
+pointerless ACTIVE Document:
+  RED  Document status remained active after both Versions became inactive
+  GREEN 4 pointer/status regressions passed
+
+publication and staging writability guards:
+  RED  2 tests DID NOT RAISE after deletion crossed a physical boundary
+  GREEN 1 publisher guard + 1 staging guard passed
+
+focused adjacent Task 5 suites:
+  70 passed
+```
+
+Fresh fix-round-2 verification:
+
+```text
+conda run -n agentic-rag python -m pytest --collect-only -q \
+  tests/integration/ingestion/test_publisher_reconciler.py \
+  tests/integration/persistence/test_redis_streams.py \
+  tests/integration/persistence/test_mysql_schema.py
+23 tests collected
+
+conda run -n agentic-rag python -m pytest -q
+235 passed, 28 skipped, 18 warnings
+
+conda run -n agentic-rag ruff check .
+All checks passed!
+
+conda run -n agentic-rag mypy src
+Success: no issues found in 38 source files
+
+conda run -n agentic-rag env MYPYPATH=src mypy --explicit-package-bases \
+  tests/unit/ingestion/test_publisher_reconciler_unit.py \
+  tests/unit/ingestion/test_manifest.py \
+  tests/unit/persistence/test_lifecycle.py \
+  tests/integration/ingestion/test_publisher_reconciler.py \
+  tests/integration/persistence/test_redis_streams.py
+Success: no issues found in 5 source files
+
+git diff --check
+clean
+```
+
+The 28 skips are the existing explicit-service gates; no MySQL, Elasticsearch,
+Redis, or live-model endpoint was guessed. No Phase 2 Task 6 or Phase 3 behavior
+was added. The controller will run the next official scoped review after this
+round is committed.

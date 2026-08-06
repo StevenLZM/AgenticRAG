@@ -114,12 +114,20 @@ class RecordingParentStore(ParentStagingStore):
         self.staged: tuple[ParentChunk, ...] = ()
         self.attachment: dict[str, Any] | None = None
         self.attach_error: BaseException | None = None
+        self.writable = True
+        self.become_nonwritable_after_stage = False
+
+    async def assert_writable(self, context: StagingContext) -> None:
+        if not self.writable:
+            raise RuntimeError("document is deleted")
 
     async def stage(
         self, context: StagingContext, parents: Sequence[ParentChunk]
     ) -> int:
         self.events.append("parents.stage")
         self.staged = tuple(parents)
+        if self.become_nonwritable_after_stage:
+            self.writable = False
         return len(parents)
 
     async def count(self, context: StagingContext) -> int:
@@ -298,6 +306,25 @@ async def test_manifest_is_written_only_after_both_store_counts_match(
         "children.count",
     ]
     assert parents.attachment is None
+
+
+@pytest.mark.asyncio
+async def test_staging_rechecks_document_writability_before_child_write(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    embedding = FakeEmbedding([[[0.0] * 1024]])
+    parents = RecordingParentStore(events)
+    parents.become_nonwritable_after_stage = True
+    children = RecordingChildStore(events)
+    writer, artifacts = _writer(tmp_path, embedding, parents, children)
+    canonical = artifacts.put_bytes("canonical.json", b"canonical")
+
+    with pytest.raises(RuntimeError, match="deleted"):
+        await writer.stage(_chunks(), context=_context(), canonical_ast=canonical)
+
+    assert events == ["parents.stage"]
+    assert children.staged == ()
 
 
 @pytest.mark.asyncio

@@ -70,6 +70,8 @@ class PublicationRepository(Protocol):
 
     async def get_target(self, version_id: str) -> PublicationTarget | None: ...
 
+    async def is_writable(self, context: StagingContext) -> bool: ...
+
     async def finalize(self, target: PublicationTarget) -> None: ...
 
     async def quarantine(self, version_id: str) -> None: ...
@@ -122,12 +124,23 @@ class VersionPublisher:
 
         # This order is a durable contract. Each operation is idempotent and scoped by
         # the trusted user/document/version identity in ``StagingContext``.
+        await self._require_writable(target.context)
         await self._parent_store.activate(target.context)
+        await self._require_writable(target.context)
         await self._child_store.activate(target.context)
         if target.previous_context is not None:
+            await self._require_writable(target.context)
             await self._child_store.deactivate(target.previous_context)
+            await self._require_writable(target.context)
             await self._parent_store.deactivate(target.previous_context)
+        await self._require_writable(target.context)
         await self._repository.finalize(target)
+
+    async def _require_writable(self, context: StagingContext) -> None:
+        if not await self._repository.is_writable(context):
+            raise PublicationIntegrityError(
+                "document is no longer writable during publication"
+            )
 
     async def _verify(self, target: PublicationTarget) -> None:
         if (

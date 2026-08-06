@@ -350,6 +350,61 @@ async def test_pointer_scan_restores_document_status_for_pointed_active_version(
     assert row.active_version_id == "version-active"
 
 
+async def test_pointerless_active_document_fails_closed_after_active_versions_deactivate(
+    lifecycle_store: tuple[
+        SqlAlchemyReconciliationRepository, async_sessionmaker[AsyncSession]
+    ],
+) -> None:
+    repository, factory = lifecycle_store
+    await _document(
+        factory,
+        document_id="document-active-without-pointer",
+        pointer=None,
+        status=DocumentStatus.ACTIVE,
+    )
+    for version_id, version_no in (("version-active-1", 1), ("version-active-2", 2)):
+        await _version(
+            factory,
+            version_id=version_id,
+            document_id="document-active-without-pointer",
+            version_no=version_no,
+            status=DocumentVersionStatus.ACTIVE,
+            manifest=False,
+        )
+
+    mismatches = await repository.list_pointer_mismatches(10)
+    assert [item.action for item in mismatches] == ["deactivate", "deactivate"]
+    for mismatch in mismatches:
+        await repository.resolve_deactivated_version(
+            mismatch.context.document_version_id
+        )
+
+    async with factory() as session:
+        document = (
+            await session.execute(
+                select(documents.c.status, documents.c.active_version_id).where(
+                    documents.c.id == "document-active-without-pointer"
+                )
+            )
+        ).one()
+        statuses = (
+            await session.execute(
+                select(document_versions.c.status)
+                .where(
+                    document_versions.c.document_id
+                    == "document-active-without-pointer"
+                )
+                .order_by(document_versions.c.version_no)
+            )
+        ).scalars().all()
+    assert document.status == DocumentStatus.FAILED.value
+    assert document.active_version_id is None
+    assert statuses == [
+        DocumentVersionStatus.INACTIVE.value,
+        DocumentVersionStatus.INACTIVE.value,
+    ]
+
+
 async def test_running_job_with_missing_expiry_is_reclaimed(
     lifecycle_store: tuple[
         SqlAlchemyReconciliationRepository, async_sessionmaker[AsyncSession]
@@ -437,6 +492,34 @@ async def test_deleted_document_with_only_inactive_versions_remains_pending(
     assert [item.document_version_id for item in deleted[0].versions] == [
         "version-inactive-delete"
     ]
+
+
+async def test_completed_deleted_document_remains_eligible_for_idempotent_resweep(
+    lifecycle_store: tuple[
+        SqlAlchemyReconciliationRepository, async_sessionmaker[AsyncSession]
+    ],
+) -> None:
+    repository, factory = lifecycle_store
+    await _document(
+        factory,
+        document_id="document-completed-delete",
+        pointer=None,
+        status=DocumentStatus.DELETED,
+        deletion_status="completed",
+        deletion_fenced_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    await _version(
+        factory,
+        version_id="version-completed-delete",
+        document_id="document-completed-delete",
+        version_no=1,
+        status=DocumentVersionStatus.INACTIVE,
+    )
+
+    deleted = await repository.list_deleted_documents(10)
+
+    assert [item.document_id for item in deleted] == ["document-completed-delete"]
+    assert await repository.mark_deletion_reconciled("document-completed-delete") is False
 
 
 async def test_deletion_completion_terminates_running_worker_lease(

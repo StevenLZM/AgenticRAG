@@ -6,7 +6,6 @@ import asyncio
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
-from redis.exceptions import RedisError
 
 from agentic_rag.ingestion.indexer import StagingContext
 from agentic_rag.ingestion.publisher import (
@@ -68,7 +67,7 @@ class ReconciliationRepository(Protocol):
 
     async def quarantine(self, version_id: str) -> None: ...
 
-    async def mark_deletion_reconciled(self, document_id: str) -> None: ...
+    async def mark_deletion_reconciled(self, document_id: str) -> bool: ...
 
 
 class OutboxRedispatcher(Protocol):
@@ -110,7 +109,7 @@ class IngestionReconciler:
                 continue
             try:
                 await self._dispatcher.redispatch(row)
-            except RedisError:
+            except Exception:
                 continue
             else:
                 redispatched.append(row.aggregate_id)
@@ -188,10 +187,12 @@ class IngestionReconciler:
                     deleted.user_id,
                     deleted.document_id,
                 )
-                await self._repository.mark_deletion_reconciled(deleted.document_id)
+                first_completion = await self._repository.mark_deletion_reconciled(
+                    deleted.document_id
+                )
             except Exception:
                 continue
-            else:
+            if first_completion:
                 deletions.append(deleted.document_id)
 
         return ReconcileReport(

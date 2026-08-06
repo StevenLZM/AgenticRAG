@@ -37,6 +37,10 @@ class SqlAlchemyParentStagingStore:
     ) -> None:
         self._session_factory = session_factory
 
+    async def assert_writable(self, context: StagingContext) -> None:
+        async with self._session_factory() as session:
+            await self._require_version(session, context)
+
     async def stage(
         self, context: StagingContext, parents: Sequence[ParentChunk]
     ) -> int:

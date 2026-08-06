@@ -86,6 +86,8 @@ class EmbeddedChild:
 class ParentStagingStore(Protocol):
     """MySQL-side staging boundary."""
 
+    async def assert_writable(self, context: StagingContext) -> None: ...
+
     async def stage(
         self, context: StagingContext, parents: Sequence[ParentChunk]
     ) -> int: ...
@@ -172,11 +174,13 @@ class IndexWriter:
 
         embedded_children = await self._embed(children, context)
 
+        await self._parent_store.assert_writable(context)
         staged_parents = await self._parent_store.stage(context, parents)
         if staged_parents != len(parents):
             raise StagingCountError(
                 f"Parent stage reported {staged_parents}; expected {len(parents)}"
             )
+        await self._parent_store.assert_writable(context)
         staged_children = await self._child_store.stage(context, embedded_children)
         if staged_children != len(children):
             raise StagingCountError(
@@ -202,6 +206,7 @@ class IndexWriter:
             embedding_dimensions=EMBEDDING_DIMENSIONS,
             index_generation=context.index_generation,
         )
+        await self._parent_store.assert_writable(context)
         manifest_ref = await asyncio.to_thread(
             self._artifacts.put_json,
             self._manifest_path(context, manifest),
@@ -213,6 +218,7 @@ class IndexWriter:
         # Keep a valid deterministic Artifact when attachment fails. It may already
         # be referenced by an earlier successful retry; deleting it would corrupt
         # that version. A later retry overwrites the same bytes and re-attaches it.
+        await self._parent_store.assert_writable(context)
         await self._parent_store.attach_manifest(
             context,
             canonical_ast_uri=canonical_ast.uri,

@@ -84,6 +84,9 @@ class _FailOnceAfterFinalize:
     async def get_target(self, version_id: str) -> Any:
         return await self._delegate.get_target(version_id)
 
+    async def is_writable(self, context: StagingContext) -> bool:
+        return await self._delegate.is_writable(context)
+
     async def finalize(self, target: Any) -> None:
         await self._delegate.finalize(target)
         if not self._failed:
@@ -105,6 +108,9 @@ class _BarrierPublicationRepository:
 
     async def get_target(self, version_id: str) -> Any:
         return await self._delegate.get_target(version_id)
+
+    async def is_writable(self, context: StagingContext) -> bool:
+        return await self._delegate.is_writable(context)
 
     async def finalize(self, target: Any) -> None:
         await self._barrier.wait()

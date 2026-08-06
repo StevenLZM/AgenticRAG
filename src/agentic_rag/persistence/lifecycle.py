@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, case, exists, or_, select, update
 from sqlalchemy.engine import CursorResult, RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -41,6 +41,34 @@ class SqlAlchemyPublicationRepository(PublicationRepository):
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+
+    async def is_writable(self, context: StagingContext) -> bool:
+        async with self._session_factory() as session:
+            writable = await session.scalar(
+                select(documents.c.id)
+                .select_from(
+                    documents.join(
+                        document_versions,
+                        document_versions.c.document_id == documents.c.id,
+                    )
+                )
+                .where(
+                    documents.c.id == context.document_id,
+                    documents.c.user_id == context.user_id,
+                    documents.c.status != DocumentStatus.DELETED.value,
+                    documents.c.deletion_status.is_(None),
+                    document_versions.c.id == context.document_version_id,
+                    document_versions.c.status.in_(
+                        (
+                            DocumentVersionStatus.BUILDING.value,
+                            DocumentVersionStatus.ACTIVE.value,
+                            DocumentVersionStatus.INACTIVE.value,
+                        )
+                    ),
+                )
+                .limit(1)
+            )
+        return writable is not None
 
     async def get_target(self, version_id: str) -> PublicationTarget | None:
         async with self._session_factory() as session:
@@ -587,7 +615,13 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                 update(documents)
                 .where(
                     documents.c.id == version["document_id"],
-                    documents.c.active_version_id == version_id,
+                    or_(
+                        documents.c.active_version_id == version_id,
+                        and_(
+                            documents.c.active_version_id.is_(None),
+                            documents.c.status == DocumentStatus.ACTIVE.value,
+                        ),
+                    ),
                 )
                 .values(
                     active_version_id=None,
@@ -605,11 +639,23 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                         select(documents.c.id, documents.c.user_id)
                         .where(
                             documents.c.status == DocumentStatus.DELETED.value,
-                            documents.c.deletion_status == "fenced",
-                            documents.c.deletion_fenced_at.is_not(None),
-                            documents.c.deletion_fenced_at <= cutoff,
+                            or_(
+                                and_(
+                                    documents.c.deletion_status == "fenced",
+                                    documents.c.deletion_fenced_at.is_not(None),
+                                    documents.c.deletion_fenced_at <= cutoff,
+                                ),
+                                documents.c.deletion_status == "completed",
+                            ),
                         )
-                        .order_by(documents.c.updated_at, documents.c.id)
+                        .order_by(
+                            case(
+                                (documents.c.deletion_status == "fenced", 0),
+                                else_=1,
+                            ),
+                            documents.c.updated_at,
+                            documents.c.id,
+                        )
                         .limit(limit)
                     )
                 )
@@ -716,22 +762,37 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                 .values(status=DocumentVersionStatus.QUARANTINED.value)
             )
 
-    async def mark_deletion_reconciled(self, document_id: str) -> None:
+    async def mark_deletion_reconciled(self, document_id: str) -> bool:
         async with self._session_factory.begin() as session:
             await session.execute(
                 update(document_versions)
                 .where(document_versions.c.document_id == document_id)
                 .values(status=DocumentVersionStatus.INACTIVE.value)
             )
+            completed = cast(
+                CursorResult[Any],
+                await session.execute(
+                    update(documents)
+                    .where(
+                        documents.c.id == document_id,
+                        documents.c.status == DocumentStatus.DELETED.value,
+                        documents.c.deletion_status == "fenced",
+                    )
+                    .values(deletion_status="completed", updated_at=_now())
+                ),
+            )
+            if completed.rowcount == 1:
+                return True
             await session.execute(
                 update(documents)
                 .where(
                     documents.c.id == document_id,
                     documents.c.status == DocumentStatus.DELETED.value,
-                    documents.c.deletion_status == "fenced",
+                    documents.c.deletion_status == "completed",
                 )
-                .values(deletion_status="completed", updated_at=_now())
+                .values(updated_at=_now())
             )
+            return False
 
 
 def _context(row: Mapping[str, Any] | RowMapping) -> StagingContext:
