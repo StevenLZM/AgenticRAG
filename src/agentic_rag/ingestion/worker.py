@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -108,6 +109,8 @@ class IngestionWorker:
         if (
             retry_backoff_seconds <= 0
             or max_retry_backoff_seconds < retry_backoff_seconds
+            or not math.isfinite(retry_backoff_seconds)
+            or not math.isfinite(max_retry_backoff_seconds)
         ):
             raise ValueError("retry backoff bounds must be positive and ordered")
         self._jobs = jobs
@@ -196,10 +199,7 @@ class IngestionWorker:
                     raise
                 except Exception:
                     failure_count += 1
-                    delay = min(
-                        self._retry_backoff * (2 ** (failure_count - 1)),
-                        self._max_retry_backoff,
-                    )
+                    delay = self._bounded_retry_delay(failure_count)
                     logger.exception(
                         "ingestion_worker_broker_retry",
                         extra={"worker_id": self._worker_id, "retry_delay": delay},
@@ -215,7 +215,26 @@ class IngestionWorker:
                         await asyncio.shield(current)
                     except asyncio.CancelledError:
                         stop.set()
-                        await current
+                        try:
+                            await current
+                        except asyncio.CancelledError:
+                            logger.info(
+                                "ingestion_worker_message_cancelled_during_drain",
+                                extra={
+                                    "worker_id": self._worker_id,
+                                    "message_id": message.id,
+                                    "job_id": message.aggregate_id,
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "ingestion_worker_message_failed_during_drain",
+                                extra={
+                                    "worker_id": self._worker_id,
+                                    "message_id": message.id,
+                                    "job_id": message.aggregate_id,
+                                },
+                            )
                         raise
                     except Exception:
                         logger.exception(
@@ -235,6 +254,19 @@ class IngestionWorker:
                 reconcile_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await reconcile_task
+
+    def _bounded_retry_delay(self, failure_count: int) -> float:
+        if failure_count <= 1 or self._retry_backoff == self._max_retry_backoff:
+            return self._retry_backoff
+        saturation_exponent = max(
+            0,
+            math.ceil(math.log2(self._max_retry_backoff / self._retry_backoff)),
+        )
+        exponent = min(failure_count - 1, saturation_exponent)
+        return min(
+            self._retry_backoff * (2.0**exponent),
+            self._max_retry_backoff,
+        )
 
     async def _run_with_heartbeat(self, claim: IngestionJobClaim) -> None:
         graph_task = asyncio.create_task(self._graph.run(claim))
@@ -435,6 +467,12 @@ class SqlAlchemyIngestionJobStore:
                 await session.execute(
                     select(
                         document_versions.c.status,
+                        document_versions.c.canonical_ast_path,
+                        document_versions.c.canonical_ast_hash,
+                        document_versions.c.manifest_path,
+                        document_versions.c.manifest_hash,
+                        document_versions.c.parent_count,
+                        document_versions.c.child_count,
                         documents.c.active_version_id,
                     )
                     .select_from(
@@ -471,6 +509,15 @@ class SqlAlchemyIngestionJobStore:
                 if getattr(result, "rowcount", 0) != 1:
                     raise LeaseLost(claim.job_id)
                 return JobStatus.COMPLETED
+            repairable_publication = publication is not None and (
+                publication.status == DocumentVersionStatus.BUILDING.value
+                and publication.canonical_ast_path is not None
+                and publication.canonical_ast_hash is not None
+                and publication.manifest_path is not None
+                and publication.manifest_hash is not None
+                and int(publication.parent_count) > 0
+                and int(publication.child_count) > 0
+            )
             result = await session.execute(
                 update(ingestion_jobs)
                 .where(*_live_claim_predicates(claim, now))
@@ -492,7 +539,7 @@ class SqlAlchemyIngestionJobStore:
             )
             if getattr(result, "rowcount", 0) != 1:
                 raise LeaseLost(claim.job_id)
-            if status is JobStatus.FAILED:
+            if status is JobStatus.FAILED and not repairable_publication:
                 await session.execute(
                     update(document_versions)
                     .where(

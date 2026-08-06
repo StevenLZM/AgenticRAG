@@ -139,3 +139,91 @@ The three-service E2E and real Redis/MySQL contracts were collected but skipped
 because their explicit test DSNs were absent. Once any test DSN is configured,
 unavailable infrastructure fails the test rather than silently falling back to
 fakes or guessed developer services.
+
+## Official review fix round 2
+
+The scoped re-review of `9689143` confirmed six original findings addressed and
+identified four remaining publication/lifecycle and loop interleavings. This
+round changes only those boundaries:
+
+- Final-attempt exceptions after new Parent activation, new Child activation,
+  old Child deactivation, or old Parent deactivation no longer convert a
+  manifest-complete BUILDING Version to FAILED. The Job still records durable
+  terminal/DLQ intent, while the Version remains an explicit publication repair
+  candidate. A worker-level parameterized test drives each physical boundary,
+  then runs the real SQL Reconciler and verifies exactly one winner: v2 ACTIVE,
+  v1 INACTIVE, Parent/Child active only for v2, and Job COMPLETED.
+- Expired-lease reclaim now locks the Job joined with its Version and Document.
+  If publication already atomically committed the candidate as ACTIVE and the
+  Document pointer names it, reclaim clears the lease and converges the Job to
+  COMPLETED without incrementing attempts or creating DLQ intent. Manifest-
+  complete BUILDING candidates are likewise preserved if a process dies during
+  partial physical publication; only unpublishable terminal candidates are
+  failed.
+- Broker retry delay now caps the exponent before exponentiation. Backoff inputs
+  must be finite, and a saturation regression uses an arbitrarily large failure
+  count to prove the result remains bounded by the configured maximum without
+  `OverflowError`.
+- Cancellation while a shielded message drains now observes and logs a drained
+  message failure but re-raises the caller's original `CancelledError`. The
+  regression reproduces a terminal DLQ failure during drain and verifies it does
+  not replace shutdown cancellation.
+
+Strict RED/GREEN evidence:
+
+```text
+terminal physical publication boundaries:
+  RED   4 failed (manifest-complete candidate became FAILED)
+  GREEN 4 passed (Reconciler converged SQL and physical winner)
+
+expired lease after publication commit:
+  RED   Job became FAILED with DLQ intent
+  GREEN Job COMPLETED with unchanged attempt count and no DLQ
+
+backoff saturation:
+  RED   missing bounded calculation; prior formula exponentiated before min
+  GREEN huge failure_count returns exactly configured maximum
+
+cancellation drain:
+  RED   drained DLQ RuntimeError replaced caller cancellation
+  GREEN caller CancelledError preserved after drained failure is observed
+
+focused four findings: 8 passed
+worker/store/lifecycle set: 31 passed
+adjacent Task 5 lifecycle set: 47 passed
+```
+
+Fresh verification after fix round 2:
+
+```text
+conda run -n agentic-rag python -m pytest tests/unit/ingestion tests/unit/safety -q
+140 passed
+
+conda run -n agentic-rag python -m pytest -m integration tests/integration/ingestion -q
+9 passed, 9 skipped, 18 existing Docling warnings
+
+conda run -n agentic-rag python -m pytest -m e2e tests/e2e -q
+3 passed, 1 skipped
+
+conda run -n agentic-rag python -m pytest -q
+263 passed, 32 skipped, 18 existing Docling warnings
+
+conda run -n agentic-rag ruff check src scripts tests
+All checks passed!
+
+conda run -n agentic-rag mypy src scripts/run_ingestion_worker.py \
+  scripts/review_quarantined_version.py tests/unit/ingestion/test_worker.py \
+  tests/unit/ingestion/test_worker_store.py \
+  tests/unit/ingestion/test_worker_publication_recovery.py \
+  tests/e2e/test_ingestion_pipeline.py \
+  tests/e2e/test_ingestion_pipeline_real_services.py \
+  tests/integration/ingestion/test_quarantine_approval_delivery.py
+Success: no issues found in 49 source files
+
+python -m py_compile scripts/run_ingestion_worker.py \
+  scripts/review_quarantined_version.py
+clean
+
+git diff --check
+clean
+```

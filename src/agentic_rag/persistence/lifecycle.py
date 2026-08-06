@@ -336,6 +336,24 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                             ingestion_jobs.c.document_id,
                             ingestion_jobs.c.document_version_id,
                             ingestion_jobs.c.attempt_count,
+                            document_versions.c.status.label("version_status"),
+                            document_versions.c.canonical_ast_path,
+                            document_versions.c.canonical_ast_hash,
+                            document_versions.c.manifest_path,
+                            document_versions.c.manifest_hash,
+                            document_versions.c.parent_count,
+                            document_versions.c.child_count,
+                            documents.c.active_version_id,
+                        )
+                        .select_from(
+                            ingestion_jobs.join(
+                                document_versions,
+                                document_versions.c.id
+                                == ingestion_jobs.c.document_version_id,
+                            ).join(
+                                documents,
+                                documents.c.id == ingestion_jobs.c.document_id,
+                            )
                         )
                         .where(
                             ingestion_jobs.c.status == JobStatus.RUNNING.value,
@@ -356,13 +374,45 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
             )
             job_ids = tuple(cast(str, row["id"]) for row in rows)
             if job_ids:
+                completed_rows = [
+                    row
+                    for row in rows
+                    if row["version_status"] == DocumentVersionStatus.ACTIVE.value
+                    and row["active_version_id"] == row["document_version_id"]
+                ]
+                completed_ids = tuple(cast(str, row["id"]) for row in completed_rows)
+                if completed_ids:
+                    await session.execute(
+                        update(ingestion_jobs)
+                        .where(
+                            ingestion_jobs.c.id.in_(completed_ids),
+                            ingestion_jobs.c.status == JobStatus.RUNNING.value,
+                            or_(
+                                ingestion_jobs.c.lease_expires_at.is_(None),
+                                ingestion_jobs.c.lease_expires_at <= now,
+                            ),
+                        )
+                        .values(
+                            status=JobStatus.COMPLETED.value,
+                            lease_owner=None,
+                            lease_expires_at=None,
+                            heartbeat_at=None,
+                            error_code=None,
+                            dead_letter_status=None,
+                            dead_letter_reason=None,
+                            updated_at=now,
+                        )
+                    )
+                remaining_rows = [
+                    row for row in rows if cast(str, row["id"]) not in completed_ids
+                ]
                 failed_rows = [
-                    row for row in rows if int(row["attempt_count"]) + 1 >= 3
+                    row for row in remaining_rows if int(row["attempt_count"]) + 1 >= 3
                 ]
                 failed_ids = tuple(cast(str, row["id"]) for row in failed_rows)
                 retry_ids = tuple(
                     cast(str, row["id"])
-                    for row in rows
+                    for row in remaining_rows
                     if cast(str, row["id"]) not in failed_ids
                 )
                 await session.execute(
@@ -416,11 +466,18 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                             updated_at=now,
                         )
                     )
+                    unrepairable_failed_rows = [
+                        row
+                        for row in failed_rows
+                        if not _is_manifest_complete_building(row)
+                    ]
                     failed_version_ids = tuple(
-                        cast(str, row["document_version_id"]) for row in failed_rows
+                        cast(str, row["document_version_id"])
+                        for row in unrepairable_failed_rows
                     )
                     failed_document_ids = tuple(
-                        cast(str, row["document_id"]) for row in failed_rows
+                        cast(str, row["document_id"])
+                        for row in unrepairable_failed_rows
                     )
                     await session.execute(
                         update(document_versions)
@@ -961,6 +1018,18 @@ def _outbox(row: Mapping[str, Any] | RowMapping) -> OutboxRecord:
         attempt_count=cast(int, row["attempt_count"]),
         next_attempt_at=cast(datetime, row["next_attempt_at"]),
         created_at=cast(datetime, row["created_at"]),
+    )
+
+
+def _is_manifest_complete_building(row: Mapping[str, Any] | RowMapping) -> bool:
+    return (
+        row["version_status"] == DocumentVersionStatus.BUILDING.value
+        and row["canonical_ast_path"] is not None
+        and row["canonical_ast_hash"] is not None
+        and row["manifest_path"] is not None
+        and row["manifest_hash"] is not None
+        and int(row["parent_count"]) > 0
+        and int(row["child_count"]) > 0
     )
 
 

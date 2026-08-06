@@ -494,6 +494,7 @@ async def test_third_expired_lease_fails_lifecycle_and_records_dlq_intent(
         document_id="document-expired-third",
         version_no=1,
         status=DocumentVersionStatus.BUILDING,
+        manifest=False,
     )
     async with factory.begin() as session:
         await session.execute(
@@ -564,6 +565,69 @@ async def test_third_expired_lease_fails_lifecycle_and_records_dlq_intent(
     assert outbox["attempt_count"] == 3
     assert version_status == DocumentVersionStatus.FAILED.value
     assert document_status == DocumentStatus.FAILED.value
+
+
+async def test_expired_lease_after_publication_commit_completes_job_without_dlq(
+    lifecycle_store: tuple[
+        SqlAlchemyReconciliationRepository, async_sessionmaker[AsyncSession]
+    ],
+) -> None:
+    repository, factory = lifecycle_store
+    now = datetime.now(UTC)
+    await _document(
+        factory,
+        document_id="document-published-crash",
+        pointer=None,
+        status=DocumentStatus.ACTIVE,
+    )
+    await _version(
+        factory,
+        version_id="version-published-crash",
+        document_id="document-published-crash",
+        version_no=1,
+        status=DocumentVersionStatus.ACTIVE,
+    )
+    async with factory.begin() as session:
+        await session.execute(
+            update(documents)
+            .where(documents.c.id == "document-published-crash")
+            .values(active_version_id="version-published-crash")
+        )
+        await session.execute(
+            insert(ingestion_jobs).values(
+                id="job-published-crash",
+                user_id="user-1",
+                document_id="document-published-crash",
+                document_version_id="version-published-crash",
+                status=JobStatus.RUNNING.value,
+                lease_owner="dead-worker",
+                lease_expires_at=now - timedelta(seconds=1),
+                heartbeat_at=now - timedelta(minutes=1),
+                attempt_count=2,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    assert await repository.reclaim_expired_jobs(10) == ("job-published-crash",)
+
+    async with factory() as session:
+        job = (
+            (
+                await session.execute(
+                    select(ingestion_jobs).where(
+                        ingestion_jobs.c.id == "job-published-crash"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert job["status"] == JobStatus.COMPLETED.value
+    assert job["attempt_count"] == 2
+    assert job["dead_letter_status"] is None
+    assert job["dead_letter_reason"] is None
+    assert job["lease_owner"] is None
 
 
 async def test_deleted_document_with_only_inactive_versions_remains_pending(

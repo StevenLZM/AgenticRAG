@@ -201,6 +201,18 @@ class CancellationGraph(Graph):
         raise AssertionError("cancellation graph unexpectedly resumed")
 
 
+class FailingDrainGraph(Graph):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, claim: IngestionJobClaim) -> dict[str, object]:
+        self.started.set()
+        await self.release.wait()
+        raise RuntimeError("drained message failed")
+
+
 class HeartbeatLosingJobStore(JobStore):
     async def heartbeat(self, claim: IngestionJobClaim, lease_seconds: int) -> None:
         raise LeaseLost(claim.job_id)
@@ -389,4 +401,50 @@ async def test_heartbeat_lease_loss_cancels_graph_and_leaves_message_pending() -
     await worker.process_message(_message())
 
     assert graph.cancelled.is_set()
+    assert broker.acked == []
+
+
+def test_broker_retry_backoff_saturates_before_large_exponent_overflows() -> None:
+    worker = IngestionWorker(
+        jobs=JobStore(),
+        broker=Broker(),
+        graph=Graph(),
+        reconciler=None,
+        worker_id="worker-1",
+        heartbeat_interval_seconds=0.01,
+        retry_backoff_seconds=0.25,
+        max_retry_backoff_seconds=5.0,
+    )
+
+    delay = worker._bounded_retry_delay(10**100)  # noqa: SLF001
+
+    assert 0.25 <= delay <= 5.0
+    assert delay == 5.0
+
+
+@pytest.mark.asyncio
+async def test_cancellation_preserves_cancelled_error_after_drained_message_fails() -> (
+    None
+):
+    jobs = JobStore(attempt_count=2)
+    broker = SingleMessageBroker(_message())
+    broker.fail_dead_letter = True
+    graph = FailingDrainGraph()
+    worker = IngestionWorker(
+        jobs=jobs,
+        broker=broker,
+        graph=graph,
+        reconciler=None,
+        worker_id="worker-1",
+        heartbeat_interval_seconds=0.01,
+    )
+    task = asyncio.create_task(worker.run_forever())
+    await asyncio.wait_for(graph.started.wait(), timeout=1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    graph.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert broker.acked == []
