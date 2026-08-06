@@ -106,3 +106,81 @@ pointer/concurrency convergence, live-job staleness, outbox claim/deduplication,
 Redis failure isolation, canonical Artifact verification, and integration-depth
 findings. Each was reproduced or covered by a focused regression and fixed. Final
 re-review reported no remaining Critical or Important findings.
+
+## Official review fix round 1
+
+The follow-up review of commit `026422df45d48c736e8b803164f86328646e9935`
+identified eight Important convergence and integration-depth gaps. This fix round
+addresses all eight without adding Task 6 behavior:
+
+- Document deletion now has a durable `pending`/`fenced`/`completed` marker introduced by
+  Alembic revision `0004_document_deletion_status`. Selection no longer infers
+  cleanup completion from Version status, including deleted Documents with only
+  inactive or zero Versions.
+- Deletion is a durable two-phase fence: the first pass atomically transitions
+  `pending` to `fenced`, records `deletion_fenced_at`, and terminates queued or
+  running Job leases. Only a later pass after the configured quiescence interval
+  may sweep physical stores and transition to `completed`. A controlled
+  interleaving test writes late Parent, Child, and Artifact data after the fence
+  and proves the later sweep removes it before completion.
+- Deletion now removes the exact trusted `documents/{user}/{document}` Artifact
+  tree before recording completion, and atomically terminates queued/running Job
+  leases so a stale worker cannot commit after deletion.
+- Publication, mismatch repair, and deletion are isolated per item. A permanently
+  failing first candidate no longer starves unrelated work in the same bounded
+  pass, and reports include only fully repaired IDs.
+- `PublicationObsoleteError` distinguishes a newer durable winner from integrity
+  corruption. Obsolete candidates are physically deactivated in Child then Parent
+  stores before their SQL Version becomes terminal.
+- Pointer scans now classify a pointed active Version with a drifted Document
+  status as `restore`; the repair rechecks pointer and Version status in a locked
+  transaction before restoring Document visibility.
+- RUNNING Jobs whose expiry is missing are treated as malformed expired claims and
+  reclaimed. Deletion completion clears live worker leases and records
+  `document_deleted`.
+- The explicit-DSN MySQL/Elasticsearch integration is parameterized over all five
+  publication boundaries (`new_parent`, `new_child`, `old_child`, `old_parent`,
+  acknowledged `finalize`), follows active Child search results through
+  pointer-gated Parent hydration, and adds concurrent v2/v3 finalizers converging
+  to the newest winner with the loser physically inactive.
+- Real MySQL coverage adds two concurrent `SKIP LOCKED` reconciliation claims and
+  a fresh `FOR UPDATE` lock-release assertion. Real Redis coverage executes the
+  Lua dedupe path, including publish-success/SQL-mark-failure retry and reclaim
+  generation rotation.
+
+Review-fix RED/GREEN evidence included:
+
+```text
+inactive deletion / per-item deletion: 12 failed, 1 passed -> 13 passed
+publication/deactivation isolation and obsolete loser: 3 failed -> 3 passed
+status drift / missing lease / deletion-worker lease: 2 failed, 2 passed -> 4 passed
+deletion fence / late in-flight physical writes: review finding -> 3 focused passed
+focused lifecycle, Artifact, publisher/reconciler units: 40 passed
+```
+
+Fresh verification after the fix round:
+
+```text
+conda run -n agentic-rag python -m pytest --collect-only -q \
+  tests/integration/ingestion/test_publisher_reconciler.py \
+  tests/integration/persistence/test_redis_streams.py \
+  tests/integration/persistence/test_mysql_schema.py
+23 tests collected
+
+conda run -n agentic-rag python -m pytest -q
+229 passed, 28 skipped, 18 warnings
+
+conda run -n agentic-rag ruff check .
+All checks passed!
+
+conda run -n agentic-rag mypy src
+Success: no issues found in 38 source files
+
+git diff --check
+clean
+```
+
+The real-service tests were collected but skipped because explicit disposable
+MySQL, Elasticsearch, and Redis endpoints were not configured. When a DSN is
+configured, the new MySQL/Elasticsearch fixture and Redis Lua test allow
+connectivity failures to fail rather than silently substituting guessed services.

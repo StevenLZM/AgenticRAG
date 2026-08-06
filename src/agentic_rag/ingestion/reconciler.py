@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
@@ -10,6 +11,7 @@ from redis.exceptions import RedisError
 from agentic_rag.ingestion.indexer import StagingContext
 from agentic_rag.ingestion.publisher import (
     PublicationIntegrityError,
+    PublicationObsoleteError,
     VersionLifecycleStore,
     VersionPublisher,
 )
@@ -33,6 +35,7 @@ class DeletedDocument(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    user_id: str
     document_id: str
     versions: tuple[StagingContext, ...]
 
@@ -43,7 +46,7 @@ class PointerMismatch(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     context: StagingContext
-    action: Literal["publish", "deactivate"]
+    action: Literal["publish", "deactivate", "restore"]
 
 
 class ReconciliationRepository(Protocol):
@@ -57,6 +60,10 @@ class ReconciliationRepository(Protocol):
 
     async def resolve_deactivated_version(self, version_id: str) -> None: ...
 
+    async def restore_active_document(self, version_id: str) -> bool: ...
+
+    async def fence_pending_deletions(self, limit: int) -> tuple[str, ...]: ...
+
     async def list_deleted_documents(self, limit: int) -> tuple[DeletedDocument, ...]: ...
 
     async def quarantine(self, version_id: str) -> None: ...
@@ -66,6 +73,10 @@ class ReconciliationRepository(Protocol):
 
 class OutboxRedispatcher(Protocol):
     async def redispatch(self, row: OutboxRecord) -> None: ...
+
+
+class DocumentArtifactStore(Protocol):
+    def delete_document_scope(self, user_id: str, document_id: str) -> None: ...
 
 
 class IngestionReconciler:
@@ -79,6 +90,7 @@ class IngestionReconciler:
         dispatcher: OutboxRedispatcher,
         parent_store: VersionLifecycleStore,
         child_store: VersionLifecycleStore,
+        artifacts: DocumentArtifactStore,
         scan_limit: int = 100,
     ) -> None:
         if scan_limit <= 0:
@@ -88,6 +100,7 @@ class IngestionReconciler:
         self._dispatcher = dispatcher
         self._parent_store = parent_store
         self._child_store = child_store
+        self._artifacts = artifacts
         self._scan_limit = scan_limit
 
     async def run_once(self) -> ReconcileReport:
@@ -112,34 +125,74 @@ class IngestionReconciler:
         )
         repaired: list[str] = []
         quarantined: list[str] = []
+        deactivated: set[str] = set()
         for version_id in publish_candidates:
             try:
                 await self._publisher.publish(version_id)
+            except PublicationObsoleteError as error:
+                try:
+                    await self._child_store.deactivate(error.context)
+                    await self._parent_store.deactivate(error.context)
+                    await self._repository.resolve_deactivated_version(version_id)
+                except Exception:
+                    continue
+                deactivated.add(version_id)
+                repaired.append(version_id)
             except PublicationIntegrityError:
-                await self._repository.quarantine(version_id)
-                quarantined.append(version_id)
+                try:
+                    await self._repository.quarantine(version_id)
+                except Exception:
+                    continue
+                else:
+                    quarantined.append(version_id)
+            except Exception:
+                continue
             else:
                 repaired.append(version_id)
 
         for mismatch in mismatches:
+            if mismatch.action == "restore":
+                version_id = mismatch.context.document_version_id
+                try:
+                    restored = await self._repository.restore_active_document(version_id)
+                except Exception:
+                    continue
+                if restored:
+                    repaired.append(version_id)
+                continue
             if mismatch.action != "deactivate":
                 continue
-            await self._child_store.deactivate(mismatch.context)
-            await self._parent_store.deactivate(mismatch.context)
-            await self._repository.resolve_deactivated_version(
-                mismatch.context.document_version_id
-            )
-            repaired.append(mismatch.context.document_version_id)
+            version_id = mismatch.context.document_version_id
+            if version_id in deactivated:
+                continue
+            try:
+                await self._child_store.deactivate(mismatch.context)
+                await self._parent_store.deactivate(mismatch.context)
+                await self._repository.resolve_deactivated_version(version_id)
+            except Exception:
+                continue
+            else:
+                repaired.append(version_id)
 
+        await self._repository.fence_pending_deletions(self._scan_limit)
         deletions: list[str] = []
         for deleted in await self._repository.list_deleted_documents(self._scan_limit):
-            for context in deleted.versions:
-                await self._child_store.deactivate(context)
-                await self._child_store.delete(context)
-                await self._parent_store.deactivate(context)
-                await self._parent_store.delete(context)
-            await self._repository.mark_deletion_reconciled(deleted.document_id)
-            deletions.append(deleted.document_id)
+            try:
+                for context in deleted.versions:
+                    await self._child_store.deactivate(context)
+                    await self._child_store.delete(context)
+                    await self._parent_store.deactivate(context)
+                    await self._parent_store.delete(context)
+                await asyncio.to_thread(
+                    self._artifacts.delete_document_scope,
+                    deleted.user_id,
+                    deleted.document_id,
+                )
+                await self._repository.mark_deletion_reconciled(deleted.document_id)
+            except Exception:
+                continue
+            else:
+                deletions.append(deleted.document_id)
 
         return ReconcileReport(
             redispatched_jobs=tuple(redispatched),

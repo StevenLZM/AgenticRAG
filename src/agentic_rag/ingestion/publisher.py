@@ -22,6 +22,17 @@ class PublicationIntegrityError(PublicationError):
     """A durable version cannot be trusted enough to publish."""
 
 
+class PublicationObsoleteError(PublicationError):
+    """A newer durable winner superseded this candidate."""
+
+    def __init__(self, context: StagingContext, winner_version_id: str) -> None:
+        super().__init__(
+            f"version {context.document_version_id!r} lost to {winner_version_id!r}"
+        )
+        self.context = context
+        self.winner_version_id = winner_version_id
+
+
 class PublicationTarget(BaseModel):
     """Trusted durable state needed to publish exactly one version."""
 

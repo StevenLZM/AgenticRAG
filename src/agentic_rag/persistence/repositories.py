@@ -59,6 +59,8 @@ documents = Table(
     Column("mime_type", String(128), nullable=False),
     Column("content_hash", String(64), nullable=False),
     Column("status", String(32), nullable=False),
+    Column("deletion_status", String(16), nullable=True),
+    Column("deletion_fenced_at", DateTime(timezone=True), nullable=True),
     Column(
         "active_version_id",
         String(36),
@@ -76,6 +78,11 @@ documents = Table(
     CheckConstraint(
         "status IN ('processing','active','failed','deleted')",
         name="ck_documents_status",
+    ),
+    CheckConstraint(
+        "deletion_status IS NULL OR "
+        "deletion_status IN ('pending','fenced','completed')",
+        name="ck_documents_deletion_status",
     ),
     CheckConstraint(
         "source_trust IN ('untrusted','trusted_curated')",
@@ -391,6 +398,7 @@ class Document:
     user_id: str
     status: DocumentStatus
     active_version_id: str | None
+    deletion_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1010,6 +1018,8 @@ class SqlAlchemyDocumentRepository(_SqlAlchemyRepository):
                 mime_type=mime_type,
                 content_hash=content_hash,
                 status=document.status.value,
+                deletion_status=None,
+                deletion_fenced_at=None,
                 source_trust="untrusted",
                 created_at=now,
                 updated_at=now,
@@ -1048,6 +1058,8 @@ class SqlAlchemyDocumentRepository(_SqlAlchemyRepository):
             )
             .values(
                 status=DocumentStatus.DELETED.value,
+                deletion_status="pending",
+                deletion_fenced_at=None,
                 active_version_id=None,
                 updated_at=_now(),
             )
@@ -1074,6 +1086,7 @@ class SqlAlchemyDocumentRepository(_SqlAlchemyRepository):
             user_id=row["user_id"],
             status=DocumentStatus(row["status"]),
             active_version_id=row["active_version_id"],
+            deletion_status=row["deletion_status"],
         )
 
 

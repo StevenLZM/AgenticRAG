@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
 from redis.exceptions import RedisError
@@ -40,6 +41,8 @@ def _context(version_id: str, version_no: int) -> StagingContext:
 @dataclass
 class _Artifacts:
     payloads: dict[str, bytes]
+    deleted_scopes: list[tuple[str, str]] = field(default_factory=list)
+    fail_scopes: set[tuple[str, str]] = field(default_factory=set)
 
     def verify(self, ref: ArtifactRef) -> bool:
         value = self.payloads.get(ref.uri)
@@ -53,6 +56,16 @@ class _Artifacts:
     def verify_hash(self, uri: str, sha256: str) -> bool:
         value = self.payloads.get(uri)
         return value is not None and hashlib.sha256(value).hexdigest() == sha256
+
+    def delete_document_scope(self, user_id: str, document_id: str) -> None:
+        scope = (user_id, document_id)
+        if scope in self.fail_scopes:
+            raise OSError("artifact cleanup failed")
+        prefix = f"artifact://documents/{user_id}/{document_id}/"
+        self.payloads = {
+            uri: value for uri, value in self.payloads.items() if not uri.startswith(prefix)
+        }
+        self.deleted_scopes.append(scope)
 
 
 @dataclass
@@ -117,9 +130,13 @@ class _ReconciliationRepository:
     stale: tuple[str, ...] = ()
     mismatches: tuple[PointerMismatch, ...] = ()
     deleted: tuple[DeletedDocument, ...] = ()
+    pending_deletions: tuple[DeletedDocument, ...] = ()
+    fenced_deletions: tuple[DeletedDocument, ...] = ()
+    deletion_fence_ready: bool = False
     quarantined: list[str] = field(default_factory=list)
     deletion_marks: list[str] = field(default_factory=list)
     resolved_mismatches: list[str] = field(default_factory=list)
+    restored_documents: list[str] = field(default_factory=list)
 
     async def claim_pending_outbox(self, limit: int) -> tuple[OutboxRecord, ...]:
         return self.pending[:limit]
@@ -136,8 +153,23 @@ class _ReconciliationRepository:
     async def resolve_deactivated_version(self, version_id: str) -> None:
         self.resolved_mismatches.append(version_id)
 
+    async def restore_active_document(self, version_id: str) -> bool:
+        self.restored_documents.append(version_id)
+        return True
+
+    async def fence_pending_deletions(self, limit: int) -> tuple[str, ...]:
+        selected = self.pending_deletions[:limit]
+        self.pending_deletions = self.pending_deletions[len(selected) :]
+        self.fenced_deletions = (*self.fenced_deletions, *selected)
+        return tuple(value.document_id for value in selected)
+
     async def list_deleted_documents(self, limit: int) -> tuple[DeletedDocument, ...]:
-        return self.deleted[:limit]
+        ready = (
+            (*self.deleted, *self.fenced_deletions)
+            if self.deletion_fence_ready
+            else self.deleted
+        )
+        return ready[:limit]
 
     async def quarantine(self, version_id: str) -> None:
         self.quarantined.append(version_id)
@@ -146,6 +178,11 @@ class _ReconciliationRepository:
         self.deletion_marks.append(document_id)
         self.deleted = tuple(
             value for value in self.deleted if value.document_id != document_id
+        )
+        self.fenced_deletions = tuple(
+            value
+            for value in self.fenced_deletions
+            if value.document_id != document_id
         )
 
 
@@ -158,6 +195,24 @@ class _Dispatcher:
         if self.fail:
             raise RedisError("offline")
         self.dispatched.append(row.aggregate_id)
+
+
+@dataclass
+class _SelectivePublisher:
+    failures: set[str]
+    published: list[str] = field(default_factory=list)
+
+    async def publish(self, version_id: str) -> None:
+        if version_id in self.failures:
+            raise RuntimeError(f"transient {version_id}")
+        self.published.append(version_id)
+
+
+class _FirstDeactivateFails(_LifecycleStore):
+    async def deactivate(self, context: StagingContext) -> None:
+        if context.document_version_id == "version-2":
+            raise RuntimeError("transient deactivation")
+        await super().deactivate(context)
 
 
 def _system(*, corrupt_manifest: bool = False, corrupt_canonical: bool = False) -> tuple[
@@ -277,6 +332,7 @@ async def test_reconciler_finishes_every_interrupted_activation_without_dual_exp
         dispatcher=_Dispatcher(),
         parent_store=parents,
         child_store=children,
+        artifacts=_Artifacts({}),
     ).run_once()
 
     assert report.repaired_versions == ("version-2",)
@@ -295,6 +351,7 @@ async def test_bad_manifest_is_quarantined_instead_of_published() -> None:
         dispatcher=_Dispatcher(),
         parent_store=parents,
         child_store=children,
+        artifacts=_Artifacts({}),
     ).run_once()
 
     assert report.quarantined_versions == ("version-2",)
@@ -312,6 +369,7 @@ async def test_missing_canonical_artifact_is_quarantined() -> None:
         dispatcher=_Dispatcher(),
         parent_store=parents,
         child_store=children,
+        artifacts=_Artifacts({}),
     ).run_once()
 
     assert report.quarantined_versions == ("version-2",)
@@ -331,6 +389,7 @@ async def test_obsolete_active_version_is_physically_and_durably_deactivated() -
         dispatcher=_Dispatcher(),
         parent_store=parents,
         child_store=children,
+        artifacts=_Artifacts({}),
     ).run_once()
 
     assert report.repaired_versions == ("version-2",)
@@ -353,6 +412,7 @@ async def test_reconciler_reports_redispatch_reclaim_and_idempotent_deletion() -
         created_at=now,
     )
     deleted = DeletedDocument(
+        user_id="user-1",
         document_id="document-1",
         versions=(_context("version-1", 1), _context("version-2", 2)),
     )
@@ -366,6 +426,7 @@ async def test_reconciler_reports_redispatch_reclaim_and_idempotent_deletion() -
         dispatcher=dispatcher,
         parent_store=parents,
         child_store=children,
+        artifacts=_Artifacts({}),
     )
 
     report = await reconciler.run_once()
@@ -401,7 +462,197 @@ async def test_redis_outage_does_not_block_other_reconciliation_classes() -> Non
         dispatcher=_Dispatcher(fail=True),
         parent_store=parents,
         child_store=children,
+        artifacts=_Artifacts({}),
     ).run_once()
 
     assert report.redispatched_jobs == ()
     assert report.reclaimed_jobs == ("job-2",)
+
+
+async def test_inactive_only_deleted_document_removes_all_physical_data_and_artifacts() -> None:
+    publisher, _, parents, children, _ = _system()
+    artifacts = _Artifacts(
+        {
+            "artifact://documents/user-1/document-1/version-1/source/upload.txt": b"x",
+            "artifact://documents/user-1/document-1/version-1/fragments/1.json": b"y",
+        }
+    )
+    deleted = DeletedDocument(
+        user_id="user-1",
+        document_id="document-1",
+        versions=(_context("version-1", 1), _context("version-2", 2)),
+    )
+    state = _ReconciliationRepository(deleted=(deleted,))
+
+    report = await IngestionReconciler(
+        repository=state,
+        publisher=publisher,
+        dispatcher=_Dispatcher(),
+        parent_store=parents,
+        child_store=children,
+        artifacts=artifacts,
+    ).run_once()
+
+    assert report.reconciled_deletions == ("document-1",)
+    assert parents.totals == {}
+    assert children.totals == {}
+    assert artifacts.payloads == {}
+    assert artifacts.deleted_scopes == [("user-1", "document-1")]
+
+
+async def test_failed_first_deletion_does_not_block_unrelated_document() -> None:
+    publisher, _, parents, children, _ = _system()
+    artifacts = _Artifacts({}, fail_scopes={("user-1", "document-1")})
+    first = DeletedDocument(
+        user_id="user-1",
+        document_id="document-1",
+        versions=(_context("version-1", 1),),
+    )
+    second_context = _context("version-3", 3).model_copy(
+        update={"document_id": "document-2"}
+    )
+    parents.totals["version-3"] = 1
+    children.totals["version-3"] = 1
+    second = DeletedDocument(
+        user_id="user-1",
+        document_id="document-2",
+        versions=(second_context,),
+    )
+    state = _ReconciliationRepository(deleted=(first, second))
+
+    report = await IngestionReconciler(
+        repository=state,
+        publisher=publisher,
+        dispatcher=_Dispatcher(),
+        parent_store=parents,
+        child_store=children,
+        artifacts=artifacts,
+    ).run_once()
+
+    assert report.reconciled_deletions == ("document-2",)
+    assert state.deletion_marks == ["document-2"]
+
+
+async def test_deletion_fence_precedes_cleanup_of_late_inflight_writes() -> None:
+    publisher, _, parents, children, _ = _system()
+    context = _context("version-late", 1)
+    deleted = DeletedDocument(
+        user_id=context.user_id,
+        document_id=context.document_id,
+        versions=(context,),
+    )
+    state = _ReconciliationRepository(pending_deletions=(deleted,))
+    artifacts = _Artifacts({})
+    reconciler = IngestionReconciler(
+        repository=state,
+        publisher=publisher,
+        dispatcher=_Dispatcher(),
+        parent_store=parents,
+        child_store=children,
+        artifacts=artifacts,
+    )
+
+    first = await reconciler.run_once()
+
+    assert first.reconciled_deletions == ()
+    assert state.fenced_deletions == (deleted,)
+    assert state.deletion_marks == []
+
+    # A publisher already in flight finishes physical writes after the durable fence.
+    parents.active.add(context.document_version_id)
+    children.active.add(context.document_version_id)
+    parents.totals[context.document_version_id] = 1
+    children.totals[context.document_version_id] = 1
+    late_uri = (
+        f"artifact://documents/{context.user_id}/{context.document_id}/"
+        f"{context.document_version_id}/late.bin"
+    )
+    artifacts.payloads[late_uri] = b"late"
+
+    state.deletion_fence_ready = True
+    second = await reconciler.run_once()
+
+    assert second.reconciled_deletions == (context.document_id,)
+    assert context.document_version_id not in parents.active
+    assert context.document_version_id not in children.active
+    assert context.document_version_id not in parents.totals
+    assert context.document_version_id not in children.totals
+    assert late_uri not in artifacts.payloads
+    assert state.deletion_marks == [context.document_id]
+
+
+async def test_failed_first_publication_does_not_starve_later_candidate() -> None:
+    _, _, parents, children, _ = _system()
+    selective = _SelectivePublisher(failures={"version-bad"})
+    state = _ReconciliationRepository(stale=("version-bad", "version-good"))
+
+    report = await IngestionReconciler(
+        repository=state,
+        publisher=cast(Any, selective),
+        dispatcher=_Dispatcher(),
+        parent_store=parents,
+        child_store=children,
+        artifacts=_Artifacts({}),
+    ).run_once()
+
+    assert report.repaired_versions == ("version-good",)
+    assert selective.published == ["version-good"]
+
+
+async def test_failed_first_deactivation_does_not_starve_later_mismatch() -> None:
+    publisher, _, parents, children, events = _system()
+    context_3 = _context("version-3", 3)
+    parents.totals["version-3"] = 1
+    children.totals["version-3"] = 1
+    failing_children = _FirstDeactivateFails(
+        "children", events, {"version-2", "version-3"}, children.totals
+    )
+    state = _ReconciliationRepository(
+        mismatches=(
+            PointerMismatch(context=_context("version-2", 2), action="deactivate"),
+            PointerMismatch(context=context_3, action="deactivate"),
+        )
+    )
+
+    report = await IngestionReconciler(
+        repository=state,
+        publisher=publisher,
+        dispatcher=_Dispatcher(),
+        parent_store=parents,
+        child_store=failing_children,
+        artifacts=_Artifacts({}),
+    ).run_once()
+
+    assert report.repaired_versions == ("version-3",)
+    assert state.resolved_mismatches == ["version-3"]
+
+
+async def test_obsolete_publication_is_physically_deactivated_before_terminal_state() -> None:
+    from agentic_rag.ingestion.publisher import PublicationObsoleteError
+
+    _, _, parents, children, _ = _system()
+    parents.active.add("version-2")
+    children.active.add("version-2")
+
+    class _ObsoletePublisher:
+        async def publish(self, version_id: str) -> None:
+            raise PublicationObsoleteError(_context(version_id, 2), "version-3")
+
+    state = _ReconciliationRepository(
+        mismatches=(
+            PointerMismatch(context=_context("version-2", 2), action="publish"),
+        )
+    )
+    report = await IngestionReconciler(
+        repository=state,
+        publisher=cast(Any, _ObsoletePublisher()),
+        dispatcher=_Dispatcher(),
+        parent_store=parents,
+        child_store=children,
+        artifacts=_Artifacts({}),
+    ).run_once()
+
+    assert report.repaired_versions == ("version-2",)
+    assert "version-2" not in parents.active
+    assert "version-2" not in children.active
+    assert state.resolved_mismatches == ["version-2"]

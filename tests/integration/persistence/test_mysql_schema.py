@@ -17,7 +17,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect, insert, select, update
+from sqlalchemy import delete, inspect, insert, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from redis.asyncio import Redis
@@ -25,6 +25,7 @@ from redis.exceptions import RedisError
 
 from agentic_rag.domain.models import RunStatus, UserScope
 from agentic_rag.persistence.mysql import create_mysql_engine, create_session_factory
+from agentic_rag.persistence.lifecycle import SqlAlchemyReconciliationRepository
 from agentic_rag.persistence.redis_queue import RedisStreamsBroker
 from agentic_rag.persistence import repositories
 from agentic_rag.persistence.repositories import (
@@ -241,7 +242,21 @@ async def test_migration_creates_exact_schema_with_required_keys(
                 }
                 for table in EXPECTED_TABLES
             }
-            return tables, run_uniques, event_uniques, indexes, foreign_keys
+            document_columns = {
+                item["name"]: item for item in inspector.get_columns("documents")
+            }
+            document_checks = {
+                item["name"] for item in inspector.get_check_constraints("documents")
+            }
+            return (
+                tables,
+                run_uniques,
+                event_uniques,
+                indexes,
+                foreign_keys,
+                document_columns,
+                document_checks,
+            )
 
         (
             tables,
@@ -249,6 +264,8 @@ async def test_migration_creates_exact_schema_with_required_keys(
             event_uniques,
             indexes,
             foreign_keys,
+            document_columns,
+            document_checks,
         ) = await schema.run_sync(inspect_schema)
 
     assert tables == EXPECTED_TABLES
@@ -260,6 +277,60 @@ async def test_migration_creates_exact_schema_with_required_keys(
     }
     assert required_indexes == EXPECTED_INDEXES
     assert foreign_keys == EXPECTED_FOREIGN_KEYS
+    assert document_columns["deletion_status"]["nullable"] is True
+    assert document_columns["deletion_fenced_at"]["nullable"] is True
+    assert "ck_documents_deletion_status" in document_checks
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reconciliation_claims_are_disjoint_and_release_locks(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    suffix = uuid4().hex
+    ids = (f"outbox-claim-a-{suffix}", f"outbox-claim-b-{suffix}")
+    now = datetime.now(UTC)
+    async with session_factory.begin() as transaction:
+        for index, outbox_id in enumerate(ids):
+            await transaction.execute(
+                insert(task_outbox).values(
+                    id=outbox_id,
+                    aggregate_type="ingestion_job",
+                    aggregate_id=f"job-claim-{index}-{suffix}",
+                    stream_name="agenticrag:test:jobs",
+                    status="pending",
+                    attempt_count=0,
+                    next_attempt_at=now,
+                    created_at=now + timedelta(microseconds=index),
+                )
+            )
+
+    first = SqlAlchemyReconciliationRepository(session_factory)
+    second = SqlAlchemyReconciliationRepository(session_factory)
+    try:
+        claims = await asyncio.wait_for(
+            asyncio.gather(
+                first.claim_pending_outbox(1),
+                second.claim_pending_outbox(1),
+            ),
+            timeout=10,
+        )
+        claimed_ids = [row.id for claim in claims for row in claim]
+        assert sorted(claimed_ids) == sorted(ids)
+        assert len(set(claimed_ids)) == 2
+
+        # Both claim transactions have committed; a fresh transaction can lock rows.
+        async with session_factory.begin() as transaction:
+            locked = (
+                await transaction.execute(
+                    select(task_outbox.c.id)
+                    .where(task_outbox.c.id.in_(ids))
+                    .with_for_update()
+                )
+            ).scalars().all()
+        assert sorted(locked) == sorted(ids)
+    finally:
+        async with session_factory.begin() as transaction:
+            await transaction.execute(delete(task_outbox).where(task_outbox.c.id.in_(ids)))
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -143,6 +144,18 @@ class LocalArtifactStore:
     def delete(self, ref: ArtifactRef) -> None:
         """Delete exactly one referenced artifact, if it still exists."""
         self._path_from_ref(ref).unlink(missing_ok=True)
+
+    def delete_document_scope(self, user_id: str, document_id: str) -> None:
+        """Idempotently remove one trusted user's exact Document Artifact tree."""
+        scope, _ = self._resolve_relative_path(
+            f"documents/{user_id}/{document_id}"
+        )
+        if not scope.exists():
+            return
+        if not scope.is_dir() or scope.is_symlink():
+            raise OSError("document Artifact scope is not a managed directory")
+        shutil.rmtree(scope)
+        _fsync_directory(scope.parent)
 
     def _path_from_ref(self, ref: ArtifactRef) -> Path:
         if not ref.uri.startswith(_ARTIFACT_URI_PREFIX):

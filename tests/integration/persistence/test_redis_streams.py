@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -12,6 +13,29 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from agentic_rag.persistence.redis_queue import RedisStreamsBroker
+from agentic_rag.persistence.outbox import OutboxDispatcher
+from agentic_rag.persistence.repositories import OutboxRecord
+
+
+class _FailFirstMarkOutbox:
+    def __init__(self) -> None:
+        self.fail_mark = True
+        self.marked: list[str] = []
+
+    async def list_pending(self, limit: int) -> list[OutboxRecord]:
+        raise AssertionError("redispatch does not list rows")
+
+    async def claim_pending(self, limit: int) -> list[OutboxRecord]:
+        raise AssertionError("redispatch does not claim rows")
+
+    async def mark_dispatched(self, outbox_id: str) -> None:
+        if self.fail_mark:
+            self.fail_mark = False
+            raise RuntimeError("injected SQL mark failure")
+        self.marked.append(outbox_id)
+
+    async def schedule_retry(self, outbox_id: str) -> None:
+        raise AssertionError("redispatch does not schedule rows")
 
 
 def _local_redis_dsn() -> str:
@@ -68,4 +92,51 @@ async def test_duplicate_aggregate_delivery_retains_the_aggregate_id() -> None:
     finally:
         if connected:
             await client.delete(stream, dead_stream)
+        await client.aclose()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_lua_dedupes_retry_and_allows_new_reclaim_generation() -> None:
+    """One delivery generation has one entry even if SQL marking fails."""
+    client = Redis.from_url(_local_redis_dsn(), decode_responses=True)
+    suffix = uuid4().hex
+    stream = f"agenticrag:test:dedupe:{suffix}"
+    broker = RedisStreamsBroker(client)
+    outbox = _FailFirstMarkOutbox()
+    dispatcher = OutboxDispatcher(outbox, broker)
+    created_at = datetime.now(UTC)
+    first_generation = OutboxRecord(
+        id=f"outbox-{suffix}",
+        aggregate_type="ingestion_job",
+        aggregate_id=f"job-{suffix}",
+        stream_name=stream,
+        status="pending",
+        attempt_count=0,
+        next_attempt_at=created_at,
+        created_at=created_at,
+    )
+
+    try:
+        # A configured but unavailable Redis is an integration failure, not a skip.
+        await client.ping()
+        with pytest.raises(RuntimeError, match="SQL mark failure"):
+            await dispatcher.redispatch(first_generation)
+        await dispatcher.redispatch(first_generation)
+
+        entries = await client.xrange(stream)
+        assert len(entries) == 1
+        assert entries[0][1]["aggregate_id"] == first_generation.aggregate_id
+        assert outbox.marked == [first_generation.id]
+
+        reclaimed_generation = replace(first_generation, attempt_count=1)
+        await dispatcher.redispatch(reclaimed_generation)
+        entries = await client.xrange(stream)
+        assert len(entries) == 2
+        assert [fields["aggregate_id"] for _, fields in entries] == [
+            first_generation.aggregate_id,
+            first_generation.aggregate_id,
+        ]
+    finally:
+        await client.delete(stream, f"{stream}:dedupe")
         await client.aclose()

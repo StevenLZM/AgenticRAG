@@ -33,6 +33,34 @@ def test_artifact_delete_removes_only_the_referenced_object(tmp_path: Path) -> N
     assert store.read_json(durable) == {"evidence_ids": ["e1"]}
 
 
+def test_document_scope_delete_is_exact_and_idempotent(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path)
+    target = store.put_bytes("documents/user-1/document-1/v1/data.bin", b"target")
+    sibling_document = store.put_bytes(
+        "documents/user-1/document-10/v1/data.bin", b"sibling-document"
+    )
+    sibling_user = store.put_bytes(
+        "documents/user-10/document-1/v1/data.bin", b"sibling-user"
+    )
+
+    store.delete_document_scope("user-1", "document-1")
+    store.delete_document_scope("user-1", "document-1")
+
+    assert not store.verify(target)
+    assert store.verify(sibling_document)
+    assert store.verify(sibling_user)
+
+
+@pytest.mark.parametrize(("user_id", "document_id"), (("../user", "doc"), ("user", "../doc")))
+def test_document_scope_delete_rejects_path_escape(
+    tmp_path: Path, user_id: str, document_id: str
+) -> None:
+    store = LocalArtifactStore(tmp_path / "artifacts")
+
+    with pytest.raises(ValueError, match="relative path"):
+        store.delete_document_scope(user_id, document_id)
+
+
 def test_verify_detects_content_and_size_mismatch(tmp_path: Path) -> None:
     store = LocalArtifactStore(tmp_path)
     ref = store.put_bytes("runs/r1/payload.bin", b"trusted")

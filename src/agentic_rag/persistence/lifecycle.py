@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.engine import CursorResult, RowMapping
@@ -14,6 +14,7 @@ from agentic_rag.domain.models import DocumentStatus, DocumentVersionStatus, Job
 from agentic_rag.ingestion.indexer import StagingContext
 from agentic_rag.ingestion.publisher import (
     PublicationError,
+    PublicationObsoleteError,
     PublicationRepository,
     PublicationTarget,
 )
@@ -114,7 +115,7 @@ class SqlAlchemyPublicationRepository(PublicationRepository):
                 if previous is None:
                     return None
                 if cast(int, previous["version_no"]) > context.version_no:
-                    return None
+                    raise PublicationObsoleteError(context, active_version_id)
                 previous_context = _context(previous)
             return PublicationTarget(
                 context=context,
@@ -152,6 +153,15 @@ class SqlAlchemyPublicationRepository(PublicationRepository):
                 target.active_version_id,
                 context.document_version_id,
             }:
+                winner = await session.execute(
+                    select(document_versions.c.id, document_versions.c.version_no).where(
+                        document_versions.c.id == current_pointer,
+                        document_versions.c.document_id == context.document_id,
+                    )
+                )
+                winner_row = winner.one_or_none()
+                if winner_row is not None and winner_row.version_no > context.version_no:
+                    raise PublicationObsoleteError(context, cast(str, winner_row.id))
                 raise PublicationConflict("active version changed during publication")
 
             newer_active = await session.scalar(
@@ -164,7 +174,7 @@ class SqlAlchemyPublicationRepository(PublicationRepository):
                 .limit(1)
             )
             if newer_active is not None:
-                raise PublicationConflict("a newer version is already active")
+                raise PublicationObsoleteError(context, cast(str, newer_active))
 
             current_version_status = await session.scalar(
                 select(document_versions.c.status).where(
@@ -291,8 +301,10 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                         select(ingestion_jobs.c.id)
                         .where(
                             ingestion_jobs.c.status == JobStatus.RUNNING.value,
-                            ingestion_jobs.c.lease_expires_at.is_not(None),
-                            ingestion_jobs.c.lease_expires_at <= now,
+                            or_(
+                                ingestion_jobs.c.lease_expires_at.is_(None),
+                                ingestion_jobs.c.lease_expires_at <= now,
+                            ),
                         )
                         .order_by(ingestion_jobs.c.lease_expires_at, ingestion_jobs.c.id)
                         .limit(limit)
@@ -309,7 +321,10 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                     .where(
                         ingestion_jobs.c.id.in_(job_ids),
                         ingestion_jobs.c.status == JobStatus.RUNNING.value,
-                        ingestion_jobs.c.lease_expires_at <= now,
+                        or_(
+                            ingestion_jobs.c.lease_expires_at.is_(None),
+                            ingestion_jobs.c.lease_expires_at <= now,
+                        ),
                     )
                     .values(
                         status=JobStatus.QUEUED.value,
@@ -394,6 +409,7 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                     select(
                         document_versions,
                         documents.c.user_id.label("user_id"),
+                        documents.c.status.label("document_status"),
                         documents.c.active_version_id,
                         pointed.c.version_no.label("pointed_version_no"),
                     )
@@ -444,6 +460,14 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                                     ),
                                 ),
                             ),
+                            and_(
+                                documents.c.active_version_id
+                                == document_versions.c.id,
+                                document_versions.c.status
+                                == DocumentVersionStatus.ACTIVE.value,
+                                documents.c.status
+                                != DocumentStatus.ACTIVE.value,
+                            ),
                         ),
                     )
                     .order_by(document_versions.c.created_at, document_versions.c.id)
@@ -457,22 +481,78 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
             version_no = cast(int, row["version_no"])
             pointed_version_no = cast(int | None, row["pointed_version_no"])
             status = cast(str, row["status"])
+            document_status = cast(str, row["document_status"])
             has_manifest = row["manifest_path"] is not None and row["manifest_hash"] is not None
-            publish = has_manifest and (
-                (version_id == pointer and status in {DocumentVersionStatus.BUILDING.value, DocumentVersionStatus.INACTIVE.value})
-                or (
-                    version_id != pointer
-                    and status in {DocumentVersionStatus.BUILDING.value, DocumentVersionStatus.ACTIVE.value}
-                    and (pointed_version_no is None or version_no > pointed_version_no)
+            action: Literal["publish", "deactivate", "restore"]
+            if (
+                version_id == pointer
+                and status == DocumentVersionStatus.ACTIVE.value
+                and document_status != DocumentStatus.ACTIVE.value
+            ):
+                action = "restore"
+            else:
+                publish = has_manifest and (
+                    (version_id == pointer and status in {DocumentVersionStatus.BUILDING.value, DocumentVersionStatus.INACTIVE.value})
+                    or (
+                        version_id != pointer
+                        and status in {DocumentVersionStatus.BUILDING.value, DocumentVersionStatus.ACTIVE.value}
+                        and (pointed_version_no is None or version_no > pointed_version_no)
+                    )
                 )
-            )
+                action = "publish" if publish else "deactivate"
             mismatches.append(
                 PointerMismatch(
                     context=_context(row),
-                    action="publish" if publish else "deactivate",
+                    action=action,
                 )
             )
         return tuple(mismatches)
+
+    async def restore_active_document(self, version_id: str) -> bool:
+        async with self._session_factory.begin() as session:
+            row = (
+                (
+                    await session.execute(
+                        select(
+                            documents.c.id.label("document_id"),
+                            documents.c.status.label("document_status"),
+                            document_versions.c.status.label("version_status"),
+                        )
+                        .select_from(
+                            document_versions.join(
+                                documents,
+                                document_versions.c.document_id == documents.c.id,
+                            )
+                        )
+                        .where(
+                            document_versions.c.id == version_id,
+                            documents.c.active_version_id == version_id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if (
+                row is None
+                or row["version_status"] != DocumentVersionStatus.ACTIVE.value
+                or row["document_status"] == DocumentStatus.DELETED.value
+            ):
+                return False
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    update(documents)
+                    .where(
+                        documents.c.id == row["document_id"],
+                        documents.c.active_version_id == version_id,
+                        documents.c.status != DocumentStatus.DELETED.value,
+                    )
+                    .values(status=DocumentStatus.ACTIVE.value, updated_at=_now())
+                ),
+            )
+            return result.rowcount == 1
 
     async def resolve_deactivated_version(self, version_id: str) -> None:
         async with self._session_factory.begin() as session:
@@ -517,29 +597,26 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
             )
 
     async def list_deleted_documents(self, limit: int) -> tuple[DeletedDocument, ...]:
+        cutoff = _now() - self._stale_after
         async with self._session_factory() as session:
-            document_ids = tuple(
-                cast(str, value)
-                for value in (
+            document_rows = (
+                (
                     await session.execute(
-                        select(documents.c.id)
-                        .select_from(
-                            documents.join(
-                                document_versions,
-                                document_versions.c.document_id == documents.c.id,
-                            )
-                        )
+                        select(documents.c.id, documents.c.user_id)
                         .where(
                             documents.c.status == DocumentStatus.DELETED.value,
-                            document_versions.c.status
-                            != DocumentVersionStatus.INACTIVE.value,
+                            documents.c.deletion_status == "fenced",
+                            documents.c.deletion_fenced_at.is_not(None),
+                            documents.c.deletion_fenced_at <= cutoff,
                         )
-                        .group_by(documents.c.id, documents.c.updated_at)
                         .order_by(documents.c.updated_at, documents.c.id)
                         .limit(limit)
                     )
-                ).scalars().all()
+                )
+                .mappings()
+                .all()
             )
+            document_ids = tuple(cast(str, row["id"]) for row in document_rows)
             if not document_ids:
                 return ()
             rows = (
@@ -566,12 +643,66 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                 .all()
             )
         grouped: dict[str, list[StagingContext]] = {value: [] for value in document_ids}
+        user_by_document = {
+            cast(str, row["id"]): cast(str, row["user_id"])
+            for row in document_rows
+        }
         for row in rows:
             grouped[cast(str, row["document_id"])].append(_context(row))
         return tuple(
-            DeletedDocument(document_id=value, versions=tuple(grouped[value]))
+            DeletedDocument(
+                user_id=user_by_document[value],
+                document_id=value,
+                versions=tuple(grouped[value]),
+            )
             for value in document_ids
         )
+
+    async def fence_pending_deletions(self, limit: int) -> tuple[str, ...]:
+        now = _now()
+        async with self._session_factory.begin() as session:
+            values = (
+                await session.execute(
+                    select(documents.c.id)
+                    .where(
+                        documents.c.status == DocumentStatus.DELETED.value,
+                        documents.c.deletion_status == "pending",
+                    )
+                    .order_by(documents.c.updated_at, documents.c.id)
+                    .limit(limit)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalars().all()
+            document_ids = tuple(cast(str, value) for value in values)
+            if not document_ids:
+                return ()
+            await session.execute(
+                update(ingestion_jobs)
+                .where(
+                    ingestion_jobs.c.document_id.in_(document_ids),
+                    ingestion_jobs.c.status.in_(
+                        (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
+                    ),
+                )
+                .values(
+                    status=JobStatus.FAILED.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None,
+                    error_code="document_deleted",
+                    updated_at=now,
+                )
+            )
+            await session.execute(
+                update(documents)
+                .where(
+                    documents.c.id.in_(document_ids),
+                    documents.c.status == DocumentStatus.DELETED.value,
+                    documents.c.deletion_status == "pending",
+                )
+                .values(deletion_status="fenced", deletion_fenced_at=now, updated_at=now)
+            )
+            return document_ids
 
     async def quarantine(self, version_id: str) -> None:
         async with self._session_factory.begin() as session:
@@ -593,21 +724,13 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                 .values(status=DocumentVersionStatus.INACTIVE.value)
             )
             await session.execute(
-                update(ingestion_jobs)
+                update(documents)
                 .where(
-                    ingestion_jobs.c.document_id == document_id,
-                    ingestion_jobs.c.status.in_(
-                        (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
-                    ),
+                    documents.c.id == document_id,
+                    documents.c.status == DocumentStatus.DELETED.value,
+                    documents.c.deletion_status == "fenced",
                 )
-                .values(
-                    status=JobStatus.FAILED.value,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    heartbeat_at=None,
-                    error_code="document_deleted",
-                    updated_at=_now(),
-                )
+                .values(deletion_status="completed", updated_at=_now())
             )
 
 
