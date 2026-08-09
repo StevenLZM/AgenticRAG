@@ -1,5 +1,9 @@
 # Production Agentic RAG Implementation Roadmap
 
+> **Current implementation status:** Phase 1 and Phase 2 are complete on
+> `sdd-agentic-rag-implementation`; Phase 3 has not started. Read the
+> [development progress snapshot](../../development-progress.md) before resuming.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver the approved single-host production Agentic RAG system as five ordered, independently reviewable implementation phases.
