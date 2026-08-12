@@ -8,7 +8,12 @@ from dataclasses import dataclass, field
 import pytest
 
 from agentic_rag.models.schemas import RouteDecision
-from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway, load_prompt
+from agentic_rag.runtime.model_gateway import (
+    ModelCall,
+    ModelGateway,
+    load_prompt,
+    prompt_hashes,
+)
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
@@ -79,6 +84,10 @@ class FakeChatClient:
         )()
 
 
+class APIConnectionError(Exception):
+    """A transport-shaped SDK error that does not inherit ConnectionError."""
+
+
 async def test_structured_call_repairs_invalid_schema_without_returning_partial() -> None:
     client = FakeClient(
         [
@@ -110,6 +119,15 @@ async def test_transient_failure_is_retried_by_gateway_once_per_attempt() -> Non
     assert result.requested_model == "light-model"
     assert result.actual_model == "provider-resolved-model"
     assert (result.input_tokens, result.output_tokens) == (7, 3)
+
+
+async def test_sdk_connection_error_is_retried_without_retrying_value_errors() -> None:
+    client = FakeClient([APIConnectionError("temporary connection"), "hello"])
+
+    result = await ModelGateway(client, sleep=lambda _: _no_sleep()).complete(ROUTE_CALL)
+
+    assert result.value == "hello"
+    assert result.attempts == 2
 
 
 async def test_non_transient_failure_is_not_retried() -> None:
@@ -149,6 +167,27 @@ def test_versioned_prompt_loader_returns_stable_content_hash(name: str) -> None:
     assert len(prompt.content_hash) == 64
     assert "# ROLE" in prompt.content
     assert "# FAIL-CLOSED RULES" in prompt.content
+
+
+def test_all_versioned_prompt_hashes_are_captured_by_an_immutable_snapshot() -> None:
+    names = (
+        "router_v1",
+        "research_agent_v1",
+        "evidence_grader_v1",
+        "generator_v1",
+        "faithfulness_v1",
+        "context_compactor_v1",
+        "memory_extractor_v1",
+    )
+    hashes = prompt_hashes(names)
+    snapshot = RuntimeConfigSnapshot(
+        **SNAPSHOT.model_dump(exclude={"prompt_hashes"}), prompt_hashes=hashes
+    )
+
+    assert snapshot.prompt_hash_map == hashes
+    assert snapshot.model_dump()["prompt_hashes"] == tuple(sorted(hashes.items()))
+    with pytest.raises(TypeError):
+        snapshot.prompt_hashes[0] = ("router_v1", "0" * 64)
 
 
 async def _no_sleep() -> None:

@@ -236,10 +236,36 @@ def _repair_messages(
 
 
 def _is_transient(error: BaseException) -> bool:
-    if isinstance(error, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
-        return True
-    status_code = _get(error, "status_code")
-    return isinstance(status_code, int) and (status_code == 429 or 500 <= status_code <= 599)
+    """Classify only known temporary provider/transport failures.
+
+    SDK transport exceptions commonly wrap ``httpx`` errors instead of inheriting
+    the standard-library ``ConnectionError``.  Traverse an exception chain by
+    identity while deliberately preserving cancellation and interrupts.
+    """
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    transient_names = {"APIConnectionError", "ConnectError", "ConnectTimeout", "ReadTimeout"}
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            return False
+        if isinstance(current, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+            return True
+        status_code = _get(current, "status_code")
+        if isinstance(status_code, int) and (status_code == 429 or 500 <= status_code <= 599):
+            return True
+        if type(current).__name__ in transient_names:
+            return True
+        cause = current.__cause__
+        context = current.__context__
+        if cause is not None:
+            pending.append(cause)
+        if context is not None:
+            pending.append(context)
+    return False
 
 
 def _get(value: object | None, key: str) -> object | None:

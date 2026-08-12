@@ -39,6 +39,24 @@ def test_runtime_snapshot_id_is_content_addressed():
     assert left.snapshot_id == right.snapshot_id
 
 
+def test_runtime_snapshot_persists_immutable_prompt_content_hashes():
+    router_hash = "a" * 64
+    snapshot = RuntimeConfigSnapshot(
+        **SNAPSHOT_DATA, prompt_hashes={"router_v1": router_hash}
+    )
+    changed = RuntimeConfigSnapshot(
+        **SNAPSHOT_DATA, prompt_hashes={"router_v1": "b" * 64}
+    )
+
+    assert snapshot.model_dump()["prompt_hashes"] == (("router_v1", router_hash),)
+    assert snapshot.prompt_hash_map == {"router_v1": router_hash}
+    assert snapshot.snapshot_id != changed.snapshot_id
+    with pytest.raises(ValidationError):
+        snapshot.prompt_hashes = {"router_v1": "c" * 64}
+    with pytest.raises(TypeError):
+        snapshot.prompt_hashes[0] = ("router_v1", "c" * 64)
+
+
 def test_user_scope_rejects_blank_user():
     """Whitespace-only users cannot cross the scope boundary."""
     with pytest.raises(ValidationError):
