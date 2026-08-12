@@ -7,10 +7,12 @@ from typing import Any, cast
 import pytest
 
 from agentic_rag.retrieval.adapters.elasticsearch import (
+    ACTIVE_CHILD_INDEX_ALIAS,
     ElasticsearchBm25Index,
     ElasticsearchVectorIndex,
     IndexGenerationMismatchError,
     QueryVectorDimensionError,
+    UnsupportedDateRangeError,
 )
 from agentic_rag.retrieval.models import DateRange, SearchFilter
 
@@ -62,7 +64,6 @@ async def test_dense_and_bm25_serialize_the_same_server_owned_filters() -> None:
         search_type="document",
         document_ids=("document-1", "document-2"),
         content_types=("paragraph",),
-        date_range=DateRange(start="2026-01-01", end="2026-01-31"),
     )
     dense = ElasticsearchVectorIndex(
         cast(Any, client), index="children-active", index_generation="index-v2"
@@ -84,17 +85,52 @@ async def test_dense_and_bm25_serialize_the_same_server_owned_filters() -> None:
         {"term": {"search_type": "document"}},
         {"terms": {"document_id": ["document-1", "document-2"]}},
         {"terms": {"content_type": ["paragraph"]}},
-        {
-            "range": {
-                "document_date": {"gte": "2026-01-01", "lte": "2026-01-31"}
-            }
-        },
     ]
     assert client.calls[0]["source_includes"] == client.calls[1]["source_includes"]
     assert dense_hits[0].lane == "dense"
     assert lexical_hits[0].lane == "bm25"
     assert dense_hits[0].lane_rank == lexical_hits[0].lane_rank == 1
     assert dense_hits[0].ast_locator == '{"segment_ordinal":0}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter", [ElasticsearchVectorIndex, ElasticsearchBm25Index])
+async def test_rejects_date_range_before_sending_an_es_request(
+    adapter: type[ElasticsearchVectorIndex | ElasticsearchBm25Index],
+) -> None:
+    client = _Client()
+    index = adapter(cast(Any, client), index_generation="index-v2")
+
+    with pytest.raises(UnsupportedDateRangeError, match="date_range"):
+        if isinstance(index, ElasticsearchVectorIndex):
+            await index.search(
+                [0.1] * 1024,
+                _filter(date_range=DateRange(start="2026-01-01")),
+                3,
+            )
+        else:
+            await index.search(
+                "termination clause",
+                _filter(date_range=DateRange(start="2026-01-01")),
+                3,
+            )
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dense_and_bm25_default_to_the_active_child_alias() -> None:
+    client = _Client()
+    dense = ElasticsearchVectorIndex(cast(Any, client), index_generation="index-v2")
+    lexical = ElasticsearchBm25Index(cast(Any, client), index_generation="index-v2")
+
+    await dense.search([0.1] * 1024, _filter(), 3)
+    await lexical.search("termination clause", _filter(), 3)
+
+    assert [call["index"] for call in client.calls] == [
+        ACTIVE_CHILD_INDEX_ALIAS,
+        ACTIVE_CHILD_INDEX_ALIAS,
+    ]
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,6 @@ from elasticsearch import AsyncElasticsearch
 
 from agentic_rag.ingestion.indexer import EMBEDDING_DIMENSIONS
 from agentic_rag.models.indexing import validate_index_generation
-from agentic_rag.persistence.elasticsearch import ElasticsearchChildIndexStore
 from agentic_rag.retrieval.models import ChildHit, SearchFilter
 
 
@@ -25,6 +24,13 @@ class QueryVectorDimensionError(ValueError):
 
 class IndexGenerationMismatchError(ValueError):
     """Raised before ES I/O when a request targets another index generation."""
+
+
+class UnsupportedDateRangeError(ValueError):
+    """Raised until Child index mappings store a queryable document date."""
+
+
+ACTIVE_CHILD_INDEX_ALIAS = "agenticrag-children-active"
 
 
 _HIT_SOURCE_FIELDS = (
@@ -39,12 +45,7 @@ _HIT_SOURCE_FIELDS = (
 
 
 def serialize_filter(filter: SearchFilter) -> list[dict[str, Any]]:
-    """Serialize all server-owned and agent-safe selectors for an ES query.
-
-    ``document_date`` is reserved metadata for date-scoped document sources.
-    Existing generations without that selector continue to work because the
-    clause is emitted only when a date range was explicitly requested.
-    """
+    """Serialize all supported server-owned and agent-safe selectors for ES."""
     clauses: list[dict[str, Any]] = [
         {"term": {"user_id": filter.user_id}},
         {"term": {"is_active": True}},
@@ -56,13 +57,6 @@ def serialize_filter(filter: SearchFilter) -> list[dict[str, Any]]:
         clauses.append({"terms": {"document_id": list(filter.document_ids)}})
     if filter.content_types:
         clauses.append({"terms": {"content_type": list(filter.content_types)}})
-    if filter.date_range is not None:
-        bounds: dict[str, str] = {}
-        if filter.date_range.start is not None:
-            bounds["gte"] = filter.date_range.start.isoformat()
-        if filter.date_range.end is not None:
-            bounds["lte"] = filter.date_range.end.isoformat()
-        clauses.append({"range": {"document_date": bounds}})
     return clauses
 
 
@@ -78,9 +72,7 @@ class _ElasticsearchChildSearch:
     ) -> None:
         self._client = client
         self._index_generation = validate_index_generation(index_generation)
-        # ``index`` is normally the stable active alias.  The physical Phase 2
-        # generation name remains the safe default until alias management lands.
-        self._index = index or ElasticsearchChildIndexStore.index_name(index_generation)
+        self._index = index or ACTIVE_CHILD_INDEX_ALIAS
 
     def _validate_filter(self, filter: SearchFilter) -> list[dict[str, Any]]:
         if filter.index_generation != self._index_generation:
@@ -88,6 +80,11 @@ class _ElasticsearchChildSearch:
                 "SearchFilter index generation "
                 f"{filter.index_generation!r} does not match adapter generation "
                 f"{self._index_generation!r}"
+            )
+        if filter.date_range is not None:
+            raise UnsupportedDateRangeError(
+                "date_range is unsupported until Child index mappings include "
+                "a populated document-date field"
             )
         return serialize_filter(filter)
 
