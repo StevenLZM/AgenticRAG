@@ -40,6 +40,8 @@ class ParentFetchFixture:
     owner_parent_id: str
     other_user_parent_id: str
     inactive_parent_id: str
+    inactive_version_parent_id: str
+    repository: SqlAlchemyParentRepository
 
 
 @pytest.fixture(scope="module")
@@ -85,6 +87,7 @@ async def parent_fetcher(
     owner_parent_id = f"owner-parent-{suffix}"
     other_user_parent_id = f"other-user-parent-{suffix}"
     inactive_parent_id = f"inactive-parent-{suffix}"
+    inactive_version_parent_id = f"inactive-version-parent-{suffix}"
     try:
         async with factory.begin() as session:
             owner_document_id = str(uuid4())
@@ -112,6 +115,24 @@ async def parent_fetcher(
                 status="inactive",
                 ordinal=1,
             )
+            inactive_version_document_id = str(uuid4())
+            inactive_version_id = str(uuid4())
+            await _insert_document(
+                session,
+                document_id=inactive_version_document_id,
+                version_id=inactive_version_id,
+                user_id="u1",
+                version_status=DocumentVersionStatus.INACTIVE,
+            )
+            await _insert_parent(
+                session,
+                parent_id=inactive_version_parent_id,
+                document_id=inactive_version_document_id,
+                version_id=inactive_version_id,
+                user_id="u1",
+                status="active",
+                ordinal=0,
+            )
 
             other_document_id = str(uuid4())
             other_version_id = str(uuid4())
@@ -131,11 +152,14 @@ async def parent_fetcher(
             )
 
         async with factory() as session:
+            repository = SqlAlchemyParentRepository(session)
             yield ParentFetchFixture(
-                fetcher=ParentFetcher(SqlAlchemyParentRepository(session)),
+                fetcher=ParentFetcher(repository),
                 owner_parent_id=owner_parent_id,
                 other_user_parent_id=other_user_parent_id,
                 inactive_parent_id=inactive_parent_id,
+                inactive_version_parent_id=inactive_version_parent_id,
+                repository=repository,
             )
     finally:
         await engine.dispose()
@@ -172,8 +196,23 @@ async def test_parent_fetch_fails_closed_for_inactive_parent(
         )
 
 
+async def test_parent_repository_excludes_parent_for_inactive_active_version(
+    parent_fetcher: ParentFetchFixture,
+) -> None:
+    rows = await parent_fetcher.repository.get_many(
+        [parent_fetcher.inactive_version_parent_id], UserScope(user_id="u1")
+    )
+
+    assert rows == []
+
+
 async def _insert_document(
-    session: AsyncSession, *, document_id: str, version_id: str, user_id: str
+    session: AsyncSession,
+    *,
+    document_id: str,
+    version_id: str,
+    user_id: str,
+    version_status: DocumentVersionStatus = DocumentVersionStatus.ACTIVE,
 ) -> None:
     await session.execute(
         insert(documents).values(
@@ -198,7 +237,7 @@ async def _insert_document(
             child_count=2,
             embedding_version="text-embedding-v3",
             index_generation="parent-fetch-test",
-            status=DocumentVersionStatus.ACTIVE.value,
+            status=version_status.value,
         )
     )
     await session.execute(

@@ -1112,6 +1112,10 @@ class SqlAlchemyParentRepository(_SqlAlchemyRepository):
                         parent_chunks.join(
                             documents,
                             parent_chunks.c.document_id == documents.c.id,
+                        ).join(
+                            document_versions,
+                            parent_chunks.c.document_version_id
+                            == document_versions.c.id,
                         )
                     )
                     .where(
@@ -1122,6 +1126,7 @@ class SqlAlchemyParentRepository(_SqlAlchemyRepository):
                         documents.c.status == DocumentStatus.ACTIVE.value,
                         documents.c.active_version_id
                         == parent_chunks.c.document_version_id,
+                        document_versions.c.status == DocumentVersionStatus.ACTIVE.value,
                     )
                 )
             )

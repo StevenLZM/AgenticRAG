@@ -35,6 +35,7 @@ def aggregate_parents(
             selections[hit.parent_id] = selection
         elif hit.score > selection.best_hit.score:
             selection.best_hit = hit
+            selection.best_position = position
 
         if len(selection.child_hits) < max_children_per_parent:
             selection.child_hits.append(hit)
@@ -43,7 +44,7 @@ def aggregate_parents(
         selections.values(),
         key=lambda selection: (
             -selection.best_hit.score,
-            selection.first_position,
+            selection.best_position,
             selection.best_hit.parent_id,
         ),
     )
@@ -55,7 +56,7 @@ class _ParentSelection:
 
     def __init__(self, *, best_hit: ChildHit, first_position: int) -> None:
         self.best_hit = best_hit
-        self.first_position = first_position
+        self.best_position = first_position
         self.child_hits: list[ChildHit] = []
 
     def to_evidence(self) -> ParentEvidence:
@@ -83,11 +84,50 @@ class ParentFetcher:
         if not requested_ids:
             return []
 
-        rows = await self._parents.get_many(requested_ids, scope)
-        expected_ids = set(requested_ids)
+        by_id = await self._fetch_by_id(requested_ids, scope)
+
+        return [_to_parent_evidence(by_id[parent_id]) for parent_id in requested_ids]
+
+    async def hydrate(
+        self, selected: Sequence[ParentEvidence], scope: UserScope
+    ) -> list[ParentEvidence]:
+        """Fill selected parent content while retaining selection provenance."""
+        if not selected:
+            return []
+
+        by_id = await self._fetch_by_id(
+            [evidence.parent_id for evidence in selected], scope
+        )
+        hydrated: list[ParentEvidence] = []
+        for evidence in selected:
+            parent = by_id[evidence.parent_id]
+            if (
+                parent.document_id != evidence.document_id
+                or parent.document_version_id != evidence.document_version_id
+            ):
+                raise ParentScopeViolation(
+                    "fetched parent provenance does not match the selected evidence"
+                )
+            hydrated.append(
+                ParentEvidence(
+                    parent_id=evidence.parent_id,
+                    document_id=evidence.document_id,
+                    document_version_id=evidence.document_version_id,
+                    content=parent.content,
+                    child_hits=evidence.child_hits,
+                    rerank_score=evidence.rerank_score,
+                )
+            )
+        return hydrated
+
+    async def _fetch_by_id(
+        self, parent_ids: Sequence[str], scope: UserScope
+    ) -> dict[str, ParentChunk]:
+        unique_ids = list(dict.fromkeys(parent_ids))
+        rows = await self._parents.get_many(unique_ids, scope)
         by_id = {row.id: row for row in rows}
         if (
-            set(by_id) != expected_ids
+            set(by_id) != set(unique_ids)
             or len(by_id) != len(rows)
             or any(
                 row.user_id != scope.user_id or row.status != "active" for row in rows
@@ -96,8 +136,7 @@ class ParentFetcher:
             raise ParentScopeViolation(
                 "one or more parents are missing, inactive, or outside scope"
             )
-
-        return [_to_parent_evidence(by_id[parent_id]) for parent_id in requested_ids]
+        return by_id
 
 
 def _to_parent_evidence(parent: ParentChunk) -> ParentEvidence:
