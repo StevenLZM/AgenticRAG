@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, RootModel, TypeAdapter, Valid
 from agentic_rag.query.context import ContextBuilder
 from agentic_rag.query.evidence_builder import EvidenceBuilder
 from agentic_rag.query.state import QueryState, scope_from_state, snapshot_from_state
+from agentic_rag.query.subagents import EvidenceReducer, SubagentDispatcher
 from agentic_rag.query.todos import InvalidTodoTransition, TodoItem, TodoReducer, TodoUpdate
 from agentic_rag.query.tools import ResearchContext, ResearchToolset, RetrievalPort
 from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway, StructuredOutputValidationError, load_prompt
@@ -82,6 +83,7 @@ class ResearchLoopDependencies:
     retrieval: RetrievalPort
     evidence_builder: EvidenceBuilder
     context_builder: ContextBuilder | None = None
+    subagents: SubagentDispatcher | None = None
 
 
 class ResearchAgentLoop:
@@ -91,6 +93,7 @@ class ResearchAgentLoop:
         self._gateway = dependencies.gateway
         self._context = dependencies.context_builder or ContextBuilder()
         self._tools = ResearchToolset(dependencies.retrieval, dependencies.evidence_builder)
+        self._subagents = dependencies.subagents
 
     async def ainvoke(self, state: QueryState) -> dict[str, object]:
         snapshot = snapshot_from_state(state)
@@ -211,8 +214,45 @@ class ResearchAgentLoop:
                 return _Step(todos, [*observations, {"kind": "submit", "ok": False, "error": "unknown evidence id"}], evidence)
             return _Step(todos, [*observations, {"kind": "submit", "ok": True}], evidence, submitted=True)
         if isinstance(action, DelegateResearch):
-            # Task 5 owns execution.  Record a safe observation rather than impersonating a subagent.
-            return _Step(todos, [*observations, {"kind": "delegate", "ok": False, "error": "subagents unavailable"}], evidence)
+            if self._subagents is None:
+                return _Step(todos, [*observations, {"kind": "delegate", "ok": False, "error": "subagents unavailable"}], evidence)
+            by_id = {todo.id: todo for todo in todos}
+            if not set(action.todo_ids).issubset(by_id):
+                return _Step(todos, [*observations, {"kind": "delegate", "ok": False, "error": "todo does not exist"}], evidence)
+            selected = tuple(by_id[todo_id] for todo_id in action.todo_ids)
+            completed = frozenset(todo.id for todo in todos if todo.status == "completed")
+            try:
+                delegated = await self._subagents.delegate(
+                    selected,
+                    context,
+                    max_parallel=snapshot_from_state(state).max_parallel_subagents_per_run,
+                    resolved_todo_ids=completed,
+                )
+            except asyncio.CancelledError:
+                raise
+            except (OSError, TimeoutError, ConnectionError, ValueError) as error:
+                return _Step(todos, [*observations, {"kind": "delegate", "ok": False, "error": str(error)}], evidence)
+            packed = EvidenceReducer.merge(delegated.results)
+            merged = _merge_evidence(evidence, [item.model_dump(mode="json") for item in packed.items])
+            completed_ids = {result.todo_id: result for result in delegated.results}
+            blocked_ids = set(delegated.blocked_todo_ids)
+            updated = tuple(
+                todo.model_copy(update={
+                    "status": "completed",
+                    "evidence_ids": tuple(item.evidence_id for item in completed_ids[todo.id].evidence.items),
+                }) if todo.id in completed_ids else (
+                    todo.model_copy(update={"status": "blocked"}) if todo.id in blocked_ids else todo
+                )
+                for todo in todos
+            )
+            return _Step(
+                updated,
+                [*observations, {
+                    "kind": "delegate", "ok": True,
+                    "completed_todo_ids": sorted(completed_ids), "blocked_todo_ids": sorted(blocked_ids),
+                }],
+                merged,
+            )
         assert isinstance(action, CannotAnswer)
         reason = "research_action_invalid" if action.reason.startswith("research_action_invalid:") else "cannot_answer"
         return _Step(
