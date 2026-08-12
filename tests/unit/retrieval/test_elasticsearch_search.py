@@ -1,0 +1,127 @@
+"""Unit coverage for Elasticsearch hybrid recall request boundaries."""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+import pytest
+
+from agentic_rag.retrieval.adapters.elasticsearch import (
+    ElasticsearchBm25Index,
+    ElasticsearchVectorIndex,
+    IndexGenerationMismatchError,
+    QueryVectorDimensionError,
+)
+from agentic_rag.retrieval.models import DateRange, SearchFilter
+
+
+class _Response:
+    def __init__(self, body: dict[str, Any]) -> None:
+        self.body = body
+
+
+class _Client:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def search(self, **kwargs: Any) -> _Response:
+        self.calls.append(kwargs)
+        return _Response(
+            {
+                "hits": {
+                    "hits": [
+                        {
+                            "_id": "fallback-id",
+                            "_score": 2.5,
+                            "_source": {
+                                "id": "child-1",
+                                "parent_id": "parent-1",
+                                "user_id": "u1",
+                                "document_id": "document-1",
+                                "document_version_id": "version-1",
+                                "content": "termination clause",
+                                "ast_locator": {"segment_ordinal": 0},
+                            },
+                        }
+                    ]
+                }
+            }
+        )
+
+
+def _filter(**overrides: Any) -> SearchFilter:
+    values = {"user_id": "u1", "index_generation": "index-v2"}
+    values.update(overrides)
+    return SearchFilter(**values)
+
+
+@pytest.mark.asyncio
+async def test_dense_and_bm25_serialize_the_same_server_owned_filters() -> None:
+    client = _Client()
+    filter = _filter(
+        search_type="document",
+        document_ids=("document-1", "document-2"),
+        content_types=("paragraph",),
+        date_range=DateRange(start="2026-01-01", end="2026-01-31"),
+    )
+    dense = ElasticsearchVectorIndex(
+        cast(Any, client), index="children-active", index_generation="index-v2"
+    )
+    lexical = ElasticsearchBm25Index(
+        cast(Any, client), index="children-active", index_generation="index-v2"
+    )
+
+    dense_hits = await dense.search([0.1] * 1024, filter, 3)
+    lexical_hits = await lexical.search("termination clause", filter, 3)
+
+    assert client.calls[0]["knn"]["filter"] == client.calls[1]["query"]["bool"][
+        "filter"
+    ]
+    assert client.calls[0]["knn"]["filter"] == [
+        {"term": {"user_id": "u1"}},
+        {"term": {"is_active": True}},
+        {"term": {"index_generation": "index-v2"}},
+        {"term": {"search_type": "document"}},
+        {"terms": {"document_id": ["document-1", "document-2"]}},
+        {"terms": {"content_type": ["paragraph"]}},
+        {
+            "range": {
+                "document_date": {"gte": "2026-01-01", "lte": "2026-01-31"}
+            }
+        },
+    ]
+    assert client.calls[0]["source_includes"] == client.calls[1]["source_includes"]
+    assert dense_hits[0].lane == "dense"
+    assert lexical_hits[0].lane == "bm25"
+    assert dense_hits[0].lane_rank == lexical_hits[0].lane_rank == 1
+    assert dense_hits[0].ast_locator == '{"segment_ordinal":0}'
+
+
+@pytest.mark.asyncio
+async def test_dense_rejects_a_non_1024_dimension_vector_before_search() -> None:
+    client = _Client()
+    dense = ElasticsearchVectorIndex(
+        cast(Any, client), index="children-active", index_generation="index-v2"
+    )
+
+    with pytest.raises(QueryVectorDimensionError, match="exactly 1024"):
+        await dense.search([0.1] * 1023, _filter(), 3)
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter", [ElasticsearchVectorIndex, ElasticsearchBm25Index])
+async def test_rejects_a_filter_for_another_index_generation_before_search(
+    adapter: type[ElasticsearchVectorIndex | ElasticsearchBm25Index],
+) -> None:
+    client = _Client()
+    index = adapter(cast(Any, client), index="children-active", index_generation="index-v2")
+
+    with pytest.raises(IndexGenerationMismatchError, match="index-v1.*index-v2"):
+        if isinstance(index, ElasticsearchVectorIndex):
+            await index.search([0.1] * 1024, _filter(index_generation="index-v1"), 3)
+        else:
+            await index.search("termination clause", _filter(index_generation="index-v1"), 3)
+
+    assert client.calls == []
