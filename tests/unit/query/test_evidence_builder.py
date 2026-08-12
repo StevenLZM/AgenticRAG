@@ -343,3 +343,57 @@ def test_builder_falls_back_to_fittable_lower_ranked_evidence_for_target_coverag
 
     assert [item.parent_id for item in packed.items] == ["low-rank"]
     assert packed.items[0].covered_target_ids == ("termination",)
+
+
+def test_builder_does_not_spend_capacity_recovering_an_already_retained_target() -> (
+    None
+):
+    from agentic_rag.query.evidence_builder import (
+        EvidenceBuilder,
+        EvidenceCoverageTarget,
+    )
+
+    shared_child = "alpha beta"
+    covers_first_two = parent(
+        "covers-first-two",
+        content=shared_child,
+        child_hit=child("covers-first-two", content=shared_child),
+        score=1.0,
+    )
+    repeats_second = parent(
+        "repeats-second",
+        content="beta only",
+        child_hit=child("repeats-second", content="beta only"),
+        score=0.9,
+    )
+    covers_third = parent(
+        "covers-third",
+        content="gamma only",
+        child_hit=child("covers-third", content="gamma only"),
+        score=0.1,
+    )
+    targets = (
+        EvidenceCoverageTarget(target_id="first", description="alpha"),
+        EvidenceCoverageTarget(target_id="second", description="beta"),
+        EvidenceCoverageTarget(target_id="third", description="gamma"),
+    )
+
+    packed = EvidenceBuilder().build(
+        [batch(covers_first_two, repeats_second, covers_third)],
+        targets,
+        SCOPE,
+        SNAPSHOT,
+        max_tokens=360,
+    )
+
+    assert [item.parent_id for item in packed.items] == [
+        "covers-first-two",
+        "covers-third",
+    ]
+    assert {
+        target_id for item in packed.items for target_id in item.covered_target_ids
+    } == {
+        "first",
+        "second",
+        "third",
+    }

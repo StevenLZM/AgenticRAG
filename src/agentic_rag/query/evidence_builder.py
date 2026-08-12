@@ -109,8 +109,11 @@ class EvidenceBuilder:
         rendered: list[str] = []
         document_counts: Counter[str] = Counter()
         selected_keys: set[tuple[str, str]] = set()
+        covered_target_ids: set[str] = set()
 
         for target in coverage_targets:
+            if target.target_id in covered_target_ids:
+                continue
             for candidate in candidates:
                 key = (candidate.parent.parent_id, candidate.parent.document_version_id)
                 if target.target_id not in candidate.target_ids or key in selected_keys:
@@ -129,6 +132,7 @@ class EvidenceBuilder:
                 rendered.append(rendered_envelope)
                 selected_keys.add(key)
                 document_counts[item.document_id] += 1
+                covered_target_ids.update(item.covered_target_ids)
                 break
 
         for candidate in candidates:
