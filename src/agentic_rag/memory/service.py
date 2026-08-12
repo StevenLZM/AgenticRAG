@@ -160,7 +160,18 @@ class MemoryServiceImpl:
                 await self._mem0.get_all(user_id=scope.user_id), scope
             )
             matching = next((record for record in visible if record.id == memory_id), None)
-            verification_query = matching.text if matching else memory_id
+            if matching is None:
+                remaining = self._records(
+                    await self._mem0.search(
+                        memory_id, user_id=scope.user_id, limit=100
+                    ),
+                    scope,
+                )
+                if memory_id in {record.id for record in remaining}:
+                    raise OSError("target is searchable but not safely deletable")
+                await self._tombstones.mark_completed(scope, memory_id)
+                return
+            verification_query = matching.text
             await self._mem0.delete(memory_id)
             remaining = self._records(await self._mem0.search(
                 verification_query, user_id=scope.user_id, limit=100

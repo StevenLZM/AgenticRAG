@@ -411,6 +411,23 @@ async def test_failed_delete_remains_pending_and_reconcile_retries_it(
     assert tombstones.records[("u1", "m1")].status == "completed"
 
 
+async def test_reconciliation_never_deletes_an_id_missing_from_scoped_listing(
+    memory_service: MemoryServiceImpl, mem0: FakeMem0, tombstones: FakeTombstones
+) -> None:
+    tombstones.records[("u1", "m1")] = Tombstone(
+        user_id="u1", memory_id="m1", status="pending"
+    )
+    mem0.records = [
+        {"id": "m1", "memory": "other tenant", "user_id": "u2", "metadata": {"user_id": "u2"}}
+    ]
+
+    await memory_service.reconcile_deletions()
+
+    assert "delete" not in mem0.events
+    assert mem0.records[0]["user_id"] == "u2"
+    assert tombstones.records[("u1", "m1")].status == "completed"
+
+
 async def test_delete_rejects_a_memory_not_visible_in_the_callers_namespace(
     memory_service: MemoryServiceImpl, mem0: FakeMem0, tombstones: FakeTombstones
 ) -> None:
