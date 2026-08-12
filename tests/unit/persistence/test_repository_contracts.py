@@ -306,6 +306,43 @@ async def test_document_soft_delete_is_scoped_and_clears_active_version() -> Non
 
 
 @pytest.mark.asyncio
+async def test_memory_tombstones_expose_pending_retry_and_completion_transitions() -> None:
+    """A completed provider deletion must be durably distinct from a request."""
+    now = datetime.now(UTC)
+    transaction = RecordingSession(
+        rows=[
+            {
+                "id": "tombstone-1",
+                "user_id": "user-1",
+                "memory_id": "memory-1",
+                "status": "pending",
+                "attempt_count": 2,
+                "requested_at": now,
+            }
+        ]
+    )
+    repository = SqlAlchemyMemoryTombstoneRepository(cast(AsyncSession, transaction))
+    scope = UserScope(user_id="user-1")
+
+    pending = await repository.list_pending()
+    await repository.mark_retry(scope, "memory-1", "provider unavailable")
+    await repository.mark_completed(scope, "memory-1")
+
+    assert [(item.memory_id, item.status, item.attempt_count) for item in pending] == [
+        ("memory-1", "pending", 2)
+    ]
+    assert transaction.statements[0].get_final_froms()[0].name == "memory_tombstones"
+    retry = transaction.statements[1]
+    assert retry.table.name == "memory_tombstones"
+    assert retry.compile().params["status"] == "pending"
+    assert retry.compile().params["last_error_detail_ref"] == "provider unavailable"
+    completed = transaction.statements[2]
+    assert completed.table.name == "memory_tombstones"
+    assert completed.compile().params["status"] == "completed"
+    assert completed.compile().params["completed_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_outbox_claim_and_retry_leave_transaction_commit_to_the_caller() -> None:
     """Dispatcher coordination must not silently commit its caller's transaction."""
     now = datetime.now(UTC)

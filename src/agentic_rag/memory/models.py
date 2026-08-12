@@ -49,6 +49,24 @@ class MemoryRecord(BaseModel):
     policy_version: str | None = None
 
 
+class MemoryCandidate(BaseModel):
+    """A structured, source-attributed memory candidate from the light model."""
+
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    text: str = Field(min_length=1, max_length=2_000)
+    memory_type: MemoryType = Field(alias="type")
+    source_message_ids: tuple[str, ...] = Field(min_length=1)
+
+
+class MemoryExtraction(BaseModel):
+    """Strict schema returned by the light-model memory extraction prompt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    memories: tuple[MemoryCandidate, ...] = ()
+
+
 class MemoryContext(BaseModel):
     """Prompt-safe memory context with an explicit availability signal."""
 
@@ -103,3 +121,12 @@ class MemoryClient(Protocol):
     async def get_all(self, *, user_id: str) -> object: ...
 
     async def delete(self, memory_id: str) -> object: ...
+
+
+@runtime_checkable
+class MemoryExtractor(Protocol):
+    """Light-model structured extraction, injected to keep graphs dependency-free."""
+
+    async def extract(
+        self, messages: list[PublicMessage]
+    ) -> tuple[MemoryCandidate, ...]: ...

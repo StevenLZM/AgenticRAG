@@ -596,6 +596,14 @@ class OutboxRepository(Protocol):
 class MemoryTombstoneRepository(Protocol):
     async def request(self, scope: UserScope, memory_id: str) -> MemoryTombstone: ...
 
+    async def list_pending(self, limit: int = 100) -> list[MemoryTombstone]: ...
+
+    async def mark_completed(self, scope: UserScope, memory_id: str) -> None: ...
+
+    async def mark_retry(
+        self, scope: UserScope, memory_id: str, error: str
+    ) -> None: ...
+
     async def is_deleted(self, scope: UserScope, memory_id: str) -> bool: ...
 
 
@@ -1352,12 +1360,64 @@ class SqlAlchemyMemoryTombstoneRepository(_SqlAlchemyRepository):
         )
         return tombstone
 
+    async def list_pending(self, limit: int = 100) -> list[MemoryTombstone]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        rows = (
+            await self._session().execute(
+                select(memory_tombstones)
+                .where(memory_tombstones.c.status == "pending")
+                .order_by(memory_tombstones.c.requested_at, memory_tombstones.c.id)
+                .limit(limit)
+            )
+        ).mappings().all()
+        return [
+            MemoryTombstone(
+                id=row["id"],
+                user_id=row["user_id"],
+                memory_id=row["memory_id"],
+                status=row["status"],
+                attempt_count=row["attempt_count"],
+            )
+            for row in rows
+        ]
+
+    async def mark_completed(self, scope: UserScope, memory_id: str) -> None:
+        await self._session().execute(
+            update(memory_tombstones)
+            .where(
+                memory_tombstones.c.user_id == scope.user_id,
+                memory_tombstones.c.memory_id == memory_id,
+            )
+            .values(
+                status="completed",
+                completed_at=_now(),
+                last_error_detail_ref=None,
+            )
+        )
+
+    async def mark_retry(self, scope: UserScope, memory_id: str, error: str) -> None:
+        await self._session().execute(
+            update(memory_tombstones)
+            .where(
+                memory_tombstones.c.user_id == scope.user_id,
+                memory_tombstones.c.memory_id == memory_id,
+            )
+            .values(
+                status="pending",
+                attempt_count=memory_tombstones.c.attempt_count + 1,
+                completed_at=None,
+                last_error_detail_ref=error,
+            )
+        )
+
     async def is_deleted(self, scope: UserScope, memory_id: str) -> bool:
         row = (
             await self._session().execute(
                 select(memory_tombstones.c.id).where(
                     memory_tombstones.c.user_id == scope.user_id,
                     memory_tombstones.c.memory_id == memory_id,
+                    memory_tombstones.c.status == "completed",
                 )
             )
         ).one_or_none()
