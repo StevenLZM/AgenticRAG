@@ -10,6 +10,7 @@ from typing import Protocol, cast
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.errors import NodeCancelledError
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.models.embeddings import EmbeddingPort
@@ -88,9 +89,15 @@ class RetrievalService:
         snapshot: RuntimeConfigSnapshot,
     ) -> EvidenceBatch:
         """Run the immutable retrieval path and return safely scoped evidence."""
-        result = await self._graph.ainvoke(
-            {"request": request, "scope": scope, "snapshot": snapshot}
-        )
+        try:
+            result = await self._graph.ainvoke(
+                {"request": request, "scope": scope, "snapshot": snapshot}
+            )
+        except NodeCancelledError as error:
+            # LangGraph turns a node's deliberate CancelledError into its own
+            # node failure. The service boundary restores cancellation so
+            # callers can stop work rather than mistake it for degradation.
+            raise asyncio.CancelledError() from error
         return cast(EvidenceBatch, result["evidence_batch"])
 
 
@@ -139,14 +146,16 @@ def build_retrieval_graph(
             return_exceptions=True,
         )
         results = {"dense": dense_result, "bm25": bm25_result}
+        _raise_cancellation_or_control_flow(results)
         _raise_input_errors(results)
 
         failures: dict[str, LaneFailure] = {}
         hits: dict[str, list[ChildHit]] = {}
         for component, result in results.items():
-            if isinstance(result, BaseException):
+            if isinstance(result, Exception):
                 failures[component] = _lane_failure(component, result)
             else:
+                assert isinstance(result, list)
                 hits[component] = result
 
         if len(failures) == len(results):
@@ -256,6 +265,15 @@ def _raise_input_errors(results: Mapping[str, object]) -> None:
     """Never recast invalid selectors or configuration as a degraded lane."""
     for result in results.values():
         if isinstance(result, ValueError):
+            raise result
+
+
+def _raise_cancellation_or_control_flow(results: Mapping[str, object]) -> None:
+    """Propagate cancellation and interpreter control flow out of the graph."""
+    for result in results.values():
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, BaseException) and not isinstance(result, Exception):
             raise result
 
 

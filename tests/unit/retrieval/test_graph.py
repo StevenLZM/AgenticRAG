@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 
 import pytest
@@ -161,6 +162,15 @@ async def test_graph_fails_closed_when_both_lanes_fail(
         await build_retrieval_graph(deps).ainvoke(state())
 
     assert set(raised.value.failures) == {"dense", "bm25"}
+
+
+async def test_graph_propagates_lane_cancellation_without_degrading(
+    deps: RetrievalDependencies,
+) -> None:
+    deps.vector.error = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await RetrievalService(deps).retrieve(REQUEST, SCOPE, SNAPSHOT)
 
 
 async def test_graph_propagates_invalid_selector_error_without_degradation(
