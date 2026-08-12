@@ -70,8 +70,16 @@ def parent(
     )
 
 
-def batch(*parents: ParentEvidence, query: str = "contract question") -> EvidenceBatch:
-    return EvidenceBatch(query=query, parents=parents)
+def batch(
+    *parents: ParentEvidence,
+    query: str = "contract question",
+    document_ids: tuple[str, ...] = (),
+) -> EvidenceBatch:
+    return EvidenceBatch(
+        query=query,
+        parents=parents,
+        document_ids=document_ids,
+    )
 
 
 def test_builder_never_exceeds_capacity_and_only_manifests_included_evidence() -> None:
@@ -246,3 +254,58 @@ def test_builder_uses_conservative_unicode_codepoint_capacity_accounting() -> No
 
     assert packed.token_count == len(packed.rendered_context)
     assert packed.token_count <= 180
+
+
+def test_builder_caps_generic_search_to_three_parents_per_document() -> None:
+    from agentic_rag.query.evidence_builder import EvidenceBuilder
+
+    packed = EvidenceBuilder().build(
+        [batch(*(parent(f"parent-{index}") for index in range(4)))],
+        (),
+        SCOPE,
+        SNAPSHOT,
+    )
+
+    assert len(packed.items) == 3
+
+
+def test_builder_preserves_more_than_three_parents_for_direct_single_document() -> None:
+    from agentic_rag.query.evidence_builder import EvidenceBuilder
+
+    packed = EvidenceBuilder().build(
+        [
+            batch(
+                *(parent(f"parent-{index}") for index in range(4)),
+                document_ids=("document-1",),
+            )
+        ],
+        (),
+        SCOPE,
+        SNAPSHOT,
+    )
+
+    assert len(packed.items) == 4
+
+
+def test_builder_does_not_claim_target_coverage_lost_during_parent_crop() -> None:
+    from agentic_rag.query.evidence_builder import (
+        EvidenceBuilder,
+        EvidenceCoverageTarget,
+    )
+
+    matched = "MATCHING CHILD PASSAGE"
+    evidence = parent(
+        "parent-1",
+        content=("termination target " + ("prefix " * 300) + matched),
+        child_hit=child("parent-1", content=matched),
+    )
+
+    packed = EvidenceBuilder().build(
+        [batch(evidence)],
+        (EvidenceCoverageTarget(target_id="termination", description="termination"),),
+        SCOPE,
+        SNAPSHOT,
+    )
+
+    assert "termination" not in packed.items[0].content.casefold()
+    assert packed.items[0].covered_target_ids == ()

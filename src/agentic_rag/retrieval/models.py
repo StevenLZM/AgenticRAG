@@ -78,8 +78,13 @@ class ParentEvidence(BaseModel):
 
 
 class EvidenceBatch(BaseModel):
-    """The evidence supplied by one retrieval execution."""
+    """The evidence supplied by one retrieval execution.
+
+    ``document_ids`` is propagated from the request by the retrieval graph;
+    it is selector metadata, never a tenant, active-version, or index scope.
+    """
 
     query: str
     parents: tuple[ParentEvidence, ...]
     degraded_components: tuple[str, ...] = ()
+    document_ids: tuple[str, ...] = ()

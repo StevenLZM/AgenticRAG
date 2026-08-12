@@ -63,7 +63,9 @@ class FakeVector:
         self.error: BaseException | None = None
         self.calls: list[tuple[list[float], object, int]] = []
 
-    async def search(self, vector: Sequence[float], filter: object, top_k: int) -> list[ChildHit]:
+    async def search(
+        self, vector: Sequence[float], filter: object, top_k: int
+    ) -> list[ChildHit]:
         self.calls.append((list(vector), filter, top_k))
         if self.error is not None:
             raise self.error
@@ -107,7 +109,10 @@ class FakeParentFetcher:
         self, selected: Sequence[ParentEvidence], scope: UserScope
     ) -> list[ParentEvidence]:
         self.calls.append((list(selected), scope))
-        return [evidence.model_copy(update={"content": f"parent {evidence.parent_id}"}) for evidence in selected]
+        return [
+            evidence.model_copy(update={"content": f"parent {evidence.parent_id}"})
+            for evidence in selected
+        ]
 
 
 @pytest.fixture
@@ -131,12 +136,25 @@ async def test_service_runs_fixed_pipeline_and_retains_parent_provenance(
     result = await RetrievalService(deps).retrieve(REQUEST, SCOPE, SNAPSHOT)
 
     assert result.query == REQUEST.query
-    assert [parent.parent_id for parent in result.parents] == ["parent-bm25", "parent-dense"]
+    assert [parent.parent_id for parent in result.parents] == [
+        "parent-bm25",
+        "parent-dense",
+    ]
     assert all(parent.content.startswith("parent ") for parent in result.parents)
     assert all(parent.child_hits for parent in result.parents)
     assert result.degraded_components == ()
     assert deps.vector.calls[0][2] == 40
     assert deps.lexical.calls[0][2] == 40
+
+
+async def test_service_propagates_direct_document_selector_to_evidence_batch(
+    deps: RetrievalDependencies,
+) -> None:
+    request = RetrievalRequest(query="termination clause", document_ids=("document-1",))
+
+    result = await RetrievalService(deps).retrieve(request, SCOPE, SNAPSHOT)
+
+    assert result.document_ids == ("document-1",)
 
 
 async def test_graph_degrades_to_bm25_when_dense_fails(

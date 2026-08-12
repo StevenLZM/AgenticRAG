@@ -71,6 +71,7 @@ class _Candidate:
     parent: ParentEvidence
     locator: str
     target_ids: tuple[str, ...]
+    is_direct_single_document: bool
     batch_position: int
     parent_position: int
 
@@ -100,12 +101,20 @@ class EvidenceBuilder:
         )
         candidates = self._candidates(batches, coverage_targets, scope)
         selected = self._coverage_first(candidates, coverage_targets)
+        descriptions_by_id = {
+            target.target_id: target.description.casefold()
+            for target in coverage_targets
+        }
 
         items: list[EvidenceItem] = []
         rendered: list[str] = []
         document_counts: Counter[str] = Counter()
         for candidate in selected:
-            if document_counts[candidate.parent.document_id] >= MAX_ITEMS_PER_DOCUMENT:
+            if (
+                not candidate.is_direct_single_document
+                and document_counts[candidate.parent.document_id]
+                >= MAX_ITEMS_PER_DOCUMENT
+            ):
                 continue
             item = self._item(candidate)
             envelope = DataEnvelope(
@@ -122,7 +131,19 @@ class EvidenceBuilder:
             if included is None:
                 continue
             fitted_content, rendered_envelope = included
-            items.append(item.model_copy(update={"content": fitted_content}))
+            retained_target_ids = tuple(
+                target_id
+                for target_id in item.covered_target_ids
+                if descriptions_by_id[target_id] in fitted_content.casefold()
+            )
+            items.append(
+                item.model_copy(
+                    update={
+                        "content": fitted_content,
+                        "covered_target_ids": retained_target_ids,
+                    }
+                )
+            )
             rendered.append(rendered_envelope)
             document_counts[item.document_id] += 1
 
@@ -171,6 +192,10 @@ class EvidenceBuilder:
                         parent=parent,
                         locator=locator,
                         target_ids=target_ids,
+                        is_direct_single_document=(
+                            len(batch.document_ids) == 1
+                            and batch.document_ids[0] == parent.document_id
+                        ),
                         batch_position=batch_position,
                         parent_position=parent_position,
                     )
@@ -208,8 +233,11 @@ class EvidenceBuilder:
                 if (
                     target.target_id in candidate.target_ids
                     and key not in selected_keys
-                    and document_counts[candidate.parent.document_id]
-                    < MAX_ITEMS_PER_DOCUMENT
+                    and (
+                        candidate.is_direct_single_document
+                        or document_counts[candidate.parent.document_id]
+                        < MAX_ITEMS_PER_DOCUMENT
+                    )
                 ):
                     selected.append(candidate)
                     selected_keys.add(key)

@@ -78,7 +78,9 @@ class RetrievalService:
         self._graph = build_retrieval_graph(dependencies)
 
     @property
-    def graph(self) -> CompiledStateGraph[RetrievalState, None, RetrievalState, RetrievalState]:
+    def graph(
+        self,
+    ) -> CompiledStateGraph[RetrievalState, None, RetrievalState, RetrievalState]:
         """Expose the compiled graph for runtime observability and tests."""
         return self._graph
 
@@ -161,7 +163,9 @@ def build_retrieval_graph(
         if len(failures) == len(results):
             raise RetrievalUnavailable(failures)
 
-        degraded = tuple(component for component in ("dense", "bm25") if component in failures)
+        degraded = tuple(
+            component for component in ("dense", "bm25") if component in failures
+        )
         timings = dict(state["timings_ms"])
         timings["recall"] = _elapsed_ms(started)
         return {
@@ -181,7 +185,9 @@ def build_retrieval_graph(
         fused = rrf_fuse(
             [state.get("dense_hits", []), state.get("bm25_hits", [])], limit=30
         )
-        return _stage_update(state, "rrf_fusion", started, fused_hits=fused, rrf=len(fused))
+        return _stage_update(
+            state, "rrf_fusion", started, fused_hits=fused, rrf=len(fused)
+        )
 
     async def cross_encoder(state: RetrievalState) -> dict[str, object]:
         started = perf_counter()
@@ -232,6 +238,7 @@ def build_retrieval_graph(
             query=state["request"].query,
             parents=tuple(state["hydrated_parents"]),
             degraded_components=state["degraded_components"],
+            document_ids=state["request"].document_ids,
         )
         return _stage_update(state, "evidence_batch", started, evidence_batch=batch)
 
