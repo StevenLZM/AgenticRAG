@@ -159,7 +159,7 @@ def test_builder_deduplicates_parent_version_and_crops_around_matching_child() -
     duplicate = long_parent.model_copy(update={"rerank_score": 0.1})
 
     packed = EvidenceBuilder().build(
-        [batch(long_parent, duplicate)], (), SCOPE, SNAPSHOT, max_tokens=140
+        [batch(long_parent, duplicate)], (), SCOPE, SNAPSHOT, max_tokens=180
     )
 
     assert len(packed.items) == 1
@@ -231,3 +231,18 @@ def test_builder_rejects_parent_when_any_child_fails_scope_provenance() -> None:
     packed = EvidenceBuilder().build([batch(mixed)], (), SCOPE, SNAPSHOT)
 
     assert packed.items == ()
+
+
+def test_builder_uses_conservative_unicode_codepoint_capacity_accounting() -> None:
+    from agentic_rag.query.evidence_builder import EvidenceBuilder
+
+    packed = EvidenceBuilder().build(
+        [batch(parent("parent-1", content="中文证据" * 100))],
+        (),
+        SCOPE,
+        SNAPSHOT,
+        max_tokens=180,
+    )
+
+    assert packed.token_count == len(packed.rendered_context)
+    assert packed.token_count <= 180

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -79,9 +78,9 @@ class _Candidate:
 class EvidenceBuilder:
     """Pack only internally consistent, tenant-scoped parent evidence.
 
-    Token accounting is intentionally local and deterministic: four Unicode
-    code points are counted as one token (rounded up).  This is conservative
-    enough for the configured packing limit without downloading a tokenizer;
+    Token accounting is intentionally local and deterministic: each Unicode
+    code point counts as one token. This deliberately conservative upper-bound
+    avoids undercounting mixed-script evidence without downloading a tokenizer;
     downstream model gateways can apply any model-specific limit separately.
     """
 
@@ -114,7 +113,12 @@ class EvidenceBuilder:
                 evidence_id=item.evidence_id,
                 content=item.content,
             )
-            included = self._fit(envelope, rendered, capacity)
+            included = self._fit(
+                envelope,
+                rendered,
+                capacity,
+                candidate.parent.child_hits[0].content,
+            )
             if included is None:
                 continue
             fitted_content, rendered_envelope = included
@@ -244,7 +248,10 @@ class EvidenceBuilder:
 
     @staticmethod
     def _fit(
-        envelope: DataEnvelope, rendered: Sequence[str], capacity: int
+        envelope: DataEnvelope,
+        rendered: Sequence[str],
+        capacity: int,
+        matching_child_content: str,
     ) -> tuple[str, str] | None:
         separator = "\n" if rendered else ""
         existing = "\n".join(rendered)
@@ -256,7 +263,9 @@ class EvidenceBuilder:
         best: tuple[str, str] | None = None
         while low <= high:
             length = (low + high) // 2
-            cropped = _crop_around_child(envelope.content, "", length)
+            cropped = _crop_around_child(
+                envelope.content, matching_child_content, length
+            )
             candidate = envelope.model_copy(update={"content": cropped}).render()
             if _estimate_tokens(f"{existing}{separator}{candidate}") <= capacity:
                 best = (cropped, candidate)
@@ -299,5 +308,5 @@ def _crop_around_child(content: str, child_content: str, limit: int = 1_200) -> 
 
 
 def _estimate_tokens(text: str) -> int:
-    """Return the documented local four-Unicode-codepoint token estimate."""
-    return math.ceil(len(text) / 4)
+    """Return the documented conservative codepoint token upper bound."""
+    return len(text)
