@@ -154,6 +154,83 @@ async def test_loop_marks_unfinished_work_blocked_after_four_rounds() -> None:
     assert len(result["research"]["observations"]) == 4
 
 
+async def test_delegate_with_empty_evidence_blocks_todo_instead_of_completing() -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+    from agentic_rag.query.subagents import DelegationResult, SubagentResult
+
+    empty = type(
+        "EmptyEvidence",
+        (),
+        {
+            "items": (),
+            "manifest": {},
+            "rendered_context": "",
+            "token_count": 0,
+            "index_generation": SNAPSHOT.index_generation,
+        },
+    )()
+
+    class EmptyDispatcher:
+        async def delegate(self, *args: object, **kwargs: object) -> DelegationResult:
+            del args, kwargs
+            return DelegationResult(
+                results=(SubagentResult(todo_id="todo-1", evidence=empty),),
+                blocked_todo_ids=(),
+                child_states=(),
+            )
+
+    state = _state()
+    state["research"] = {
+        "todos": [{
+            "id": "todo-1", "title": "Find notice", "owner": "supervisor",
+            "status": "pending", "dependencies": [], "evidence_ids": [],
+        }],
+        "observations": [],
+    }
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=ScriptedGateway([
+            {"action": "delegate_research", "todo_ids": ["todo-1"]},
+            {"action": "cannot_answer", "reason": "empty evidence"},
+        ]),
+        retrieval=FakeRetrieval(), evidence_builder=EvidenceBuilder(), subagents=EmptyDispatcher(),
+    ))
+
+    result = await loop.ainvoke(state)
+
+    assert result["research"]["todos"][0]["status"] == "blocked"
+    assert result["research"]["todos"][0]["evidence_ids"] == []
+
+
+async def test_delegate_with_all_children_timed_out_keeps_todos_blocked() -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+    from agentic_rag.query.subagents import DelegationResult
+
+    class TimeoutDispatcher:
+        async def delegate(self, *args: object, **kwargs: object) -> DelegationResult:
+            del args, kwargs
+            return DelegationResult(results=(), blocked_todo_ids=("todo-1",), child_states=())
+
+    state = _state()
+    state["research"] = {
+        "todos": [{
+            "id": "todo-1", "title": "Find notice", "owner": "supervisor",
+            "status": "pending", "dependencies": [], "evidence_ids": [],
+        }],
+        "observations": [],
+    }
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=ScriptedGateway([
+            {"action": "delegate_research", "todo_ids": ["todo-1"]},
+            {"action": "cannot_answer", "reason": "timeout"},
+        ]),
+        retrieval=FakeRetrieval(), evidence_builder=EvidenceBuilder(), subagents=TimeoutDispatcher(),
+    ))
+
+    result = await loop.ainvoke(state)
+
+    assert result["research"]["todos"][0]["status"] == "blocked"
+
+
 async def test_loop_propagates_cancellation_from_tool() -> None:
     from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
 

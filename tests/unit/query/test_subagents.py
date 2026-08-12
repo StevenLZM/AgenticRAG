@@ -23,7 +23,9 @@ SNAPSHOT = RuntimeConfigSnapshot(
 CONTEXT = ResearchContext(scope=UserScope(user_id="u-1"), snapshot=SNAPSHOT)
 
 
-def _packed(evidence_id: str, content: str = "evidence") -> PackedEvidence:
+def _packed(
+    evidence_id: str, content: str = "evidence", *, generation: str = "index"
+) -> PackedEvidence:
     item = EvidenceItem(
         evidence_id=evidence_id, parent_id=f"parent-{evidence_id}", document_id="doc-1",
         document_version_id="v1", content=content, ast_locator="#/1", covered_target_ids=("todo",),
@@ -34,7 +36,7 @@ def _packed(evidence_id: str, content: str = "evidence") -> PackedEvidence:
             evidence_id=evidence_id, parent_id=item.parent_id, document_id=item.document_id,
             document_version_id=item.document_version_id, ast_locator=item.ast_locator,
         )},
-        rendered_context=f"[{evidence_id}] {content}", token_count=len(content), index_generation="index",
+        rendered_context=f"[{evidence_id}] {content}", token_count=len(content), index_generation=generation,
     )
 
 
@@ -112,6 +114,26 @@ def test_reducer_orders_by_todo_then_evidence_id_and_deduplicates() -> None:
     assert [item.evidence_id for item in merged.items] == ["e-1", "e-2"]
     assert merged.items[1].content == "first winner"
     assert list(merged.manifest) == ["e-1", "e-2"]
+
+
+def test_reducer_rejects_mixed_index_generations() -> None:
+    from agentic_rag.query.subagents import EvidenceConsistencyError, EvidenceReducer, SubagentResult
+
+    with pytest.raises(EvidenceConsistencyError, match="index generation"):
+        EvidenceReducer.merge((
+            SubagentResult(todo_id="a", evidence=_packed("e-a", generation="index-1")),
+            SubagentResult(todo_id="b", evidence=_packed("e-b", generation="index-2")),
+        ))
+
+
+def test_reducer_rejects_generation_mismatch_with_expected_snapshot() -> None:
+    from agentic_rag.query.subagents import EvidenceConsistencyError, EvidenceReducer, SubagentResult
+
+    with pytest.raises(EvidenceConsistencyError, match="expected index generation"):
+        EvidenceReducer.merge(
+            (SubagentResult(todo_id="a", evidence=_packed("e-a")),),
+            expected_index_generation="index-other",
+        )
 
 
 async def test_dispatcher_rejects_unresolved_dependencies_without_starting_children() -> None:

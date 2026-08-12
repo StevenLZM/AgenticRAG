@@ -232,10 +232,27 @@ class ResearchAgentLoop:
                 raise
             except (OSError, TimeoutError, ConnectionError, ValueError) as error:
                 return _Step(todos, [*observations, {"kind": "delegate", "ok": False, "error": str(error)}], evidence)
-            packed = EvidenceReducer.merge(delegated.results)
-            merged = _merge_evidence(evidence, [item.model_dump(mode="json") for item in packed.items])
-            completed_ids = {result.todo_id: result for result in delegated.results}
+            if delegated.results:
+                packed = EvidenceReducer.merge(
+                    delegated.results,
+                    expected_index_generation=context.snapshot.index_generation,
+                )
+                merged = _merge_evidence(evidence, [item.model_dump(mode="json") for item in packed.items])
+            else:
+                # A full timeout has no evidence to reduce; keep parent evidence
+                # and let the dispatcher-provided blocked IDs drive Todo state.
+                merged = evidence
+            completed_ids = {
+                result.todo_id: result
+                for result in delegated.results
+                if result.evidence.items
+            }
             blocked_ids = set(delegated.blocked_todo_ids)
+            blocked_ids.update(
+                result.todo_id
+                for result in delegated.results
+                if not result.evidence.items
+            )
             updated = tuple(
                 todo.model_copy(update={
                     "status": "completed",

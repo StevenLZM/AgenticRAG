@@ -28,3 +28,9 @@ git diff --check: passed
 ## Scope
 
 Task 6 audits, Task 7 QueryGraph, and Task 8/9 persistence/API work were not implemented.
+
+## Review fix round
+
+- `EvidenceReducer.merge` now requires a non-empty, single `index_generation` across all child packs and optionally validates the expected generation from the parent runtime snapshot.
+- Research delegation passes the parent snapshot generation and treats empty child evidence as blocked work, never as a completed Todo. A full timeout with no completed results preserves existing parent evidence while retaining blocked IDs.
+- Fix verification: 17 focused query tests, 210 query/runtime/memory/retrieval/persistence tests, Ruff, mypy, and `git diff --check` all passed.

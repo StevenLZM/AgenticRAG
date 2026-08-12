@@ -18,6 +18,10 @@ class UnresolvedDependencyError(ValueError):
     """Raised before dispatch when a requested Todo cannot run independently."""
 
 
+class EvidenceConsistencyError(ValueError):
+    """Raised when child evidence cannot share one immutable index generation."""
+
+
 @dataclass(frozen=True, slots=True)
 class ChildResearchState:
     """A per-invocation, read-only view supplied to exactly one child worker."""
@@ -146,12 +150,21 @@ class EvidenceReducer:
     """Merge server-derived evidence without permitting provenance replacement."""
 
     @staticmethod
-    def merge(results: Sequence[SubagentResult]) -> PackedEvidence:
+    def merge(
+        results: Sequence[SubagentResult],
+        *,
+        expected_index_generation: str | None = None,
+    ) -> PackedEvidence:
         selected: dict[str, tuple[EvidenceItem, EvidenceManifestEntry]] = {}
-        index_generation = ""
+        generations = {result.evidence.index_generation for result in results}
+        if not generations or "" in generations:
+            raise EvidenceConsistencyError("evidence index generation must be non-empty")
+        if len(generations) != 1:
+            raise EvidenceConsistencyError("evidence index generation must be consistent")
+        index_generation = next(iter(generations))
+        if expected_index_generation is not None and index_generation != expected_index_generation:
+            raise EvidenceConsistencyError("evidence does not match expected index generation")
         for result in sorted(results, key=lambda value: value.todo_id):
-            if not index_generation:
-                index_generation = result.evidence.index_generation
             for item in sorted(result.evidence.items, key=lambda value: value.evidence_id):
                 manifest = result.evidence.manifest.get(item.evidence_id)
                 if item.evidence_id in selected or not _matches_manifest(item, manifest):
