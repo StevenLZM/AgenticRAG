@@ -125,6 +125,20 @@ def _initial_state() -> dict[str, object]:
     )
 
 
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+def test_query_state_rejects_non_finite_message_values(non_finite: float) -> None:
+    from agentic_rag.query.state import InvalidQueryState, new_query_state
+
+    with pytest.raises(InvalidQueryState):
+        new_query_state(
+            run_id="run-1",
+            question="What notice is required?",
+            scope=SCOPE,
+            snapshot=SNAPSHOT,
+            messages=[{"role": "user", "score": non_finite}],
+        )
+
+
 async def test_memory_loads_once_before_router_and_fast_path_never_reloads() -> None:
     from agentic_rag.models.schemas import EvidenceGrade
     from agentic_rag.query.fast_rag import FastRagDependencies, run_fast_rag

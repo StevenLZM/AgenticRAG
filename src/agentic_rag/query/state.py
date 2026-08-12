@@ -73,7 +73,9 @@ def new_query_state(
 def json_safe(value: Any) -> JsonValue:
     """Round-trip through JSON to reject non-checkpointable graph values."""
     try:
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        encoded = json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
         decoded = json.loads(encoded)
     except (TypeError, ValueError) as error:
         raise InvalidQueryState("query state must contain JSON-compatible values") from error
