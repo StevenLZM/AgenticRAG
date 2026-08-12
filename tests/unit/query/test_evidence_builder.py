@@ -309,3 +309,37 @@ def test_builder_does_not_claim_target_coverage_lost_during_parent_crop() -> Non
 
     assert "termination" not in packed.items[0].content.casefold()
     assert packed.items[0].covered_target_ids == ()
+
+
+def test_builder_falls_back_to_fittable_lower_ranked_evidence_for_target_coverage() -> (
+    None
+):
+    from agentic_rag.query.evidence_builder import (
+        EvidenceBuilder,
+        EvidenceCoverageTarget,
+    )
+
+    matched = "MATCHING CHILD PASSAGE"
+    high_ranked_lost_target = parent(
+        "high-rank",
+        content=("termination target " + ("prefix " * 300) + matched),
+        child_hit=child("high-rank", content=matched),
+        score=1.0,
+    )
+    lower_ranked_retained_target = parent(
+        "low-rank",
+        content=("termination target " + matched + (" suffix" * 300)),
+        child_hit=child("low-rank", content=matched),
+        score=0.1,
+    )
+
+    packed = EvidenceBuilder().build(
+        [batch(high_ranked_lost_target, lower_ranked_retained_target)],
+        (EvidenceCoverageTarget(target_id="termination", description="termination"),),
+        SCOPE,
+        SNAPSHOT,
+        max_tokens=220,
+    )
+
+    assert [item.parent_id for item in packed.items] == ["low-rank"]
+    assert packed.items[0].covered_target_ids == ("termination",)

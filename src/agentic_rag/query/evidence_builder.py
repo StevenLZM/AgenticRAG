@@ -100,7 +100,6 @@ class EvidenceBuilder:
             max_tokens, snapshot.max_evidence_tokens, MAX_PACKED_EVIDENCE_TOKENS
         )
         candidates = self._candidates(batches, coverage_targets, scope)
-        selected = self._coverage_first(candidates, coverage_targets)
         descriptions_by_id = {
             target.target_id: target.description.casefold()
             for target in coverage_targets
@@ -109,41 +108,46 @@ class EvidenceBuilder:
         items: list[EvidenceItem] = []
         rendered: list[str] = []
         document_counts: Counter[str] = Counter()
-        for candidate in selected:
+        selected_keys: set[tuple[str, str]] = set()
+
+        for target in coverage_targets:
+            for candidate in candidates:
+                key = (candidate.parent.parent_id, candidate.parent.document_version_id)
+                if target.target_id not in candidate.target_ids or key in selected_keys:
+                    continue
+                packed = self._pack_candidate(
+                    candidate, rendered, capacity, descriptions_by_id
+                )
+                if (
+                    packed is None
+                    or target.target_id not in packed[0].covered_target_ids
+                    or not _within_document_limit(candidate, document_counts)
+                ):
+                    continue
+                item, rendered_envelope = packed
+                items.append(item)
+                rendered.append(rendered_envelope)
+                selected_keys.add(key)
+                document_counts[item.document_id] += 1
+                break
+
+        for candidate in candidates:
+            key = (candidate.parent.parent_id, candidate.parent.document_version_id)
+            if key in selected_keys:
+                continue
             if (
                 not candidate.is_direct_single_document
                 and document_counts[candidate.parent.document_id]
                 >= MAX_ITEMS_PER_DOCUMENT
             ):
                 continue
-            item = self._item(candidate)
-            envelope = DataEnvelope(
-                source_label=f"document:{item.document_id}",
-                evidence_id=item.evidence_id,
-                content=item.content,
+            packed = self._pack_candidate(
+                candidate, rendered, capacity, descriptions_by_id
             )
-            included = self._fit(
-                envelope,
-                rendered,
-                capacity,
-                candidate.parent.child_hits[0].content,
-            )
-            if included is None:
+            if packed is None:
                 continue
-            fitted_content, rendered_envelope = included
-            retained_target_ids = tuple(
-                target_id
-                for target_id in item.covered_target_ids
-                if descriptions_by_id[target_id] in fitted_content.casefold()
-            )
-            items.append(
-                item.model_copy(
-                    update={
-                        "content": fitted_content,
-                        "covered_target_ids": retained_target_ids,
-                    }
-                )
-            )
+            item, rendered_envelope = packed
+            items.append(item)
             rendered.append(rendered_envelope)
             document_counts[item.document_id] += 1
 
@@ -164,6 +168,43 @@ class EvidenceBuilder:
             rendered_context=rendered_context,
             token_count=_estimate_tokens(rendered_context),
             index_generation=snapshot.index_generation,
+        )
+
+    def _pack_candidate(
+        self,
+        candidate: _Candidate,
+        rendered: Sequence[str],
+        capacity: int,
+        descriptions_by_id: Mapping[str, str],
+    ) -> tuple[EvidenceItem, str] | None:
+        item = self._item(candidate)
+        envelope = DataEnvelope(
+            source_label=f"document:{item.document_id}",
+            evidence_id=item.evidence_id,
+            content=item.content,
+        )
+        included = self._fit(
+            envelope,
+            rendered,
+            capacity,
+            candidate.parent.child_hits[0].content,
+        )
+        if included is None:
+            return None
+        fitted_content, rendered_envelope = included
+        retained_target_ids = tuple(
+            target_id
+            for target_id in item.covered_target_ids
+            if descriptions_by_id[target_id] in fitted_content.casefold()
+        )
+        return (
+            item.model_copy(
+                update={
+                    "content": fitted_content,
+                    "covered_target_ids": retained_target_ids,
+                }
+            ),
+            rendered_envelope,
         )
 
     def _candidates(
@@ -218,36 +259,6 @@ class EvidenceBuilder:
                 seen.add(key)
                 unique.append(candidate)
         return unique
-
-    @staticmethod
-    def _coverage_first(
-        candidates: Sequence[_Candidate],
-        targets: Sequence[EvidenceCoverageTarget],
-    ) -> list[_Candidate]:
-        selected: list[_Candidate] = []
-        selected_keys: set[tuple[str, str]] = set()
-        document_counts: Counter[str] = Counter()
-        for target in targets:
-            for candidate in candidates:
-                key = (candidate.parent.parent_id, candidate.parent.document_version_id)
-                if (
-                    target.target_id in candidate.target_ids
-                    and key not in selected_keys
-                    and (
-                        candidate.is_direct_single_document
-                        or document_counts[candidate.parent.document_id]
-                        < MAX_ITEMS_PER_DOCUMENT
-                    )
-                ):
-                    selected.append(candidate)
-                    selected_keys.add(key)
-                    document_counts[candidate.parent.document_id] += 1
-                    break
-        for candidate in candidates:
-            key = (candidate.parent.parent_id, candidate.parent.document_version_id)
-            if key not in selected_keys:
-                selected.append(candidate)
-        return selected
 
     @staticmethod
     def _item(candidate: _Candidate) -> EvidenceItem:
@@ -314,6 +325,16 @@ def _valid_child_hits(parent: ParentEvidence, scope: UserScope) -> tuple[ChildHi
         and child.document_version_id == parent.document_version_id
     )
     return valid if len(valid) == len(parent.child_hits) else ()
+
+
+def _within_document_limit(
+    candidate: _Candidate, document_counts: Counter[str]
+) -> bool:
+    """Apply diversity only when the request is not a direct document lookup."""
+    return (
+        candidate.is_direct_single_document
+        or document_counts[candidate.parent.document_id] < MAX_ITEMS_PER_DOCUMENT
+    )
 
 
 def _crop_around_child(content: str, child_content: str, limit: int = 1_200) -> str:
