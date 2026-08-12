@@ -12,7 +12,7 @@ from agentic_rag.domain.models import UserScope
 from agentic_rag.query.evidence_builder import EvidenceBuilder
 from agentic_rag.query.state import new_query_state
 from agentic_rag.retrieval.models import ChildHit, EvidenceBatch, ParentEvidence
-from agentic_rag.runtime.model_gateway import ModelResponse
+from agentic_rag.runtime.model_gateway import ModelGateway, ModelResponse
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
@@ -65,6 +65,25 @@ class FakeRetrieval:
         return self.batch
 
 
+@dataclass
+class RepairingResponses:
+    values: list[str]
+    calls: int = 0
+
+    async def create(self, **_: object) -> object:
+        value = self.values[self.calls]
+        self.calls += 1
+        return type("Response", (), {"output_text": value, "model": "main"})()
+
+
+@dataclass
+class RepairingClient:
+    values: list[str]
+
+    def __post_init__(self) -> None:
+        self.responses = RepairingResponses(self.values)
+
+
 def _state() -> dict[str, object]:
     return new_query_state(run_id="run-1", question="What notice applies?", scope=SCOPE, snapshot=SNAPSHOT)
 
@@ -100,6 +119,25 @@ async def test_unknown_model_action_fails_closed_without_arbitrary_tool_executio
 
     assert result["research"]["cannot_answer"] is True
     assert result["termination_reason"] == "research_action_invalid"
+
+
+async def test_gateway_repairs_action_specific_schema_before_loop_executes() -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+
+    client = RepairingClient([
+        '{"action":"retrieve_evidence"}',
+        '{"action":"submit_evidence"}',
+    ])
+    gateway = ModelGateway(client, max_retries=0)
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=gateway, retrieval=FakeRetrieval(), evidence_builder=EvidenceBuilder()
+    ))
+
+    result = await loop.ainvoke(_state())
+
+    assert client.responses.calls == 2
+    assert result["research"]["submitted"] is True
+    assert result["termination_reason"] is None
 
 
 async def test_loop_marks_unfinished_work_blocked_after_four_rounds() -> None:

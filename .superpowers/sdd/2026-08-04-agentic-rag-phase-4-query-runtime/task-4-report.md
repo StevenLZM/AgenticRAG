@@ -21,16 +21,22 @@ The research-loop/context RED run then failed because their modules were absent.
 
 ## Verification
 
+Fix round: the Gateway now receives a strict discriminated RootModel union. A
+missing `query`, `expression`, or other action-specific field therefore fails
+inside `complete_structured` and receives the Gateway's single schema-repair
+attempt; the loop does not perform a second independent repair. Unknown actions
+remain fail-closed.
+
 ```text
 conda run -n agentic-rag python -m pytest --import-mode=importlib \
   tests/unit/query/test_todos.py tests/unit/query/test_calculator.py \
   tests/unit/query/test_research_loop.py -q
-16 passed in 0.17s
+17 passed in 0.17s
 
 conda run -n agentic-rag python -m pytest --import-mode=importlib \
   tests/unit/query tests/unit/runtime tests/unit/memory tests/unit/retrieval \
   tests/unit/persistence -q
-198 passed in 2.63s
+199 passed in 3.33s
 
 ruff check ...
 All checks passed!

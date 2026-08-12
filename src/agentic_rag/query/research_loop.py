@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, RootModel, TypeAdapter, ValidationError
 
 from agentic_rag.query.context import ContextBuilder
 from agentic_rag.query.evidence_builder import EvidenceBuilder
@@ -224,18 +224,8 @@ class ResearchAgentLoop:
         )
 
 
-class _ResearchActionSchema(BaseModel):
-    """Pydantic-compatible shell so ModelGateway owns structured repair/retry."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    action: Literal["update_todos", "retrieve_evidence", "delegate_research", "calculator", "submit_evidence", "cannot_answer"]
-    updates: list[dict[str, object]] | None = None
-    query: str | None = None
-    todo_id: str | None = None
-    todo_ids: list[str] | None = None
-    expression: str | None = None
-    evidence_ids: list[str] | None = None
-    reason: str | None = None
+class _ResearchActionSchema(RootModel[ResearchAction]):
+    """Strict discriminated union passed to ModelGateway for one repair owner."""
 
 
 @dataclass(frozen=True, slots=True)
