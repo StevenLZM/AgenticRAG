@@ -35,8 +35,10 @@ def rrf_fuse(
     best_ranks: dict[str, int] = {}
     hits: dict[str, ChildHit] = {}
     for lane in lanes:
-        for ordinal, hit in enumerate(lane, start=1):
-            rank = hit.lane_rank if hit.lane_rank > 0 else ordinal
+        for hit in lane:
+            rank = hit.lane_rank
+            if rank <= 0:
+                raise ValueError("ChildHit lane_rank must be positive")
             scores[hit.child_id] = scores.get(hit.child_id, 0.0) + reciprocal_rank_score(
                 rank, k
             )

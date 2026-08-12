@@ -48,3 +48,14 @@ def test_rrf_honors_the_result_limit() -> None:
     fused = rrf_fuse([[hit("a"), hit("b", lane_rank=2)]], limit=1)
 
     assert [item.child_id for item in fused] == ["a"]
+
+
+def test_rrf_rejects_a_non_positive_child_lane_rank() -> None:
+    invalid_hit = hit("a", lane_rank=0)
+
+    try:
+        rrf_fuse([[invalid_hit]])
+    except ValueError as error:
+        assert str(error) == "ChildHit lane_rank must be positive"
+    else:
+        raise AssertionError("rrf_fuse accepted an invalid ChildHit lane rank")
