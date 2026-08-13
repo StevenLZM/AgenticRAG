@@ -19,7 +19,16 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.add_column(
         "agent_runs",
-        sa.Column("question", sa.Text(), nullable=False, server_default=""),
+        sa.Column("question", sa.Text(), nullable=True),
+    )
+    op.execute(
+        sa.text("UPDATE agent_runs SET question = '' WHERE question IS NULL")
+    )
+    op.alter_column(
+        "agent_runs",
+        "question",
+        existing_type=sa.Text(),
+        nullable=False,
     )
 
 

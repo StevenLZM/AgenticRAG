@@ -10,6 +10,7 @@ dependencies = [
   "aiosqlite>=0.22.1,<0.23",
   "alembic",
   "asyncmy",
+  "cryptography>=42",
   "docling",
   "elasticsearch[async]",
   "fastapi",
