@@ -16,7 +16,12 @@ from agentic_rag.models.indexing import (
 class Settings(BaseSettings):
     """Validated runtime settings for the application."""
 
-    model_config = SettingsConfigDict(env_prefix="AGENTIC_RAG_", extra="forbid")
+    model_config = SettingsConfigDict(
+        env_prefix="AGENTIC_RAG_",
+        env_file=".env.local",
+        env_file_encoding="utf-8",
+        extra="forbid",
+    )
 
     mysql_dsn: str
     redis_url: str = "redis://127.0.0.1:6379/0"
