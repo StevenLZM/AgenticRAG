@@ -116,7 +116,7 @@ def build_container(settings: Settings) -> AppContainer:
 
         async def list(self, scope: UserScope) -> list[MemoryRecord]:
             del scope
-            return []
+            raise OSError("memory provider is not configured")
 
         async def delete(self, scope: UserScope, memory_id: str) -> None:
             del scope, memory_id

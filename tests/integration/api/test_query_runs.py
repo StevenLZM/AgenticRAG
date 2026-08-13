@@ -261,6 +261,46 @@ async def test_sse_reconnect_uses_event_cursor_and_redacts_payload() -> None:
 
 
 @pytest.mark.integration
+async def test_sse_unknown_event_does_not_forward_raw_summary() -> None:
+    event = AgentEvent(
+        id=1,
+        event_key="unknown-event",
+        trace_id="trace-1",
+        run_id="run-1",
+        user_id=SCOPE.user_id,
+        event_type="INTERNAL_TOOL_PAYLOAD",
+        summary='{"secret_tool_input":"do-not-stream"}',
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        created_at=datetime.now(UTC),
+    )
+    runs = FakeRunManager(runs={"run-1": _run(status=RunStatus.COMPLETED)})
+    app, _, _, _ = _app(runs, FakeEvents(events=[event]))
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/query-runs/run-1/events")
+
+    assert response.status_code == 200
+    assert "do-not-stream" not in response.text
+    assert '"event_type":"PROGRESS"' in response.text
+
+
+@pytest.mark.integration
+async def test_unconfigured_memory_list_fails_closed() -> None:
+    class UnavailableMemory(FakeMemory):
+        async def list(self, scope: UserScope) -> list[MemoryRecord]:
+            del scope
+            raise OSError("provider unavailable")
+
+    app, _, _, _ = _app(memory=UnavailableMemory())
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/memories")
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "MEMORY_UNAVAILABLE"
+
+
+@pytest.mark.integration
 async def test_sync_query_timeout_returns_202_without_second_run() -> None:
     runs = FakeRunManager()
     app, manager, _, _ = _app(runs)

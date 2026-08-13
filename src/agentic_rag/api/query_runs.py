@@ -283,11 +283,14 @@ def _parse_cursor(value: str | None) -> int:
 
 
 def _sse_event(event: AgentEvent) -> str:
-    event_type = event.event_type if event.event_type in _PUBLIC_EVENT_TYPES else "PROGRESS"
+    is_public = event.event_type in _PUBLIC_EVENT_TYPES
+    event_type = event.event_type if is_public else "PROGRESS"
     payload = {
         "run_id": event.run_id,
         "event_type": event_type,
-        "summary": event.summary[:1_000],
+        # Unknown event types may contain internal/tool payload summaries. Do
+        # not forward their source text merely because the event row is scoped.
+        "summary": event.summary[:1_000] if is_public else "progress update",
         "created_at": (event.created_at or datetime.now(UTC)).isoformat(),
     }
     return f"id: {event.id}\nevent: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
