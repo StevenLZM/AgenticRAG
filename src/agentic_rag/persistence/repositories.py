@@ -426,6 +426,8 @@ class ParentChunk:
     ordinal: int
     content: str
     status: str
+    ast_locator: str | None = None
+    index_generation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1115,7 +1117,10 @@ class SqlAlchemyParentRepository(_SqlAlchemyRepository):
         rows = (
             (
                 await self._session().execute(
-                    select(parent_chunks)
+                    select(
+                        parent_chunks,
+                        document_versions.c.index_generation.label("index_generation"),
+                    )
                     .select_from(
                         parent_chunks.join(
                             documents,
@@ -1150,6 +1155,8 @@ class SqlAlchemyParentRepository(_SqlAlchemyRepository):
                 ordinal=row["ordinal"],
                 content=row["content"],
                 status=row["status"],
+                ast_locator=row["ast_locator"],
+                index_generation=row["index_generation"],
             )
             for row in rows
         }

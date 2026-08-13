@@ -11,7 +11,10 @@ Answer segments, Evidence Manifest, packed evidence, and question.
 Return pass/fail and factual-support issues only.
 
 # OUTPUT SCHEMA
-`{"passed":true|false,"issues":["string"]}`
+`{"passed":true|false,"unsupported_claim_ids":["claim-id"],"reasons":["string"]}`
+
+The object has no additional fields. `unsupported_claim_ids` identifies factual
+claims that lack semantic support; `reasons` gives bounded factual-support issues.
 
 # FAIL-CLOSED RULES
 Do not validate citation syntax or coverage, generate replacements, retrieve new evidence, or infer support absent from the Manifest.

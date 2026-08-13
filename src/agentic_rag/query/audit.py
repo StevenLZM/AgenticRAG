@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.models.schemas import EvidenceGrade
+from agentic_rag.persistence.repositories import ParentRepository
 from agentic_rag.query.evidence_builder import EvidenceItem, EvidenceManifestEntry, PackedEvidence
 from agentic_rag.query.generation import AnswerDraft, AnswerGenerationUnavailable, AnswerGenerator
 from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway, load_prompt
@@ -44,6 +45,38 @@ class CitationValidation(BaseModel):
 
 class StructuredGateway(Protocol):
     async def complete_structured(self, call: ModelCall, schema: type[object]) -> object: ...
+
+
+class EvidenceAuthorizationResolver(Protocol):
+    """Repository-backed recheck for every manifest parent before publication."""
+
+    async def resolve(
+        self,
+        manifest: Mapping[str, EvidenceManifestEntry],
+        scope: UserScope,
+        snapshot: RuntimeConfigSnapshot,
+    ) -> Mapping[str, object]: ...
+
+
+class ParentRepositoryAuthorizationResolver:
+    """Adapt the scoped active-parent repository to the audit resolver port."""
+
+    def __init__(self, parents: ParentRepository) -> None:
+        self._parents = parents
+
+    async def resolve(
+        self,
+        manifest: Mapping[str, EvidenceManifestEntry],
+        scope: UserScope,
+        snapshot: RuntimeConfigSnapshot,
+    ) -> Mapping[str, object]:
+        parent_ids = list(dict.fromkeys(entry.parent_id for entry in manifest.values()))
+        rows = await self._parents.get_many(parent_ids, scope)
+        by_id = {row.id: row for row in rows}
+        return {
+            evidence_id: _parent_record(by_id.get(entry.parent_id), scope, snapshot)
+            for evidence_id, entry in manifest.items()
+        }
 
 
 class EvidenceGrader:
@@ -167,6 +200,33 @@ class CitationValidator:
                     reasons.append("evidence_not_authorized")
         return CitationValidation(passed=not reasons, reasons=tuple(dict.fromkeys(reasons)))
 
+    async def validate_async(
+        self,
+        draft: AnswerDraft,
+        packed_evidence: PackedEvidence,
+        scope: UserScope,
+        snapshot: RuntimeConfigSnapshot,
+        authorization: Mapping[str, object],
+        *,
+        authorization_resolver: EvidenceAuthorizationResolver,
+    ) -> CitationValidation:
+        """Recheck manifest provenance through a scoped repository before publication."""
+        try:
+            resolved = await authorization_resolver.resolve(
+                packed_evidence.manifest, scope, snapshot
+            )
+        except asyncio.CancelledError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return CitationValidation(passed=False, reasons=("authorization_unavailable",))
+        if not isinstance(resolved, Mapping):
+            return CitationValidation(passed=False, reasons=("authorization_malformed",))
+        # The resolver result is authoritative; the mapping is only a local cache
+        # and cannot make an inactive, cross-tenant, or stale row valid.
+        return self.validate(draft, packed_evidence, scope, snapshot, resolved)
+
 
 async def generate_with_mandatory_audits(
     *,
@@ -179,6 +239,7 @@ async def generate_with_mandatory_audits(
     faithfulness_auditor: FaithfulnessAuditor,
     citation_validator: CitationValidator,
     authorization: Mapping[str, object],
+    authorization_resolver: EvidenceAuthorizationResolver | None = None,
 ) -> dict[str, object]:
     """Generate at most twice; never return an unapproved draft in state."""
     raw_revision_count = state.get("revision_count", 0)
@@ -195,8 +256,18 @@ async def generate_with_mandatory_audits(
             raise
         except AnswerGenerationUnavailable as error:
             return _refusal(revision_count, prior_audits, [*prior_errors, {"code": "generation_unavailable", "detail": str(error)}])
-        citation = citation_validator.validate(draft, packed_evidence, scope, snapshot, authorization)
         faithfulness = await faithfulness_auditor.audit(question, draft, packed_evidence, scope=scope, snapshot=snapshot)
+        if authorization_resolver is None:
+            citation = CitationValidation(passed=False, reasons=("authorization_resolver_required",))
+        else:
+            citation = await citation_validator.validate_async(
+                draft,
+                packed_evidence,
+                scope,
+                snapshot,
+                authorization,
+                authorization_resolver=authorization_resolver,
+            )
         audit_record = {
             "citation": citation.model_dump(mode="json"),
             "faithfulness": faithfulness.model_dump(mode="json"),
@@ -270,3 +341,23 @@ def _authorization_allows(
         and value.get("document_version_id") == entry.document_version_id
         and value.get("ast_locator") == entry.ast_locator
     )
+
+
+def _parent_record(
+    parent: object,
+    scope: UserScope,
+    snapshot: RuntimeConfigSnapshot,
+) -> Mapping[str, object]:
+    if parent is None:
+        return {}
+    user_id = getattr(parent, "user_id", None)
+    status = getattr(parent, "status", None)
+    return {
+        "user_id": user_id if user_id is not None else scope.user_id,
+        "index_generation": getattr(parent, "index_generation", None),
+        "is_active": status == "active",
+        "parent_id": getattr(parent, "id", None),
+        "document_id": getattr(parent, "document_id", None),
+        "document_version_id": getattr(parent, "document_version_id", None),
+        "ast_locator": getattr(parent, "ast_locator", None),
+    }

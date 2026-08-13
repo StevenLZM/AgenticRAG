@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 
 import pytest
 
@@ -152,6 +153,141 @@ def test_citation_validator_rejects_conflicting_manifest_metadata() -> None:
     )
     assert result.passed is False
     assert "manifest_mismatch" in result.reasons
+
+
+class FakeAuthorizationResolver:
+    def __init__(self, record: Mapping[str, object]) -> None:
+        self.record = record
+        self.calls = 0
+
+    async def resolve(self, manifest: Mapping[str, object], scope: UserScope, snapshot: RuntimeConfigSnapshot) -> Mapping[str, object]:
+        self.calls += 1
+        return {"evidence-1": self.record}
+
+
+class MalformedAuthorizationResolver:
+    async def resolve(
+        self,
+        manifest: Mapping[str, object],
+        scope: UserScope,
+        snapshot: RuntimeConfigSnapshot,
+    ) -> object:
+        return ["not-a-resolution"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_authorization_resolver_fails_closed_before_answer_publication() -> None:
+    from agentic_rag.query.audit import FaithfulnessAuditor, CitationValidator, generate_with_mandatory_audits
+    from agentic_rag.query.generation import AnswerGenerator
+
+    gateway = FakeGateway([
+        {"segments": [{"kind": "content", "text": "The term is three years.", "evidence_ids": ["evidence-1"]}]},
+        {"passed": True, "unsupported_claim_ids": [], "reasons": []},
+    ])
+    result = await generate_with_mandatory_audits(
+        question="What is the term?",
+        state={"revision_count": 0, "audit_results": [], "errors": []},
+        packed_evidence=packed_evidence(),
+        scope=SCOPE,
+        snapshot=SNAPSHOT.model_copy(update={"max_answer_revisions": 0}),
+        generator=AnswerGenerator(gateway),
+        faithfulness_auditor=FaithfulnessAuditor(gateway),
+        citation_validator=CitationValidator(),
+        authorization=authorization(),
+        authorization_resolver=MalformedAuthorizationResolver(),  # type: ignore[arg-type]
+    )
+
+    assert result["answer"] == {}
+    assert result["termination_reason"] == "audit_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "record",
+    [
+        {**authorization()["evidence-1"], "is_active": False},
+        {**authorization()["evidence-1"], "user_id": "user-2"},
+        {**authorization()["evidence-1"], "document_version_id": "version-old"},
+    ],
+)
+async def test_generation_requires_repository_recheck_even_when_mapping_claims_current(
+    record: Mapping[str, object],
+) -> None:
+    from agentic_rag.query.audit import FaithfulnessAuditor, CitationValidator, generate_with_mandatory_audits
+    from agentic_rag.query.generation import AnswerGenerator
+
+    resolver = FakeAuthorizationResolver(record)
+    gateway = FakeGateway([
+        {"segments": [{"kind": "content", "text": "The term is three years.", "evidence_ids": ["evidence-1"]}]},
+        {"passed": True, "unsupported_claim_ids": [], "reasons": []},
+    ])
+    no_revision = SNAPSHOT.model_copy(update={"max_answer_revisions": 0})
+    result = await generate_with_mandatory_audits(
+        question="What is the term?",
+        state={"revision_count": 0, "audit_results": [], "errors": []},
+        packed_evidence=packed_evidence(),
+        scope=SCOPE,
+        snapshot=no_revision,
+        generator=AnswerGenerator(gateway),
+        faithfulness_auditor=FaithfulnessAuditor(gateway),
+        citation_validator=CitationValidator(),
+        authorization=authorization(),
+        authorization_resolver=resolver,
+    )
+
+    assert resolver.calls == 1
+    assert result["answer"] == {}
+    assert result["termination_reason"] == "audit_failed"
+
+
+@pytest.mark.asyncio
+async def test_mandatory_audit_runs_faithfulness_before_citation() -> None:
+    from agentic_rag.query.audit import (
+        CitationValidation,
+        FaithfulnessAudit,
+        generate_with_mandatory_audits,
+    )
+    from agentic_rag.query.generation import AnswerGenerator
+
+    calls: list[str] = []
+
+    class TrackingFaithfulness:
+        async def audit(self, *args: object, **kwargs: object) -> FaithfulnessAudit:
+            calls.append("faithfulness")
+            return FaithfulnessAudit(passed=True)
+
+    class TrackingCitation:
+        async def validate_async(self, *args: object, **kwargs: object) -> CitationValidation:
+            calls.append("citation")
+            return CitationValidation(passed=True)
+
+    gateway = FakeGateway([
+        {"segments": [{"kind": "content", "text": "The term is three years.", "evidence_ids": ["evidence-1"]}]},
+    ])
+    result = await generate_with_mandatory_audits(
+        question="What is the term?",
+        state={"revision_count": 0, "audit_results": [], "errors": []},
+        packed_evidence=packed_evidence(),
+        scope=SCOPE,
+        snapshot=SNAPSHOT,
+        generator=AnswerGenerator(gateway),
+        faithfulness_auditor=TrackingFaithfulness(),  # type: ignore[arg-type]
+        citation_validator=TrackingCitation(),  # type: ignore[arg-type]
+        authorization=authorization(),
+        authorization_resolver=FakeAuthorizationResolver(authorization()["evidence-1"]),
+    )
+
+    assert result["answer"]
+    assert calls == ["faithfulness", "citation"]
+
+
+def test_faithfulness_prompt_contract_matches_audit_schema() -> None:
+    from agentic_rag.runtime.model_gateway import load_prompt
+
+    prompt = load_prompt("faithfulness_v1").content
+    assert '"unsupported_claim_ids"' in prompt
+    assert '"reasons"' in prompt
+    assert '"issues"' not in prompt
 
 
 class FakeGateway:
