@@ -39,7 +39,7 @@
 - Produces: `ModelGateway.complete()`, `ModelGateway.complete_structured()`, `ModelResponse`, prompt Hash/version loader.
 - Consumes: model IDs and retry/timeout settings from `RuntimeConfigSnapshot`.
 
-- [ ] **Step 1: Write structured-response and retry-ownership tests**
+- [x] **Step 1: Write structured-response and retry-ownership tests**
 
 ```python
 async def test_structured_call_rejects_invalid_schema_without_returning_partial(fake_client):
@@ -49,12 +49,12 @@ async def test_structured_call_rejects_invalid_schema_without_returning_partial(
     assert result.attempts == 2
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest tests/unit/runtime/test_model_gateway.py -q`
 Expected: FAIL because ModelGateway is absent.
 
-- [ ] **Step 3: Implement one retry owner and immutable prompt versions**
+- [x] **Step 3: Implement one retry owner and immutable prompt versions**
 
 ```python
 class ModelResponse(BaseModel, Generic[T]):
@@ -73,12 +73,12 @@ class ModelGateway(Protocol):
 
 Use the provider's OpenAI-compatible endpoint behind an injected client. Retry only timeout, 429, 5xx and temporary connection errors with exponential backoff plus jitter, at most two retries. Schema errors receive one repair attempt within this Gateway; Graph Nodes do not repeat an already retried call. Each prompt file has fixed `ROLE`, `TRUST BOUNDARY`, `INPUT`, `ALLOWED DECISIONS/ACTIONS`, `OUTPUT SCHEMA` and `FAIL-CLOSED RULES` sections. Research prompt lists only the six approved actions; generator forbids Evidence IDs outside the Manifest; grader/auditor state their non-overlapping responsibilities. Load prompts from these versioned files and store their content Hash in the Run snapshot.
 
-- [ ] **Step 4: Run gateway tests**
+- [x] **Step 4: Run gateway tests**
 
 Run: `pytest tests/unit/runtime/test_model_gateway.py -q && mypy src/agentic_rag/runtime/model_gateway.py`
 Expected: PASS for timeout retry, schema repair, actual model ID and usage capture.
 
-- [ ] **Step 5: Commit ModelGateway**
+- [x] **Step 5: Commit ModelGateway**
 
 ```bash
 git add src/agentic_rag/runtime/model_gateway.py src/agentic_rag/models src/agentic_rag/prompts tests/unit/runtime
@@ -99,7 +99,7 @@ git commit -m "feat: add structured model gateway"
 - Produces: `MemoryService.load_context()`, `extract_and_store()`, `list()`, `delete()`, `reconcile_deletions()`.
 - Consumes: mem0ai `AsyncMemory`, `MemoryTombstoneRepository`, ModelGateway light model, UserScope.
 
-- [ ] **Step 1: Write user-source-only memory and tombstone tests**
+- [x] **Step 1: Write user-source-only memory and tombstone tests**
 
 ```python
 async def test_assistant_claim_is_not_written_without_user_confirmation(memory_service):
@@ -112,12 +112,12 @@ async def test_assistant_claim_is_not_written_without_user_confirmation(memory_s
     assert all("上海" not in item.text for item in stored)
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest tests/unit/memory/test_service.py -q`
 Expected: FAIL because MemoryService is absent.
 
-- [ ] **Step 3: Implement the thin Mem0 boundary**
+- [x] **Step 3: Implement the thin Mem0 boundary**
 
 ```python
 class MemoryType(StrEnum):
@@ -134,12 +134,12 @@ class MemoryService(Protocol):
 
 Configure mem0ai with `agent_memories_v1`, Qwen 1024-dimensional embeddings and the same `user_id` namespace. Metadata includes Memory type, source Run/message IDs and policy version. Wrap loaded Memory in an untrusted Data Envelope. Deletion writes MySQL Tombstone first, calls Mem0 delete, and marks complete only after a subsequent search no longer returns the Memory.
 
-- [ ] **Step 4: Run unit and local Mem0/ES tests**
+- [x] **Step 4: Run unit and local Mem0/ES tests**
 
 Run: `pytest tests/unit/memory/test_service.py -q && pytest -m integration tests/integration/memory/test_mem0_adapter.py -q`
 Expected: user isolation, source filtering, graceful read/write degradation and deletion reconciliation pass.
 
-- [ ] **Step 5: Commit memory boundary**
+- [x] **Step 5: Commit memory boundary**
 
 ```bash
 git add src/agentic_rag/memory tests/unit/memory tests/integration/memory
@@ -158,7 +158,7 @@ git commit -m "feat: integrate scoped mem0 memory"
 - Produces: `QueryState`, `RouteDecision`, `MemoryContextLoader`, `route_query()`, `run_fast_rag()`.
 - Consumes: ModelGateway, MemoryService and RetrievalService.
 
-- [ ] **Step 1: Write route and fast-path escalation tests**
+- [x] **Step 1: Write route and fast-path escalation tests**
 
 ```python
 async def test_fast_path_retrieves_once_then_escalates_on_insufficient(router_graph, deps):
@@ -169,12 +169,12 @@ async def test_fast_path_retrieves_once_then_escalates_on_insufficient(router_gr
     assert state["next_node"] == "research_agent"
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest tests/unit/query/test_router_fast_path.py -q`
 Expected: FAIL because Query state/router are absent.
 
-- [ ] **Step 3: Implement JSON-serializable state and strict routing**
+- [x] **Step 3: Implement JSON-serializable state and strict routing**
 
 ```python
 class QueryState(TypedDict):
@@ -196,12 +196,12 @@ class QueryState(TypedDict):
 
 Memory loader executes exactly once before Router. Router schema is `fast_rag | research`; invalid outputs fail closed after Gateway repair. Fast RAG makes one high-level RetrievalService call and never calls ES/MySQL adapters directly.
 
-- [ ] **Step 4: Run state and fast route tests**
+- [x] **Step 4: Run state and fast route tests**
 
 Run: `pytest tests/unit/query/test_router_fast_path.py -q`
 Expected: Memory loads once, fast retrieval calls once, and insufficient evidence routes to Research.
 
-- [ ] **Step 5: Commit query entry flow**
+- [x] **Step 5: Commit query entry flow**
 
 ```bash
 git add src/agentic_rag/query/state.py src/agentic_rag/query/router.py src/agentic_rag/query/fast_rag.py tests/unit/query
@@ -224,7 +224,7 @@ git commit -m "feat: add memory routed fast rag"
 - Produces: `TodoReducer`, `ResearchAction` union, `ResearchAgentLoop`, `ResearchToolset`, `ContextBuilder`.
 - Consumes: ModelGateway main/light models, RetrievalService, EvidenceBuilder, calculator and EventRepository.
 
-- [ ] **Step 1: Write Todo invariants and observation-loop tests**
+- [x] **Step 1: Write Todo invariants and observation-loop tests**
 
 ```python
 def test_completed_todo_requires_evidence_or_result_ref():
@@ -242,12 +242,12 @@ def test_calculator_rejects_function_calls():
         SafeCalculator().evaluate("__import__('os').system('id')")
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest tests/unit/query/test_todos.py tests/unit/query/test_research_loop.py -q`
 Expected: FAIL because loop contracts are absent.
 
-- [ ] **Step 3: Implement the action union and true loop**
+- [x] **Step 3: Implement the action union and true loop**
 
 ```python
 ResearchAction = Annotated[
@@ -262,12 +262,12 @@ class ResearchToolset:
 
 The Agent node always returns one structured action. Reducer rejects dependency cycles, illegal ownership changes and completion without Evidence/result reference. Calculator parses Python expression AST and permits only numeric literals, parentheses and `+ - * / // % **`; it rejects names, attributes, calls, containers and results exceeding configured magnitude. Tool Observation returns to the Agent. ContextBuilder retains system constraints, original question, Memory summary, unfinished Todos, latest Observation, Evidence Manifest and grader gaps; when estimated context exceeds 16000 Tokens, the light model compacts only older Observations/completed Todo detail while raw public messages/events remain in MySQL. Enforce four research rounds and Graph recursion limit 50.
 
-- [ ] **Step 4: Run Todo/loop tests**
+- [x] **Step 4: Run Todo/loop tests**
 
 Run: `pytest tests/unit/query/test_todos.py tests/unit/query/test_calculator.py tests/unit/query/test_research_loop.py -q`
 Expected: dynamic creation/revision, multi-hop retrieval, cannot-answer and loop-limit behavior pass.
 
-- [ ] **Step 5: Commit ResearchAgentLoop**
+- [x] **Step 5: Commit ResearchAgentLoop**
 
 ```bash
 git add src/agentic_rag/query/todos.py src/agentic_rag/query/tools.py src/agentic_rag/query/calculator.py src/agentic_rag/query/research_loop.py src/agentic_rag/query/context.py tests/unit/query
@@ -286,7 +286,7 @@ git commit -m "feat: add dynamic research agent loop"
 - Produces: `ConcurrencyManager`, `SubagentDispatcher.delegate()`, `EvidenceReducer.merge()` and LangGraph `Send` branch integration.
 - Consumes: restricted ResearchAgentLoop and Runtime settings.
 
-- [ ] **Step 1: Write fan-out, partial-join and cancellation tests**
+- [x] **Step 1: Write fan-out, partial-join and cancellation tests**
 
 ```python
 async def test_subagents_are_bounded_and_partial_results_survive_timeout(dispatcher):
@@ -296,12 +296,12 @@ async def test_subagents_are_bounded_and_partial_results_survive_timeout(dispatc
     assert result.blocked_todo_ids == ("slow-todo",)
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest tests/unit/query/test_subagents.py -q`
 Expected: FAIL because dispatcher/reducer are absent.
 
-- [ ] **Step 3: Implement per-invocation Subgraphs and deterministic merge**
+- [x] **Step 3: Implement per-invocation Subgraphs and deterministic merge**
 
 Implement `ConcurrencyManager` with injected Run/LLM/Reranker limits and a per-Run Subagent Semaphore. Supervisor may delegate only Todos without unresolved dependencies. Each `Send` payload contains assigned question, server-built Filter, read-only Memory summary and Evidence Manifest. Subagents cannot delegate again or generate final answers. Use per-invocation state, sort reducer input by Todo ID, deduplicate by stable Evidence ID, keep completed results on timeout, mark unfinished Todos blocked, and cancel all children when parent Run ends.
 
@@ -319,12 +319,12 @@ class EvidenceReducer:
     def merge(self, results: Sequence[SubagentResult]) -> tuple[EvidenceItem, ...]: ...
 ```
 
-- [ ] **Step 4: Run Subagent tests**
+- [x] **Step 4: Run Subagent tests**
 
 Run: `pytest tests/unit/query/test_subagents.py -q`
 Expected: bound, isolation, deterministic reducer, timeout and cancellation tests pass.
 
-- [ ] **Step 5: Commit Multi-Agent execution**
+- [x] **Step 5: Commit Multi-Agent execution**
 
 ```bash
 git add src/agentic_rag/query/research_loop.py src/agentic_rag/query/subagents.py src/agentic_rag/runtime/concurrency.py tests/unit/query/test_subagents.py
@@ -342,7 +342,7 @@ git commit -m "feat: add bounded research subagents"
 - Produces: `AnswerDraft`, `EvidenceGrader`, `FaithfulnessAuditor`, `CitationValidator`, `render_final_answer()`.
 - Consumes: PackedEvidence, ModelGateway and current UserScope/version repository checks.
 
-- [ ] **Step 1: Write claim coverage, invalid citation and revision-limit tests**
+- [x] **Step 1: Write claim coverage, invalid citation and revision-limit tests**
 
 ```python
 def test_citation_validator_requires_evidence_for_every_content_segment():
@@ -356,12 +356,12 @@ async def test_second_failed_revision_refuses(graph):
     assert result["answer"] == {}
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest tests/unit/query/test_audit.py -q`
 Expected: FAIL because audit types and nodes are absent.
 
-- [ ] **Step 3: Implement the three gates and one shared repair loop**
+- [x] **Step 3: Implement the three gates and one shared repair loop**
 
 ```python
 class AnswerSegment(BaseModel):
@@ -375,12 +375,12 @@ class AnswerDraft(BaseModel):
 
 Evidence Grader returns `sufficient | insufficient | clarify | refuse` plus gaps. Faithfulness checks semantic support only. Citation Validator deterministically requires every content Segment to cite Manifest Evidence owned by the current user and active version; only format kinds may omit Evidence. Faithfulness or citation failure returns to Generate once, then refuses without returning the draft.
 
-- [ ] **Step 4: Run audit tests**
+- [x] **Step 4: Run audit tests**
 
 Run: `pytest tests/unit/query/test_audit.py -q`
 Expected: sufficient, research-gap, clarify, refuse, repair and fail-closed paths pass.
 
-- [ ] **Step 5: Commit audits**
+- [x] **Step 5: Commit audits**
 
 ```bash
 git add src/agentic_rag/query/generation.py src/agentic_rag/query/audit.py tests/unit/query/test_audit.py
@@ -397,7 +397,7 @@ git commit -m "feat: enforce answer evidence audits"
 - Produces: `build_query_graph(deps, checkpointer) -> CompiledStateGraph`.
 - Consumes: Tasks 2–6 and Phase 3 Retrieval/Evidence services.
 
-- [ ] **Step 1: Write fixed-path graph topology tests**
+- [x] **Step 1: Write fixed-path graph topology tests**
 
 ```python
 async def test_every_normal_answer_passes_all_three_gates(query_graph, events):
@@ -407,12 +407,12 @@ async def test_every_normal_answer_passes_all_three_gates(query_graph, events):
     assert types.index("EVIDENCE_GRADED") < types.index("FAITHFULNESS_AUDITED") < types.index("CITATION_VALIDATED")
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest tests/unit/query/test_graph.py -q`
 Expected: FAIL because QueryGraph is absent.
 
-- [ ] **Step 3: Compile the approved macro graph**
+- [x] **Step 3: Compile the approved macro graph**
 
 ```text
 START -> memory_loader -> route
@@ -426,12 +426,12 @@ audit failure -> generate once -> refuse on second failure
 
 Before calling EvidenceBuilder, map the Fast-path question or current Todo list into Phase 3 `EvidenceCoverageTarget` values; do not introduce a reverse dependency from Phase 3 to Todo types. Use the Query SQLite Checkpointer and `checkpoint_thread_id={user_id}:{thread_id}`. Finalize persists the public final answer/events first, then invokes MemoryService extraction as a degradable post-finalize side effect.
 
-- [ ] **Step 4: Run QueryGraph tests**
+- [x] **Step 4: Run QueryGraph tests**
 
 Run: `pytest tests/unit/query/test_graph.py tests/unit/query/test_router_fast_path.py tests/unit/query/test_research_loop.py tests/unit/query/test_audit.py -q`
 Expected: all macro routes and mandatory gates pass.
 
-- [ ] **Step 5: Commit QueryGraph**
+- [x] **Step 5: Commit QueryGraph**
 
 ```bash
 git add src/agentic_rag/query/graph.py tests/unit/query/test_graph.py
@@ -451,7 +451,7 @@ git commit -m "feat: compile audited query graph"
 - Produces: `RunManager.create()`, `request_cancel()`, `QueryWorker.run_one()`/`run_forever()`.
 - Consumes: Run/Outbox/Event repositories, Redis broker, QueryGraph, Checkpoint backend and `ConcurrencyManager` from Task 5.
 
-- [ ] **Step 1: Write durable creation, single-thread and crash-resume tests**
+- [x] **Step 1: Write durable creation, single-thread and crash-resume tests**
 
 ```python
 @pytest.mark.integration
@@ -467,12 +467,12 @@ async def test_worker_resumes_same_run_after_crash(worker_fixture):
     assert worker_fixture.duplicate_event_keys == set()
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest -m integration tests/integration/runtime/test_query_worker.py -q`
 Expected: FAIL because runtime classes are absent.
 
-- [ ] **Step 3: Implement durable execution and cooperative cancellation**
+- [x] **Step 3: Implement durable execution and cooperative cancellation**
 
 ```python
 class ConcurrencyManager:
@@ -489,12 +489,12 @@ class RunManager(Protocol):
 
 Create Run and Outbox atomically. Worker consumes `agenticrag:jobs:query`, Claims MySQL lease, checks cancel before each Graph node/tool/subagent, heartbeats, invokes Graph with the stable checkpoint thread, and ACKs only after terminal status. Reclaim expired pending entries with `XAUTOCLAIM`; dead-letter after three Claim attempts. Enforce 300-second Run timeout and graceful shutdown that stops new Claims before waiting for active nodes.
 
-- [ ] **Step 4: Run runtime integration tests**
+- [x] **Step 4: Run runtime integration tests**
 
 Run: `pytest -m integration tests/integration/runtime/test_query_worker.py -q`
 Expected: duplicate notifications, active-thread conflict, cancellation, timeout, lease reclaim and checkpoint resume pass without duplicate events.
 
-- [ ] **Step 5: Commit Query runtime**
+- [x] **Step 5: Commit Query runtime**
 
 ```bash
 git add src/agentic_rag/runtime scripts/run_query_worker.py tests/integration/runtime
@@ -515,7 +515,7 @@ git commit -m "feat: add durable query worker"
 - Produces: all `/v1/query-runs`, `/v1/query`, `/v1/memories` and `/v1/feedback` endpoints from the design.
 - Consumes: RunManager, EventRepository, MemoryService and UserScope dependency.
 
-- [ ] **Step 1: Write SSE reconnection, sync-wrapper and cancellation API tests**
+- [x] **Step 1: Write SSE reconnection, sync-wrapper and cancellation API tests**
 
 ```python
 @pytest.mark.integration
@@ -530,12 +530,12 @@ async def test_sync_query_returns_202_after_wait_timeout(client, slow_run):
     assert response.json()["run_id"]
 ```
 
-- [ ] **Step 2: Verify red state**
+- [x] **Step 2: Verify red state**
 
 Run: `pytest -m integration tests/integration/api/test_query_runs.py -q`
 Expected: FAIL because routes are absent.
 
-- [ ] **Step 3: Implement scoped APIs and MySQL-backed SSE**
+- [x] **Step 3: Implement scoped APIs and MySQL-backed SSE**
 
 `POST /v1/query-runs` returns 202. GET and cancel verify Run ownership. SSE polls `agent_events.id > Last-Event-ID`, emits heartbeat comments and redacted public progress only. `/v1/query` creates the same durable Run, waits at most 30 seconds, returns 200 only for an audited completed result and otherwise returns 202 without starting a second Run. Memory deletion is tombstone-backed; feedback verifies Run ownership before appending `USER_FEEDBACK`.
 
@@ -548,12 +548,12 @@ class QueryRequest(BaseModel):
 
 If `(user_id, thread_id)` already has an active Run, return unified 409 `ACTIVE_RUN_EXISTS` and set `Location: /v1/query-runs/{existing_run_id}`; do not enqueue a duplicate. All other failures use Phase 1 `ApiError`.
 
-- [ ] **Step 4: Run the Phase 4 gate**
+- [x] **Step 4: Run the Phase 4 gate**
 
 Run: `pytest tests/unit/query tests/unit/memory tests/unit/runtime -q && pytest -m integration tests/integration/runtime tests/integration/api tests/integration/memory -q && pytest -m e2e tests/e2e/test_query_runtime.py -q`
 Expected: Fast RAG, multi-hop, Subagent, audit repair/refuse, restart, cancel, SSE reconnect, Memory isolation and feedback all pass.
 
-- [ ] **Step 5: Commit public Query APIs**
+- [x] **Step 5: Commit public Query APIs**
 
 ```bash
 git add src/agentic_rag/api tests/integration/api tests/e2e/test_query_runtime.py
