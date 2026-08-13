@@ -49,6 +49,7 @@ class RecordingSessions:
 @dataclass
 class Runs:
     run: QueryRun | None = None
+    runs: dict[str, QueryRun] = field(default_factory=dict)
     creates: int = 0
     outbox_created: list[str] = field(default_factory=list)
     finishes: list[RunStatus] = field(default_factory=list)
@@ -59,49 +60,58 @@ class Runs:
     ) -> QueryRun:
         del transaction
         self.creates += 1
-        if self.run is not None and self.run.status in {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED}:
+        if any(current.status in {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED} for current in self.runs.values()):
             raise ActiveRunConflict("active run")
+        run_id = f"run-{self.creates}"
         self.run = QueryRun(
-            id="run-1", user_id=scope.user_id, thread_id=thread_id, question=question,
+            id=run_id, user_id=scope.user_id, thread_id=thread_id, question=question,
             checkpoint_thread_id=f"query:{scope.user_id}:{thread_id}", status=RunStatus.QUEUED,
             active_slot=1, runtime_config_snapshot_id=snapshot.snapshot_id,
             runtime_config_snapshot=snapshot.model_dump(mode="json"),
         )
+        self.runs[self.run.id] = self.run
         self.outbox_created.append(self.run.id)
         return self.run
 
     async def get(self, run_id: str, scope: UserScope) -> QueryRun | None:
-        return self.run if self.run is not None and self.run.id == run_id and self.run.user_id == scope.user_id else None
+        run = self.runs.get(run_id)
+        return run if run is not None and run.user_id == scope.user_id else None
 
     async def get_for_delivery(self, run_id: str) -> QueryRun | None:
-        return self.run if self.run is not None and self.run.id == run_id else None
+        return self.runs.get(run_id)
 
     async def claim(self, run_id: str, owner: str, lease_seconds: int) -> QueryRun | None:
         del owner, lease_seconds
-        if self.run is None or self.run.id != run_id or self.run.status is not RunStatus.QUEUED:
+        current = self.runs.get(run_id)
+        if current is None or current.status is not RunStatus.QUEUED:
             return None
         self.claimed += 1
-        self.run = replace(self.run, status=RunStatus.RUNNING, claim_generation=self.claimed)
+        self.run = replace(current, status=RunStatus.RUNNING, claim_generation=self.claimed)
+        self.runs[run_id] = self.run
         return self.run
 
     async def heartbeat(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
 
     async def request_cancel(self, run_id: str, scope: UserScope) -> RunStatus:
-        assert self.run is not None and self.run.id == run_id and self.run.user_id == scope.user_id
-        self.run = replace(self.run, status=RunStatus.CANCEL_REQUESTED)
+        current = self.runs[run_id]
+        assert current.user_id == scope.user_id
+        self.run = replace(current, status=RunStatus.CANCEL_REQUESTED)
+        self.runs[run_id] = self.run
         return self.run.status
 
     async def finish(self, run_id: str, status: RunStatus, result_ref: str | None, error_code: str | None, *, owner: str, claim_generation: int) -> None:
         del result_ref, error_code, owner, claim_generation
-        assert self.run is not None and self.run.id == run_id
+        assert run_id in self.runs
         self.finishes.append(status)
-        self.run = replace(self.run, status=status, active_slot=None)
+        self.run = replace(self.runs[run_id], status=status, active_slot=None)
+        self.runs[run_id] = self.run
 
 
 @dataclass
 class Broker:
     messages: list[StreamMessage] = field(default_factory=list)
+    reclaimed: list[StreamMessage] = field(default_factory=list)
     acknowledged: list[str] = field(default_factory=list)
     dead: list[str] = field(default_factory=list)
     consume_error: Exception | None = None
@@ -115,7 +125,8 @@ class Broker:
 
     async def reclaim(self, *args: object, **kwargs: object) -> list[StreamMessage]:
         del args, kwargs
-        return []
+        result, self.reclaimed = self.reclaimed, []
+        return result
 
     async def ack(self, stream: str, group: str, message_id: str) -> None:
         del stream, group
@@ -210,6 +221,56 @@ class _Graph:
         return {"termination_reason": "completed", "answer": {"status": "audited"}}
 
 
+def _queued_peer(run: QueryRun, run_id: str = "run-2") -> QueryRun:
+    return replace(
+        run,
+        id=run_id,
+        thread_id=f"{run.thread_id}-{run_id}",
+        checkpoint_thread_id=f"query:{run.user_id}:{run.thread_id}-{run_id}",
+        status=RunStatus.QUEUED,
+        active_slot=1,
+        claim_generation=0,
+    )
+
+
+async def test_worker_drains_every_fresh_message_in_one_delivery_batch() -> None:
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    first = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="first")
+    second = _queued_peer(first)
+    runs.runs[second.id] = second
+    broker = Broker(messages=[
+        StreamMessage("1-0", first.id, datetime.now(UTC)),
+        StreamMessage("2-0", second.id, datetime.now(UTC)),
+    ])
+    worker = QueryWorker(runs=runs, broker=broker, graph_factory=lambda **_: _Graph(), worker_id="worker-1")
+
+    processed = await worker.run_one()
+
+    assert processed is True
+    assert runs.finishes == [RunStatus.COMPLETED, RunStatus.COMPLETED]
+    assert broker.acknowledged == ["1-0", "2-0"]
+
+
+async def test_worker_drains_reclaimed_before_fresh_without_losing_fresh_batch() -> None:
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    reclaimed_run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="reclaimed")
+    fresh_run = _queued_peer(reclaimed_run)
+    runs.runs[fresh_run.id] = fresh_run
+    broker = Broker(
+        reclaimed=[StreamMessage("1-0", reclaimed_run.id, datetime.now(UTC))],
+        messages=[StreamMessage("2-0", fresh_run.id, datetime.now(UTC))],
+    )
+    worker = QueryWorker(runs=runs, broker=broker, graph_factory=lambda **_: _Graph(), worker_id="worker-1")
+
+    await worker.run_one()
+
+    assert broker.acknowledged == ["1-0", "2-0"]
+
+
 async def test_duplicate_delivery_that_cannot_claim_is_not_executed_or_acked() -> None:
     from agentic_rag.runtime.query_worker import QueryWorker
 
@@ -231,6 +292,7 @@ async def test_duplicate_terminal_delivery_is_acked_without_graph_execution() ->
     runs = Runs()
     run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="What notice applies?")
     runs.run = replace(run, status=RunStatus.COMPLETED, active_slot=None)
+    runs.runs[run.id] = runs.run
     broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
     worker = QueryWorker(runs=runs, broker=broker, graph_factory=lambda **_: _Graph(), worker_id="worker-1")
 

@@ -96,17 +96,18 @@ class QueryWorker:
         self._max_attempts = max_attempts
 
     async def run_one(self) -> bool:
-        """Process at most one reclaimed or fresh delivery."""
+        """Drain one Redis delivery batch, preferring reclaimed messages first."""
         reclaimed = await self._broker.reclaim(
             QUERY_STREAM, QUERY_GROUP, self._worker_id, self._reclaim_idle_ms
         )
         fresh = await self._broker.consume(
             QUERY_STREAM, QUERY_GROUP, self._worker_id, self._block_ms
         )
-        message = next(iter((*reclaimed, *fresh)), None)
-        if message is None:
+        messages = (*reclaimed, *fresh)
+        if not messages:
             return False
-        await self.process_message(message)
+        for message in messages:
+            await self.process_message(message)
         return True
 
     async def process_message(self, message: StreamMessage) -> None:
