@@ -18,9 +18,9 @@ class ConcurrencyManager:
     def __init__(
         self,
         *,
-        run_limit: int = 16,
-        llm_limit: int = 16,
-        reranker_limit: int = 8,
+        run_limit: int = 4,
+        llm_limit: int = 8,
+        reranker_limit: int = 1,
         per_run_subagent_limit: int = 3,
         run_semaphore: asyncio.Semaphore | None = None,
         llm_semaphore: asyncio.Semaphore | None = None,

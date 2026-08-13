@@ -220,6 +220,7 @@ agent_runs = Table(
     Column("heartbeat_at", DateTime(timezone=True), nullable=True),
     Column("attempt_count", Integer, nullable=False, default=0),
     Column("route", String(64), nullable=True),
+    Column("question", Text, nullable=False, default=""),
     Column("runtime_config_snapshot_id", String(64), nullable=False),
     Column("runtime_config_snapshot", JSON, nullable=False),
     Column("result_ref", String(1024), nullable=True),
@@ -389,6 +390,7 @@ class QueryRun:
     claim_generation: int = 0
     result_ref: str | None = None
     error_code: str | None = None
+    question: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,10 +476,13 @@ class RunRepository(Protocol):
         thread_id: str,
         snapshot: RuntimeConfigSnapshot,
         *,
+        question: str = "",
         transaction: AsyncSession | None = None,
     ) -> QueryRun: ...
 
     async def get(self, run_id: str, scope: UserScope) -> QueryRun | None: ...
+
+    async def get_for_delivery(self, run_id: str) -> QueryRun | None: ...
 
     async def claim(
         self, run_id: str, owner: str, lease_seconds: int
@@ -635,6 +640,7 @@ def _run_from_row(row: dict[str, Any]) -> QueryRun:
         claim_generation=row["attempt_count"],
         result_ref=row["result_ref"],
         error_code=row["error_code"],
+        question=cast(str, row.get("question") or ""),
     )
 
 
@@ -645,6 +651,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         thread_id: str,
         snapshot: RuntimeConfigSnapshot,
         *,
+        question: str = "",
         transaction: AsyncSession | None = None,
     ) -> QueryRun:
         session = self._session(transaction)
@@ -658,6 +665,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
             active_slot=1,
             runtime_config_snapshot_id=snapshot.snapshot_id,
             runtime_config_snapshot=snapshot.model_dump(mode="json"),
+            question=question.strip(),
         )
         try:
             await session.execute(
@@ -671,6 +679,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                     attempt_count=0,
                     runtime_config_snapshot_id=run.runtime_config_snapshot_id,
                     runtime_config_snapshot=run.runtime_config_snapshot,
+                    question=run.question,
                     created_at=now,
                 )
             )
@@ -703,6 +712,19 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                         agent_runs.c.id == run_id,
                         agent_runs.c.user_id == scope.user_id,
                     )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        return _run_from_row(dict(row)) if row else None
+
+    async def get_for_delivery(self, run_id: str) -> QueryRun | None:
+        """Read one Run for a trusted broker delivery, without API exposure."""
+        row = (
+            (
+                await self._session().execute(
+                    select(agent_runs).where(agent_runs.c.id == run_id)
                 )
             )
             .mappings()
