@@ -218,6 +218,50 @@ async def test_worker_claims_invokes_stable_checkpoint_and_acks_only_terminal_ru
     assert broker.acknowledged == ["1-0"]
 
 
+@pytest.mark.parametrize(
+    "termination_reason",
+    [
+        "clarify",
+        "refuse",
+        "cannot_answer",
+        "research_action_invalid",
+        "audit_failed",
+        "research_round_limit",
+    ],
+)
+async def test_worker_persists_business_terminal_reasons_as_completed(
+    termination_reason: str,
+) -> None:
+    """A user-facing refusal/clarification is a completed, audited Run outcome."""
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    run = await runs.create_queued(
+        SCOPE, "thread-1", SNAPSHOT, question="What notice applies?"
+    )
+    broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+
+    class TerminalGraph:
+        async def ainvoke(
+            self, state: dict[str, object], config: dict[str, object]
+        ) -> dict[str, object]:
+            del state, config
+            return {"termination_reason": termination_reason}
+
+    worker = QueryWorker(
+        runs=runs,
+        broker=broker,
+        graph_factory=lambda **_: TerminalGraph(),
+        worker_id="worker-1",
+    )
+    await worker.run_one()
+
+    assert runs.finishes == [RunStatus.COMPLETED]
+    assert runs.answers == [{"status": termination_reason}]
+    assert broker.dead == []
+    assert broker.acknowledged == ["1-0"]
+
+
 class _Graph:
     async def ainvoke(self, state: dict[str, object], config: dict[str, object]) -> dict[str, object]:
         del state, config

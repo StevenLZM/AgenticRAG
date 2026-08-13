@@ -21,6 +21,17 @@ QUERY_STREAM = "agenticrag:jobs:query"
 QUERY_GROUP = "agenticrag-query-workers"
 QUERY_DEAD_STREAM = "agenticrag:jobs:query:dead"
 TERMINAL_RUN_STATUSES = {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED}
+BUSINESS_TERMINAL_REASONS = frozenset(
+    {
+        "completed",
+        "clarify",
+        "refuse",
+        "cannot_answer",
+        "research_action_invalid",
+        "audit_failed",
+        "research_round_limit",
+    }
+)
 
 
 class QueryGraph(Protocol):
@@ -147,15 +158,20 @@ class QueryWorker:
             await self._handle_execution_failure(message, claim, "invalid_graph_result")
             return
         termination = result.get("termination_reason")
+        if not isinstance(termination, str):
+            await self._handle_execution_failure(message, claim, "invalid_termination")
+            return
         if termination == "cancelled":
             terminal = RunStatus.CANCELLED
-        elif termination == "completed":
+        elif termination in BUSINESS_TERMINAL_REASONS:
             terminal = RunStatus.COMPLETED
         else:
             await self._handle_execution_failure(message, claim, "invalid_termination")
             return
         answer = result.get("answer")
-        if answer is not None and not isinstance(answer, dict):
+        if answer is None and terminal is RunStatus.COMPLETED:
+            answer = {"status": termination}
+        if not isinstance(answer, dict) and answer is not None:
             await self._handle_execution_failure(message, claim, "invalid_graph_result")
             return
         await self._finish_and_ack(
