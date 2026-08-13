@@ -223,6 +223,7 @@ agent_runs = Table(
     Column("question", Text, nullable=False, default=""),
     Column("runtime_config_snapshot_id", String(64), nullable=False),
     Column("runtime_config_snapshot", JSON, nullable=False),
+    Column("answer", JSON, nullable=True),
     Column("result_ref", String(1024), nullable=True),
     Column("error_code", String(128), nullable=True),
     Column("termination_reason", String(255), nullable=True),
@@ -364,7 +365,17 @@ def _is_mysql_duplicate_for(error: IntegrityError, constraint_name: str) -> bool
 
 
 class ActiveRunConflict(RuntimeError):
-    """Raised when a user/thread already has a non-terminal run."""
+    """Raised when a user/thread already has a non-terminal run.
+
+    ``existing_run_id`` is server-derived and may be populated after a
+    uniqueness race is resolved by the transaction owner.  Keeping it on the
+    exception lets the HTTP layer emit a safe ``Location`` without parsing
+    provider error strings.
+    """
+
+    def __init__(self, message: str = "active run already exists", existing_run_id: str | None = None) -> None:
+        super().__init__(message)
+        self.existing_run_id = existing_run_id
 
 
 class LeaseLost(RuntimeError):
@@ -391,6 +402,7 @@ class QueryRun:
     result_ref: str | None = None
     error_code: str | None = None
     question: str = ""
+    answer: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +496,8 @@ class RunRepository(Protocol):
 
     async def get_for_delivery(self, run_id: str) -> QueryRun | None: ...
 
+    async def get_active(self, scope: UserScope, thread_id: str) -> QueryRun | None: ...
+
     async def claim(
         self, run_id: str, owner: str, lease_seconds: int
     ) -> QueryRun | None: ...
@@ -508,6 +522,7 @@ class RunRepository(Protocol):
         *,
         owner: str,
         claim_generation: int,
+        answer: dict[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -641,6 +656,7 @@ def _run_from_row(row: dict[str, Any]) -> QueryRun:
         result_ref=row["result_ref"],
         error_code=row["error_code"],
         question=cast(str, row.get("question") or ""),
+        answer=cast(dict[str, Any] | None, row.get("answer")),
     )
 
 
@@ -711,6 +727,24 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                     select(agent_runs).where(
                         agent_runs.c.id == run_id,
                         agent_runs.c.user_id == scope.user_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        return _run_from_row(dict(row)) if row else None
+
+    async def get_active(self, scope: UserScope, thread_id: str) -> QueryRun | None:
+        """Resolve the active Run for a conflict response after rollback."""
+        row = (
+            (
+                await self._session().execute(
+                    select(agent_runs).where(
+                        agent_runs.c.user_id == scope.user_id,
+                        agent_runs.c.thread_id == thread_id,
+                        agent_runs.c.active_slot == 1,
+                        agent_runs.c.status.in_([status.value for status in ACTIVE_RUN_STATUSES]),
                     )
                 )
             )
@@ -876,6 +910,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         *,
         owner: str,
         claim_generation: int,
+        answer: dict[str, Any] | None = None,
     ) -> None:
         if status not in TERMINAL_RUN_STATUSES:
             raise ValueError("finish requires a terminal RunStatus")
@@ -899,6 +934,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                     active_slot=None,
                     result_ref=result_ref,
                     error_code=error_code,
+                    answer=answer,
                     finished_at=now,
                     lease_owner=None,
                     lease_expires_at=None,

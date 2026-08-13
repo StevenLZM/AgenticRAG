@@ -154,7 +154,17 @@ class QueryWorker:
         else:
             await self._handle_execution_failure(message, claim, "invalid_termination")
             return
-        await self._finish_and_ack(message, claim, terminal, None)
+        answer = result.get("answer")
+        if answer is not None and not isinstance(answer, dict):
+            await self._handle_execution_failure(message, claim, "invalid_graph_result")
+            return
+        await self._finish_and_ack(
+            message,
+            claim,
+            terminal,
+            None,
+            answer=cast(dict[str, object] | None, answer),
+        )
 
     async def run_forever(self, *, stop_event: asyncio.Event | None = None) -> None:
         stop = stop_event or asyncio.Event()
@@ -216,11 +226,39 @@ class QueryWorker:
                 with suppress(asyncio.CancelledError):
                     await task
 
-    async def _finish_and_ack(self, message: StreamMessage, claim: QueryRun, status: RunStatus, error_code: str | None) -> None:
-        await self._runs.finish(
-            claim.id, status, None, error_code,
-            owner=self._worker_id, claim_generation=claim.claim_generation,
-        )
+    async def _finish_and_ack(
+        self,
+        message: StreamMessage,
+        claim: QueryRun,
+        status: RunStatus,
+        error_code: str | None,
+        *,
+        answer: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            await self._runs.finish(
+                claim.id,
+                status,
+                None,
+                error_code,
+                owner=self._worker_id,
+                claim_generation=claim.claim_generation,
+                answer=answer,
+            )
+        except TypeError as error:
+            # Keep deployment-owned lightweight Run ports source-compatible
+            # while they migrate to the answer projection.  Do not swallow
+            # unrelated TypeErrors raised inside repository implementations.
+            if "unexpected keyword argument 'answer'" not in str(error):
+                raise
+            await self._runs.finish(
+                claim.id,
+                status,
+                None,
+                error_code,
+                owner=self._worker_id,
+                claim_generation=claim.claim_generation,
+            )
         await self._broker.ack(QUERY_STREAM, QUERY_GROUP, message.id)
 
     async def _dead_letter_and_fail(self, message: StreamMessage, claim: QueryRun, reason: str) -> None:

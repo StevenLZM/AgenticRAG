@@ -120,13 +120,17 @@ async def _scope_error_handler(request: Request, _exc: Exception) -> JSONRespons
 
 
 async def _active_run_handler(request: Request, _exc: Exception) -> JSONResponse:
-    return _response(
+    response = _response(
         request,
         status_code=409,
         error_code="ACTIVE_RUN_EXISTS",
         message="An active run already exists for this thread.",
         retryable=False,
     )
+    existing_run_id = getattr(_exc, "existing_run_id", None)
+    if isinstance(existing_run_id, str) and existing_run_id.strip():
+        response.headers["Location"] = f"/v1/query-runs/{existing_run_id.strip()}"
+    return response
 
 
 async def _dependency_error_handler(request: Request, exc: Exception) -> JSONResponse:

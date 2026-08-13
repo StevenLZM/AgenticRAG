@@ -53,6 +53,7 @@ class Runs:
     creates: int = 0
     outbox_created: list[str] = field(default_factory=list)
     finishes: list[RunStatus] = field(default_factory=list)
+    answers: list[dict[str, object] | None] = field(default_factory=list)
     claimed: int = 0
 
     async def create_queued(
@@ -100,10 +101,11 @@ class Runs:
         self.runs[run_id] = self.run
         return self.run.status
 
-    async def finish(self, run_id: str, status: RunStatus, result_ref: str | None, error_code: str | None, *, owner: str, claim_generation: int) -> None:
+    async def finish(self, run_id: str, status: RunStatus, result_ref: str | None, error_code: str | None, *, owner: str, claim_generation: int, answer: dict[str, object] | None = None) -> None:
         del result_ref, error_code, owner, claim_generation
         assert run_id in self.runs
         self.finishes.append(status)
+        self.answers.append(answer)
         self.run = replace(self.runs[run_id], status=status, active_slot=None)
         self.runs[run_id] = self.run
 
@@ -212,6 +214,7 @@ async def test_worker_claims_invokes_stable_checkpoint_and_acks_only_terminal_ru
 
     assert factory.calls == ["query:user-1:thread-1"]
     assert runs.finishes == [RunStatus.COMPLETED]
+    assert runs.answers == [{"status": "audited"}]
     assert broker.acknowledged == ["1-0"]
 
 

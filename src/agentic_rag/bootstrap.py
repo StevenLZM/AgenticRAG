@@ -17,9 +17,15 @@ from agentic_rag.persistence.checkpoint import CheckpointBackend
 from agentic_rag.persistence.mysql import create_mysql_engine, create_session_factory
 from agentic_rag.persistence.redis_queue import RedisStreamsBroker, StreamBroker
 from agentic_rag.persistence.repositories import (
+    AgentEvent,
     SqlAlchemyDocumentRepository,
+    SqlAlchemyEventRepository,
     SqlAlchemyIngestionJobRepository,
 )
+from agentic_rag.runtime.run_manager import RunManager, TransactionalRunRepository
+from agentic_rag.memory.models import MemoryContext, MemoryRecord
+from agentic_rag.memory.service import MemoryService
+from agentic_rag.domain.models import UserScope
 from agentic_rag.safety.uploads import DefaultUploadSafetyScanner
 
 
@@ -45,6 +51,9 @@ class AppContainer:
     mysql_engine: AsyncEngine
     redis: Redis
     reranker_initialized: bool
+    run_manager: RunManager | None = None
+    event_repository: object | None = None
+    memory_service: MemoryService | None = None
 
     async def close(self) -> None:
         """Attempt cleanup of every process-owned async client."""
@@ -54,6 +63,25 @@ class AppContainer:
             self.mysql_engine.dispose(),
             return_exceptions=True,
         )
+
+
+class _TransactionalEventRepository:
+    """Open a short session per API/graph event operation."""
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._factory = session_factory
+
+    async def append(self, event: AgentEvent) -> int:
+        async with self._factory.begin() as session:
+            return await SqlAlchemyEventRepository(session).append(event)
+
+    async def list_after(
+        self, run_id: str, scope: UserScope, after_id: int, limit: int
+    ) -> list[AgentEvent]:
+        async with self._factory() as session:
+            return await SqlAlchemyEventRepository(session).list_after(
+                run_id, scope, after_id, limit
+            )
 
 
 def build_container(settings: Settings) -> AppContainer:
@@ -74,6 +102,33 @@ def build_container(settings: Settings) -> AppContainer:
         reranker_initialized=reranker_initialized,
     )
     repositories = Repositories(create_session_factory(mysql_engine))
+    event_repository = _TransactionalEventRepository(repositories.session_factory)
+    # Mem0 construction belongs to deployment composition.  Until a client is
+    # injected, this safe no-op implementation exposes no cross-user data and
+    # keeps query creation/status APIs available for local health checks.
+    class _UnavailableMemory:
+        async def load_context(self, scope: UserScope, query: str, limit: int = 10) -> MemoryContext:
+            del scope, query, limit
+            return MemoryContext(degraded=True)
+
+        async def extract_and_store(self, scope: UserScope, run_id: str, messages: object) -> None:
+            del scope, run_id, messages
+
+        async def list(self, scope: UserScope) -> list[MemoryRecord]:
+            del scope
+            return []
+
+        async def delete(self, scope: UserScope, memory_id: str) -> None:
+            del scope, memory_id
+            raise OSError("memory provider is not configured")
+
+        async def reconcile_deletions(self) -> None:
+            return None
+
+    run_manager = RunManager(
+        session_factory=repositories.session_factory,
+        runs=TransactionalRunRepository(repositories.session_factory),
+    )
     document_service = DocumentService(
         scanner=DefaultUploadSafetyScanner(
             max_upload_bytes=settings.max_upload_bytes
@@ -102,4 +157,7 @@ def build_container(settings: Settings) -> AppContainer:
         mysql_engine=mysql_engine,
         redis=redis,
         reranker_initialized=reranker_initialized,
+        run_manager=run_manager,
+        event_repository=event_repository,
+        memory_service=_UnavailableMemory(),  # type: ignore[arg-type]
     )

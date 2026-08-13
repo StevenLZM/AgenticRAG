@@ -10,6 +10,9 @@ from fastapi import FastAPI
 from agentic_rag.api.errors import register_error_handlers
 from agentic_rag.api.health import health_router
 from agentic_rag.api.documents import documents_router
+from agentic_rag.api.feedback import feedback_router
+from agentic_rag.api.memories import memories_router
+from agentic_rag.api.query_runs import query_runs_router
 from agentic_rag.bootstrap import build_container
 from agentic_rag.config import Settings
 
@@ -29,5 +32,8 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.container = container
     app.include_router(health_router)
     app.include_router(documents_router)
+    app.include_router(query_runs_router)
+    app.include_router(memories_router)
+    app.include_router(feedback_router)
     register_error_handlers(app)
     return app
