@@ -28,6 +28,7 @@ class QueryState(TypedDict):
     route: NotRequired[dict[str, JsonValue]]
     research: NotRequired[dict[str, JsonValue]]
     evidence: NotRequired[list[dict[str, JsonValue]]]
+    retrieval_batches: NotRequired[list[dict[str, JsonValue]]]
     packed_context: NotRequired[dict[str, JsonValue]]
     runtime_config_snapshot: dict[str, JsonValue]
     answer: NotRequired[dict[str, JsonValue]]

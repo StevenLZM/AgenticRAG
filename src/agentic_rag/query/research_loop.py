@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel, TypeAdapter, ValidationError
@@ -102,17 +102,20 @@ class ResearchAgentLoop:
         todos = _todos(research.get("todos"))
         observations = _observations(research.get("observations"))
         evidence = _evidence(state)
+        retrieval_batches = _retrieval_batches(state)
         for round_number in range(snapshot.max_research_rounds):
             action = await self._next_action(state, research, todos, observations)
             result = await self._execute(action, context, todos, observations, evidence, state, round_number)
             todos, observations, evidence = result.todos, result.observations, result.evidence
+            retrieval_batches.extend(result.retrieval_batches)
             research = {**research, "todos": _dump_todos(todos), "observations": observations}
             if result.submitted:
-                return _result(research, evidence, submitted=True)
+                return _result(research, evidence, retrieval_batches=retrieval_batches, submitted=True)
             if result.cannot_answer:
                 return _result(
                     {**research, "cannot_answer": True},
                     evidence,
+                    retrieval_batches=retrieval_batches,
                     cannot_answer=True,
                     termination_reason=result.termination_reason or "cannot_answer",
                 )
@@ -125,6 +128,7 @@ class ResearchAgentLoop:
         return _result(
             {**research, "todos": _dump_todos(blocked), "observations": observations},
             evidence,
+            retrieval_batches=retrieval_batches,
             termination_reason="research_round_limit",
         )
 
@@ -203,6 +207,7 @@ class ResearchAgentLoop:
                 todos,
                 [*observations, {"kind": "retrieval", "ok": True, "evidence_ids": [item["evidence_id"] for item in additions]}],
                 merged,
+                retrieval_batches=[_batch.model_dump(mode="json")],
             )
         if isinstance(action, CalculatorCall):
             observation = await self._tools.calculator(action.expression)
@@ -293,6 +298,7 @@ class _Step:
     submitted: bool = False
     cannot_answer: bool = False
     termination_reason: str | None = None
+    retrieval_batches: list[dict[str, object]] = field(default_factory=list)
 
 
 def _parse_action(value: object) -> ResearchAction:
@@ -328,6 +334,11 @@ def _evidence(state: QueryState) -> list[dict[str, object]]:
     return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
 
 
+def _retrieval_batches(state: QueryState) -> list[dict[str, object]]:
+    value = state.get("retrieval_batches")
+    return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
 def _dump_todos(todos: tuple[TodoItem, ...]) -> list[dict[str, object]]:
     return [todo.model_dump(mode="json") for todo in todos]
 
@@ -349,6 +360,7 @@ def _result(
     research: dict[str, object],
     evidence: list[dict[str, object]],
     *,
+    retrieval_batches: list[dict[str, object]] | None = None,
     submitted: bool = False,
     cannot_answer: bool = False,
     termination_reason: str | None = None,
@@ -356,6 +368,7 @@ def _result(
     return {
         "research": {**research, "submitted": submitted, "cannot_answer": cannot_answer},
         "evidence": evidence,
+        "retrieval_batches": retrieval_batches or [],
         "next_node": "generate" if submitted else "end",
         "termination_reason": termination_reason,
     }

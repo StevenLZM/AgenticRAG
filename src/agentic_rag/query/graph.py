@@ -12,7 +12,6 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Protocol, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -31,8 +30,7 @@ from agentic_rag.query.audit import (
 )
 from agentic_rag.query.evidence_builder import (
     EvidenceBuilder,
-    EvidenceItem,
-    EvidenceManifestEntry,
+    EvidenceCoverageTarget,
     PackedEvidence,
 )
 from agentic_rag.query.fast_rag import FastRagDependencies, EvidenceGrader as EvidenceGraderPort, run_fast_rag
@@ -41,6 +39,7 @@ from agentic_rag.query.research_loop import ResearchAgentLoop
 from agentic_rag.query.router import MemoryContextLoader, route_query
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.retrieval.graph import RetrievalService
+from agentic_rag.retrieval.models import EvidenceBatch
 from agentic_rag.runtime.model_gateway import ModelGateway
 
 
@@ -124,7 +123,31 @@ def build_query_graph(
         return update
 
     async def evidence_builder(state: QueryState) -> dict[str, object]:
-        packed = _pack_research_evidence(state)
+        raw_batches = state.get("retrieval_batches")
+        if not isinstance(raw_batches, list) or not raw_batches:
+            return {
+                "packed_context": _empty_pack(state).model_dump(mode="json"),
+                "evidence": [],
+                "errors": [*state.get("errors", []), {"code": "research_batches_missing"}],
+                "termination_reason": "refuse",
+                "next_node": "end",
+            }
+        try:
+            batches = tuple(EvidenceBatch.model_validate(value) for value in raw_batches)
+        except (TypeError, ValueError):
+            return {
+                "packed_context": _empty_pack(state).model_dump(mode="json"),
+                "evidence": [],
+                "errors": [*state.get("errors", []), {"code": "research_batches_invalid"}],
+                "termination_reason": "refuse",
+                "next_node": "end",
+            }
+        packed = dependencies.evidence_builder.build(
+            batches,
+            _coverage_targets(state),
+            scope_from_state(state),
+            snapshot_from_state(state),
+        )
         return {
             "packed_context": packed.model_dump(mode="json"),
             "evidence": [item.model_dump(mode="json") for item in packed.items],
@@ -150,6 +173,13 @@ def build_query_graph(
 
     async def generate(state: QueryState) -> dict[str, object]:
         packed = _packed_from_state(state)
+        if not packed.items:
+            return {
+                "answer": {},
+                "errors": [*state.get("errors", []), {"code": "verified_evidence_missing"}],
+                "termination_reason": "refuse",
+                "next_node": "end",
+            }
         # `generate_with_mandatory_audits` is the sole owner of revision policy;
         # the subsequent two graph nodes expose its completed gate results/events
         # without ever storing the unreviewed draft in checkpoint state.
@@ -209,6 +239,9 @@ def build_query_graph(
     def after_research(state: QueryState) -> str:
         return "evidence_builder" if state.get("next_node") == "generate" else "finalize"
 
+    def after_evidence_builder(state: QueryState) -> str:
+        return "finalize" if state.get("next_node") == "end" else "evidence_grader"
+
     def after_grade(state: QueryState) -> str:
         if state.get("next_node") == "generate":
             return "generate"
@@ -234,7 +267,7 @@ def build_query_graph(
     builder.add_edge("fast_rag", "record_fast_grade")
     builder.add_conditional_edges("record_fast_grade", after_fast_grade, {"generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
     builder.add_conditional_edges("research_agent_loop", after_research, {"evidence_builder": "evidence_builder", "finalize": "finalize"})
-    builder.add_edge("evidence_builder", "evidence_grader")
+    builder.add_conditional_edges("evidence_builder", after_evidence_builder, {"evidence_grader": "evidence_grader", "finalize": "finalize"})
     builder.add_conditional_edges("evidence_grader", after_grade, {"generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
     builder.add_edge("generate", "faithfulness")
     builder.add_edge("faithfulness", "citation")
@@ -264,43 +297,54 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
         "next_node": state.get("next_node"),
     }
     event_digest = hashlib.sha256(
-        json.dumps(event_key_payload, ensure_ascii=False, sort_keys=True, default=str).encode()
+        json.dumps(
+            {"run_id": state["run_id"], **event_key_payload},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode()
     ).hexdigest()[:20]
     event = AgentEvent(
-        event_key=f"{state['run_id']}:{event_type}:{event_digest}",
+        event_key=event_digest,
         trace_id=state["run_id"], run_id=state["run_id"], user_id=scope_from_state(state).user_id,
         event_type=event_type, summary=summary[:1_000], runtime_config_snapshot_id=snapshot.snapshot_id,
-        node_name=event_type.lower(), created_at=datetime.now(UTC),
+        node_name=event_type.lower(),
     )
     await dependencies.event_repository.append(event)
 
 
-def _pack_research_evidence(state: QueryState) -> PackedEvidence:
-    snapshot = snapshot_from_state(state)
-    items = tuple(EvidenceItem.model_validate(value) for value in state.get("evidence", []) if isinstance(value, Mapping))
-    manifest = {
-        item.evidence_id: EvidenceManifestEntry(
-            evidence_id=item.evidence_id, parent_id=item.parent_id, document_id=item.document_id,
-            document_version_id=item.document_version_id, ast_locator=item.ast_locator,
-        ) for item in items
-    }
-    rendered = "\n".join(item.content for item in items)
-    return PackedEvidence(items=items, manifest=manifest, rendered_context=rendered, token_count=len(rendered), index_generation=snapshot.index_generation)
+def _empty_pack(state: QueryState) -> PackedEvidence:
+    return PackedEvidence(
+        items=(), manifest={}, rendered_context="", token_count=0,
+        index_generation=snapshot_from_state(state).index_generation,
+    )
+
+
+def _coverage_targets(state: QueryState) -> tuple[EvidenceCoverageTarget, ...]:
+    targets: list[EvidenceCoverageTarget] = [
+        EvidenceCoverageTarget(target_id=f"query:{state['run_id']}", description=question_from_state(state))
+    ]
+    research = state.get("research")
+    todos = research.get("todos") if isinstance(research, Mapping) else None
+    if isinstance(todos, list):
+        for todo in todos:
+            if not isinstance(todo, Mapping):
+                continue
+            todo_id = todo.get("id")
+            title = todo.get("title")
+            if isinstance(todo_id, str) and isinstance(title, str) and title.strip():
+                targets.append(EvidenceCoverageTarget(target_id=todo_id, description=title.strip()))
+    return tuple(dict((target.target_id, target) for target in targets).values())
 
 
 def _packed_from_state(state: QueryState) -> PackedEvidence:
     packed = state.get("packed_context")
     if not isinstance(packed, Mapping):
-        return _pack_research_evidence(state)
+        return _empty_pack(state)
     try:
         result = PackedEvidence.model_validate(packed)
     except (TypeError, ValueError):
-        return _pack_research_evidence(state)
-    # LangGraph's TypedDict coercion can preserve a partial/empty NotRequired
-    # value under a state merge.  Evidence itself is the source of truth, so a
-    # non-empty evidence list repairs that incomplete checkpoint projection.
-    if not result.items and state.get("evidence"):
-        return _pack_research_evidence(state)
+        return _empty_pack(state)
     return result
 
 

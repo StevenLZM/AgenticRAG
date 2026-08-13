@@ -112,10 +112,22 @@ class FakeResearchLoop:
 @dataclass
 class EventLog:
     types: list[str] = field(default_factory=list)
+    events: list[object] = field(default_factory=list)
 
     async def append(self, event: object) -> int:
         self.types.append(getattr(event, "event_type"))
+        self.events.append(event)
         return len(self.types)
+
+
+@dataclass
+class RecordingEvidenceBuilder:
+    delegate: EvidenceBuilder = field(default_factory=EvidenceBuilder)
+    calls: list[tuple[object, object, object, object]] = field(default_factory=list)
+
+    def build(self, batches: object, targets: object, scope: object, snapshot: object) -> object:
+        self.calls.append((batches, targets, scope, snapshot))
+        return self.delegate.build(batches, targets, scope, snapshot)  # type: ignore[arg-type]
 
 
 class Resolver:
@@ -142,7 +154,7 @@ def _state() -> dict[str, object]:
     )
 
 
-def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research: dict[str, object] | None = None) -> tuple[object, FakeMemory, FakeRetrieval, EventLog]:
+def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research: dict[str, object] | None = None, evidence_builder: object | None = None) -> tuple[object, FakeMemory, FakeRetrieval, EventLog]:
     from agentic_rag.query.audit import CitationValidator, FaithfulnessAuditor
     from agentic_rag.query.graph import QueryGraphDependencies
 
@@ -166,9 +178,13 @@ def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research:
     event_log = EventLog()
     configured_grades = [EvidenceGrade(decision=value) for value in (grades or ["sufficient"])]
     deps = QueryGraphDependencies(
-        memory=memory, gateway=gateway, retrieval=retrieval, evidence_builder=EvidenceBuilder(),
+        memory=memory, gateway=gateway, retrieval=retrieval, evidence_builder=evidence_builder or EvidenceBuilder(),
         evidence_grader=FakeGrader(configured_grades),
-        research_loop=FakeResearchLoop(research or {"research": {"submitted": True}, "evidence": [], "next_node": "generate", "termination_reason": None}),
+        research_loop=FakeResearchLoop(research or {
+            "research": {"submitted": True},
+            "retrieval_batches": [_batch().model_dump(mode="json")],
+            "evidence": [], "next_node": "generate", "termination_reason": None,
+        }),
         generator=Generator(), faithfulness_auditor=FaithfulnessAuditor(gateway),
         citation_validator=CitationValidator(), authorization_resolver=Resolver(), event_repository=event_log,
     )
@@ -225,3 +241,44 @@ async def test_graph_propagates_cancellation_from_research_loop() -> None:
 
     with pytest.raises(NodeCancelledError):
         await build_query_graph(deps).ainvoke(_state())
+
+
+async def test_research_evidence_builder_uses_verified_batches_and_targets() -> None:
+    from agentic_rag.query.graph import build_query_graph
+
+    recording = RecordingEvidenceBuilder()
+    deps, _memory, _retrieval, _events = _deps(
+        route="research",
+        evidence_builder=recording,
+        research={
+            "research": {"submitted": True},
+            "retrieval_batches": [_batch().model_dump(mode="json")],
+            "evidence": [],
+            "next_node": "generate",
+            "termination_reason": None,
+        },
+    )
+    result = await build_query_graph(deps).ainvoke(_state())
+
+    assert result["termination_reason"] == "completed"
+    assert len(recording.calls) == 1
+    batches, targets, scope, snapshot = recording.calls[0]
+    assert len(batches) == 1
+    assert targets[0].target_id == "query:run-1"
+    assert targets[0].description == "What notice is required?"
+    assert scope == SCOPE
+    assert snapshot.index_generation == SNAPSHOT.index_generation
+
+
+async def test_event_replay_has_stable_key_and_no_dynamic_timestamp() -> None:
+    from agentic_rag.query.graph import _event
+
+    deps, _memory, _retrieval, events = _deps()
+    state = _state()
+    await _event(deps, state, "ANSWER_FINALIZED", "completed")
+    await _event(deps, state, "ANSWER_FINALIZED", "completed")
+
+    assert len(events.events) == 2
+    assert events.events[0].event_key == events.events[1].event_key
+    assert events.events[0].created_at is None
+    assert events.events[1].created_at is None
