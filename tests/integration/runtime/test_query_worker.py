@@ -268,6 +268,7 @@ async def test_worker_emits_safe_queue_wait_event_when_emitter_is_injected() -> 
 
     queue_event = next(call for call in emitter.calls if call["event_type"] == "QUEUE_WAITED")
     assert queue_event["attributes"]["queue_wait_seconds"] >= 0
+    assert queue_event["event_key"] == stable_event_key(run.id, "1-0", "QUEUE_WAITED")
 
 
 async def test_worker_emits_stable_run_lifecycle_and_latency_events() -> None:

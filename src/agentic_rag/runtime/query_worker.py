@@ -159,7 +159,7 @@ class QueryWorker:
                     event_type="QUEUE_WAITED",
                     summary="completed",
                     event_key=stable_event_key(
-                        claim.id, message.id, str(claim.claim_generation), "QUEUE_WAITED"
+                        claim.id, message.id, "QUEUE_WAITED"
                     ),
                     attributes={"queue_wait_seconds": queue_wait},
                 )
