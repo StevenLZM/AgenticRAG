@@ -2,7 +2,7 @@
 
 > 快照日期：2026-08-14
 >
-> 当前状态：Phase 1–4 已完成并通过独立审查；Phase 5 Task 1 已完成并通过四轮独立审查。当前实现位于独立 worktree，尚未合并到 `main`。
+> 当前状态：Phase 1–4 已完成并通过独立审查；Phase 5 Task 1–2 已完成并通过独立审查。当前实现位于独立 worktree，尚未合并到 `main`。
 >
 > 本文档是恢复开发时的首要状态入口；详细设计、接口约束和任务拆分以文末权威文档为准。
 
@@ -34,9 +34,9 @@ git log -5 --oneline
 | Phase 2：Document Ingestion | 完成 | 6/6 | 安全上传、Docling AST、Parent/Child、Embedding、发布/对账、可恢复 Worker |
 | Phase 3：Retrieval and Evidence | 完成 | 6/6 | Dense/BM25、RRF/Rerank、Parent 聚合、降级检索图、EvidenceBuilder |
 | Phase 4：Query and Agent Runtime | 完成 | 9/9 | ModelGateway、Memory、Fast/Research、Subagent、审计、QueryGraph、Worker、API |
-| Phase 5：Evaluation and Operations | 进行中 | 1/5 | 本地 Trace/在线指标已完成；评测、负载/恢复、备份恢复和最终验收待完成 |
+| Phase 5：Evaluation and Operations | 进行中 | 2/5 | 本地 Trace/在线指标与确定性评测已完成；Ragas、负载/恢复、备份恢复和最终验收待完成 |
 
-**总体完成：`28/32` 个路线图任务，约 `87.5%`。**
+**总体完成：`29/32` 个路线图任务，约 `90.6%`。**
 
 ## 3. 已实现能力
 
@@ -87,14 +87,21 @@ Phase 4 当前具备的关键边界：
 - QueryGraph、QueryWorker、ModelGateway、Tool/Memory/Retrieval/Rerank/Audit 边界已接入共享快照遥测；Graph/Worker 生命周期事件使用稳定 event key，Redis 重领取不会重复队列指标，lease 丢失不会伪造终态事件。
 - `MetricsProjector` 支持 cursor/reducer 跨页累计 queue/run/node latency、retrieval、token/call、citation、repair、degraded、feedback、outbox/lease/reconciler 和业务终态指标。无可信定价来源时 `estimated_cost_status=unavailable`，不把零值伪装成成本估算；只有带安全成本字段的观察事件才标记 `observed`。
 
+Task 2（`7aac8d8`，基线实现 `fff7ea5`）已完成：
+
+- 新增纯离线 `evals` 包和严格 `EvaluationCase`、`IngestionFidelityCase`、`SecurityCase` 模型；拒绝未知字段、非 JSON/非有限值、敏感/provider 字段、重复 ID、路径穿越和非严格类型转换。
+- Recall@k、MRR、NDCG@k 使用 binary relevance，先按原始排名位置截取 top-k，再在窗口内去重；重复事件按稳定 `event_key` 去重，并按 `user_id` 与 `runtime_config_snapshot_id` fail-closed 过滤。
+- 固定数据集已纳入 wheel：baseline 24（8 single-hop、8 multi-hop、4 scanned-PDF、4 Excel）、ingestion fidelity 13、security 12；CLI 为 `python -m evals.validate_datasets evals/datasets`。
+
 ## 4. 最近验证证据
 
-验证基于实现分支最终提交 `8729171`，使用 `conda` 环境 `agentic-rag`：
+验证基于实现分支最终提交 `7aac8d8`，使用 `conda` 环境 `agentic-rag`：
 
 ```text
-full importlib test suite: 470 passed, 38 skipped
+full importlib test suite: 493 passed, 38 skipped
 Task 1 focused observability/graph/worker/model suite: 70 passed
-Task 1 related runtime/query/observability/persistence subset: 161 passed
+Task 2 focused evaluation suite: 23 passed
+Task 2 related retrieval/query/observability subset: 140 passed
 ruff check src tests: All checks passed
 mypy Task 1 changed source: no issues found
 git diff --check b83b716..8729171: clean
@@ -127,7 +134,7 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 
 ## 6. 尚未实现与上线前注意事项
 
-- Phase 5 仍缺少四项交付：确定性检索与 AgentLoop 评测、Ragas 离线报告、对抗/负载/恢复测试、备份恢复/就绪检查/最终验收。
+- Phase 5 仍缺少三项交付：Ragas 离线报告、对抗/负载/恢复测试、备份恢复/就绪检查/最终验收。
 - 当前 V1 只有 `user_id` 命名空间隔离，没有完整鉴权、RBAC 或用户身份解析；生产入口不能继续依赖 `default_user`。
 - Memory 的真实 Mem0 provider 由部署注入；未配置时服务会 fail-closed，不应把 no-op 结果当作生产记忆。
 - Elasticsearch、MySQL、Redis、Mem0 的真实联调尚未在本环境执行；上线前必须使用独立测试资源完成门禁。
@@ -135,13 +142,13 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 
 ## 7. 下一次开发的准确起点
 
-下一任务是 **Phase 5 Task 2：Deterministic Retrieval and AgentLoop Evaluation**。
+下一任务是 **Phase 5 Task 3：Offline Ragas Runner and Reproducible Reports**。
 
 恢复步骤：
 
-1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净、HEAD 为 `8729171` 或其后续 docs-only 提交。
-2. 运行 Phase 4 与 Task 1 回归门禁，确认 Query Worker/API/审计/遥测没有回归。
-3. 完整阅读 Phase 5 计划与全局约束，为 Task 2 编写 RED 测试和独立 brief。
+1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净、HEAD 为 `7aac8d8` 或其后续 docs-only 提交。
+2. 运行 Phase 4、Task 1 和 Task 2 回归门禁，确认 Query Worker/API/审计/遥测/评测没有回归。
+3. 完整阅读 Phase 5 计划与全局约束，为 Task 3 编写 RED 测试和独立 brief。
 4. 配置可丢弃的 MySQL/Redis/Elasticsearch 测试资源；有 Mem0 provider 时再启用真实 Memory 集成。
 5. 按 TDD、实现报告、独立 reviewer、fix/re-review 流程推进，不跳过评测的可重复性和运行时指标契约。
 
@@ -149,7 +156,8 @@ Phase 5 顺序：
 
 ```text
 Trace Recorder + Online Metrics (complete)
-  -> Deterministic Retrieval/AgentLoop Evaluation (next)
+  -> Deterministic Retrieval/AgentLoop Evaluation (complete)
+  -> Offline Ragas Reports (next)
   -> Offline Ragas Reports
   -> Adversarial/Load/Recovery Suites
   -> Backup/Restore/Readiness/Final Acceptance
