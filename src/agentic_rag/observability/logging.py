@@ -8,6 +8,8 @@ metadata.
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -28,8 +30,17 @@ _SENSITIVE_KEY_PARTS = (
     "reasoning",
     "secret",
     "tool_args",
+    "tool_input",
+    "tool_output",
     "tool_payload",
     "tool_result",
+    "tool_response",
+    "chain_of_thought",
+    "hidden_reasoning",
+    "message",
+    "provider_payload",
+    "raw_payload",
+    "payload",
 )
 _SENSITIVE_VALUE = re.compile(
     r"(?:\b(?:api[_ -]?key|authorization|bearer|password|secret)\b|\bsk-[A-Za-z0-9_-]+)",
@@ -37,6 +48,24 @@ _SENSITIVE_VALUE = re.compile(
 )
 _MAX_ATTRIBUTE_DEPTH = 8
 _MAX_ATTRIBUTE_STRING_LENGTH = 1_000
+_SAFE_SUMMARIES = frozenset(
+    {
+        "completed",
+        "started",
+        "cancelled",
+        "failed",
+        "sufficient",
+        "insufficient",
+        "clarify",
+        "refuse",
+        "progress update",
+        "model_completed",
+        "queue_waited",
+        "retrieval_completed",
+        "citation_validated",
+    }
+)
+_EVENT_KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -61,7 +90,9 @@ def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
 def sanitize_summary(summary: str) -> str:
     """Keep a bounded operational summary without credential-like content."""
     candidate = summary.strip()[:1_000]
-    return "redacted telemetry event" if _SENSITIVE_VALUE.search(candidate) else candidate
+    if _SENSITIVE_VALUE.search(candidate):
+        return "telemetry event"
+    return candidate if candidate.casefold() in _SAFE_SUMMARIES else "telemetry event"
 
 
 def structured_log_record(
@@ -112,14 +143,19 @@ class AgentEventEmitter:
             raise ValueError("run_id, user_id, and event_type must not be blank")
         safe_attributes = sanitize_attributes(attributes)
         key = event_key or uuid4().hex
-        if len(key) > 64:
-            raise ValueError("event_key must be at most 64 characters")
+        if _EVENT_KEY.fullmatch(key) is None:
+            raise ValueError("event_key must use only letters, digits, underscores, or hyphens")
         payload_ref: str | None = None
         if safe_attributes and self._artifacts is not None:
-            ref = self._artifacts.put_json(
-                f"observability/events/{key}.json",
-                {"attributes": safe_attributes},
-            )
+            payload = {"attributes": safe_attributes}
+            digest = _artifact_digest(user_id, run_id, key, payload)
+            path = f"observability/events/{digest}.json"
+            try:
+                ref = self._artifacts.describe(f"artifact://{path}")
+                if self._artifacts.read_json(ref) != payload:
+                    raise RuntimeError("observability artifact hash collision")
+            except FileNotFoundError:
+                ref = self._artifacts.put_json(path, payload)
             payload_ref = ref.uri
         event = AgentEvent(
             event_key=key,
@@ -167,3 +203,21 @@ def _sanitize_value(value: Any, *, depth: int) -> Any:
         items = [_sanitize_value(item, depth=depth + 1) for item in value]
         return [item for item in items if item is not _OMIT]
     return _OMIT
+
+
+def _artifact_digest(
+    user_id: str, run_id: str, event_key: str, payload: Mapping[str, Any]
+) -> str:
+    """Address artifact content without exposing caller-controlled path segments."""
+    encoded = json.dumps(
+        {
+            "user_id": user_id,
+            "run_id": run_id,
+            "event_key": event_key,
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

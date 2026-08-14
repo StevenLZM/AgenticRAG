@@ -218,6 +218,28 @@ async def test_worker_claims_invokes_stable_checkpoint_and_acks_only_terminal_ru
     assert broker.acknowledged == ["1-0"]
 
 
+async def test_worker_records_queue_span_when_trace_recorder_is_injected() -> None:
+    """The worker's actual claim-to-finish path owns queue latency tracing."""
+    from agentic_rag.observability.tracing import TraceRecorder
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="What notice applies?")
+    broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+    recorder = TraceRecorder(runtime_config_snapshot_id=SNAPSHOT.snapshot_id)
+    worker = QueryWorker(
+        runs=runs,
+        broker=broker,
+        graph_factory=lambda **_: _Graph(),
+        worker_id="worker-1",
+        trace_recorder=recorder,
+    )
+
+    await worker.run_one()
+
+    assert any(span.name == "queue" and span.run_id == run.id for span in recorder.events)
+
+
 @pytest.mark.parametrize(
     "termination_reason",
     [

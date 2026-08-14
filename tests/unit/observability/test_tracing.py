@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from agentic_rag.observability.logging import AgentEventEmitter, structured_log_record
+from agentic_rag.observability.logging import (
+    AgentEventEmitter,
+    sanitize_attributes,
+    sanitize_summary,
+    structured_log_record,
+)
+from agentic_rag.persistence.artifacts import LocalArtifactStore
 from agentic_rag.persistence.repositories import AgentEvent
 from agentic_rag.observability.tracing import TraceRecorder
 
@@ -70,6 +77,20 @@ async def test_span_marks_error_without_storing_exception_message(
     assert "private provider payload" not in json.dumps(event.model_dump())
 
 
+async def test_trace_context_rejects_cross_recorder_or_cross_run_nesting() -> None:
+    """A run must never inherit trace context from a different recorder or run."""
+    first = TraceRecorder(runtime_config_snapshot_id="snapshot-1")
+    second = TraceRecorder(runtime_config_snapshot_id="snapshot-2")
+
+    async with first.span("queue", run_id="run-1"):
+        with pytest.raises(RuntimeError, match="recorder"):
+            async with second.span("graph.node", run_id="run-1"):
+                pass
+        with pytest.raises(RuntimeError, match="run_id"):
+            async with first.span("graph.node", run_id="run-2"):
+                pass
+
+
 def test_structured_log_record_removes_sensitive_fields() -> None:
     """The log adapter must use the same privacy boundary as trace attributes."""
     record = structured_log_record(
@@ -80,6 +101,26 @@ def test_structured_log_record_removes_sensitive_fields() -> None:
     assert record["event"] == "model_completed"
     assert record["attributes"] == {"input_tokens": 8}
     assert "secret" not in json.dumps(record)
+
+
+def test_privacy_sanitizers_fail_closed_for_raw_prompt_and_tool_fields() -> None:
+    """Unknown summaries and all raw user/model/tool channels are never telemetry."""
+    attributes = sanitize_attributes(
+        {
+            "tool_input": {"query": "private"},
+            "tool_output": "private result",
+            "tool_response": "private response",
+            "chain_of_thought": "private reasoning",
+            "hidden_reasoning": "private reasoning",
+            "messages": [{"content": "private prompt"}],
+            "provider_payload": {"response": "private"},
+            "input_tokens": 8,
+        }
+    )
+
+    assert attributes == {"input_tokens": 8}
+    assert sanitize_summary("summarize this private user prompt") == "telemetry event"
+    assert sanitize_summary("completed") == "completed"
 
 
 class RecordingEventRepository:
@@ -118,3 +159,54 @@ async def test_event_emitter_replay_leaves_timestamp_to_repository() -> None:
     )
 
     assert [event.created_at for event in repository.events] == [None, None]
+
+
+async def test_emitter_artifact_path_is_immutable_and_not_controlled_by_event_key(
+    tmp_path: Path,
+) -> None:
+    """A conflicting replay must not rewrite the first event's safe artifact."""
+    repository = RecordingEventRepository()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(
+        repository, artifacts, runtime_config_snapshot_id="snapshot-1"
+    )
+    first_id = await emitter.emit(
+        run_id="run-1",
+        user_id="user-1",
+        event_type="LLM_COMPLETED",
+        event_key="same-key",
+        attributes={"input_tokens": 1},
+    )
+    first = repository.events[first_id - 1]
+    assert first.payload_ref is not None
+    first_ref = artifacts.describe(first.payload_ref)
+
+    await emitter.emit(
+        run_id="run-1",
+        user_id="user-1",
+        event_type="LLM_COMPLETED",
+        event_key="same-key",
+        attributes={"input_tokens": 2},
+    )
+    second = repository.events[-1]
+    assert second.payload_ref is not None
+    assert second.payload_ref != first.payload_ref
+    assert "same-key" not in first.payload_ref
+    assert artifacts.read_json(first_ref) == {"attributes": {"input_tokens": 1}}
+
+    third_id = await emitter.emit(
+        run_id="run-1",
+        user_id="user-2",
+        event_type="LLM_COMPLETED",
+        event_key="same-key",
+        attributes={"input_tokens": 1},
+    )
+    assert repository.events[third_id - 1].payload_ref != first.payload_ref
+
+    with pytest.raises(ValueError, match="event_key"):
+        await emitter.emit(
+            run_id="run-1",
+            user_id="user-1",
+            event_type="LLM_COMPLETED",
+            event_key="../path-alias",
+        )

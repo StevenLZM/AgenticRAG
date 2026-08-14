@@ -119,3 +119,72 @@ async def test_metrics_projection_ignores_other_snapshot_events(tmp_path) -> Non
 
     assert projection.events_processed == 0
     assert projection.metrics["input_tokens"] == 0
+
+
+@pytest.mark.integration
+async def test_metrics_projection_carries_started_times_across_pages(tmp_path) -> None:
+    """A page boundary must not erase run/node starts needed by the next page."""
+    repository = RecordingEventRepository()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    started = datetime(2026, 8, 4, tzinfo=UTC)
+    for event_type, node_name, offset in (
+        ("RUN_STARTED", None, 0),
+        ("GRAPH_NODE_STARTED", "retrieve", 1),
+        ("GRAPH_NODE_COMPLETED", "retrieve", 4),
+        ("RUN_COMPLETED", None, 6),
+    ):
+        await emitter.emit(
+            run_id="run-1",
+            user_id="user-1",
+            event_type=event_type,
+            node_name=node_name,
+            created_at=started + timedelta(seconds=offset),
+        )
+
+    projector = MetricsProjector(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    first = await projector.project_window(
+        run_id="run-1", scope=UserScope(user_id="user-1"), limit=2
+    )
+    second = await projector.project_window(
+        run_id="run-1",
+        scope=UserScope(user_id="user-1"),
+        after_id=first.through_id,
+        limit=2,
+        reducer_state=first.reducer_state,
+    )
+
+    assert second.metrics["node_latency_seconds"] == 3.0
+    assert second.metrics["run_latency_seconds"] == 6.0
+
+
+@pytest.mark.integration
+async def test_metrics_rates_deduplicate_repeated_outcomes_per_run(tmp_path) -> None:
+    """Repeated event delivery must not produce invalid rates above one."""
+    repository = RecordingEventRepository()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    for event_type, attributes in (
+        ("RUN_COMPLETED", {"termination_reason": "refuse"}),
+        ("REFUSED", {}),
+        ("REFUSED", {}),
+        ("AUDIT_REPAIR", {}),
+        ("AUDIT_REPAIR", {}),
+        ("COMPONENT_DEGRADED", {}),
+        ("COMPONENT_DEGRADED", {}),
+    ):
+        await emitter.emit(
+            run_id="run-1",
+            user_id="user-1",
+            event_type=event_type,
+            attributes=attributes,
+        )
+
+    projection = await MetricsProjector(
+        repository, artifacts, runtime_config_snapshot_id="snapshot-1"
+    ).project_window(run_id="run-1", scope=UserScope(user_id="user-1"))
+
+    assert projection.metrics["refusal_rate"] == 1.0
+    assert projection.metrics["repair_rate"] == 1.0
+    assert projection.metrics["degraded_component_rate"] == 1.0
+    assert all(value <= 1.0 for key, value in projection.metrics.items() if key.endswith("_rate"))

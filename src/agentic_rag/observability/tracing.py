@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
@@ -35,7 +36,15 @@ class SpanRecord(BaseModel):
         return super().model_dump(**kwargs)
 
 
-_ACTIVE_SPANS: ContextVar[tuple[SpanRecord, ...] | None] = ContextVar(
+@dataclass(frozen=True, slots=True)
+class _TraceContext:
+    recorder: "TraceRecorder"
+    run_id: str
+    snapshot_id: str
+    spans: tuple[SpanRecord, ...]
+
+
+_ACTIVE_SPANS: ContextVar[_TraceContext | None] = ContextVar(
     "agentic_rag_active_spans", default=None
 )
 
@@ -84,7 +93,7 @@ class LocalSpan:
         self._record: SpanRecord | None = None
         self._index: int | None = None
         self._root_index: int | None = None
-        self._token: Token[tuple[SpanRecord, ...] | None] | None = None
+        self._token: Token[_TraceContext | None] | None = None
 
     @property
     def record(self) -> SpanRecord:
@@ -93,11 +102,15 @@ class LocalSpan:
         return self._record
 
     async def __aenter__(self) -> "LocalSpan":
-        active = _ACTIVE_SPANS.get()
-        if active:
-            parent = active[-1]
+        context = _ACTIVE_SPANS.get()
+        if context:
+            if context.recorder is not self._recorder:
+                raise RuntimeError("cannot nest spans from a different recorder")
+            if context.run_id != self._run_id:
+                raise RuntimeError("cannot nest spans with a different run_id")
+            parent = context.spans[-1]
             trace_id = parent.trace_id
-            stack = active
+            stack = context.spans
         else:
             implicit_root = SpanRecord(
                 trace_id=uuid4().hex,
@@ -131,7 +144,14 @@ class LocalSpan:
         )
         self._index = len(self._recorder.events)
         self._recorder.events.append(self._record)
-        self._token = _ACTIVE_SPANS.set((*stack, self._record))
+        self._token = _ACTIVE_SPANS.set(
+            _TraceContext(
+                recorder=self._recorder,
+                run_id=self._run_id,
+                snapshot_id=self._recorder.runtime_config_snapshot_id,
+                spans=(*stack, self._record),
+            )
+        )
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> bool:

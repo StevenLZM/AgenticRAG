@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Protocol, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agentic_rag.domain.models import RunStatus, UserScope
+from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.redis_queue import StreamBroker, StreamMessage
 from agentic_rag.persistence.repositories import LeaseLost, QueryRun, RunRepository
 from agentic_rag.query.state import new_query_state
@@ -83,6 +85,7 @@ class QueryWorker:
         reclaim_idle_ms: int = 30_000,
         block_ms: int = 1_000,
         max_attempts: int = 3,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must not be blank")
@@ -105,6 +108,7 @@ class QueryWorker:
         self._reclaim_idle_ms = reclaim_idle_ms
         self._block_ms = block_ms
         self._max_attempts = max_attempts
+        self._trace_recorder = trace_recorder
 
     async def run_one(self) -> bool:
         """Drain one Redis delivery batch, preferring reclaimed messages first."""
@@ -128,6 +132,24 @@ class QueryWorker:
             if existing is not None and existing.status in TERMINAL_RUN_STATUSES:
                 await self._broker.ack(QUERY_STREAM, QUERY_GROUP, message.id)
             return
+        snapshot = RuntimeConfigSnapshot.model_validate(claim.runtime_config_snapshot)
+        if (
+            self._trace_recorder is not None
+            and self._trace_recorder.runtime_config_snapshot_id == snapshot.snapshot_id
+        ):
+            queue_wait = max(
+                0.0, (datetime.now(UTC) - message.enqueued_at).total_seconds()
+            )
+            async with self._trace_recorder.span(
+                "queue", run_id=claim.id, attributes={"queue_wait_seconds": queue_wait}
+            ):
+                await self._process_claimed_message(message, claim)
+            return
+        await self._process_claimed_message(message, claim)
+
+    async def _process_claimed_message(
+        self, message: StreamMessage, claim: QueryRun
+    ) -> None:
         if claim.status is RunStatus.CANCEL_REQUESTED:
             await self._finish_and_ack(message, claim, RunStatus.CANCELLED, None)
             return

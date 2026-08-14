@@ -154,7 +154,7 @@ def _state() -> dict[str, object]:
     )
 
 
-def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research: dict[str, object] | None = None, evidence_builder: object | None = None) -> tuple[object, FakeMemory, FakeRetrieval, EventLog]:
+def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research: dict[str, object] | None = None, evidence_builder: object | None = None, trace_recorder: object | None = None) -> tuple[object, FakeMemory, FakeRetrieval, EventLog]:
     from agentic_rag.query.audit import CitationValidator, FaithfulnessAuditor
     from agentic_rag.query.graph import QueryGraphDependencies
 
@@ -187,6 +187,7 @@ def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research:
         }),
         generator=Generator(), faithfulness_auditor=FaithfulnessAuditor(gateway),
         citation_validator=CitationValidator(), authorization_resolver=Resolver(), event_repository=event_log,
+        trace_recorder=trace_recorder,
     )
     return deps, memory, retrieval, event_log
 
@@ -202,6 +203,20 @@ async def test_fast_path_loads_memory_once_and_emits_all_audit_gates_in_order() 
     assert retrieval.calls == 1
     assert events.types.index("EVIDENCE_GRADED") < events.types.index("FAITHFULNESS_AUDITED") < events.types.index("CITATION_VALIDATED")
     assert json.loads(json.dumps(result)) == result
+
+
+async def test_real_query_graph_records_lane_spans_when_trace_recorder_is_injected() -> None:
+    """Instrumentation must wrap real graph boundaries, not manual span calls."""
+    from agentic_rag.observability.tracing import TraceRecorder
+    from agentic_rag.query.graph import build_query_graph
+
+    recorder = TraceRecorder(runtime_config_snapshot_id=SNAPSHOT.snapshot_id)
+    deps, _memory, _retrieval, _events = _deps(trace_recorder=recorder)
+    result = await build_query_graph(deps).ainvoke(_state())
+
+    assert result["termination_reason"] == "completed"
+    names = {span.name for span in recorder.events}
+    assert {"graph.node.memory_loader", "memory", "llm", "retrieval", "rerank", "audit"} <= names
 
 
 async def test_insufficient_fast_evidence_escalates_to_research_before_audits() -> None:
