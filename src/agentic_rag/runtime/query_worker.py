@@ -11,6 +11,7 @@ from typing import Protocol, cast
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agentic_rag.domain.models import RunStatus, UserScope
+from agentic_rag.observability.logging import AgentEventEmitter
 from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.redis_queue import StreamBroker, StreamMessage
 from agentic_rag.persistence.repositories import LeaseLost, QueryRun, RunRepository
@@ -86,6 +87,7 @@ class QueryWorker:
         block_ms: int = 1_000,
         max_attempts: int = 3,
         trace_recorder: TraceRecorder | None = None,
+        event_emitter: AgentEventEmitter | None = None,
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must not be blank")
@@ -109,6 +111,7 @@ class QueryWorker:
         self._block_ms = block_ms
         self._max_attempts = max_attempts
         self._trace_recorder = trace_recorder
+        self._event_emitter = event_emitter
 
     async def run_one(self) -> bool:
         """Drain one Redis delivery batch, preferring reclaimed messages first."""
@@ -133,13 +136,24 @@ class QueryWorker:
                 await self._broker.ack(QUERY_STREAM, QUERY_GROUP, message.id)
             return
         snapshot = RuntimeConfigSnapshot.model_validate(claim.runtime_config_snapshot)
+        queue_wait = max(0.0, (datetime.now(UTC) - message.enqueued_at).total_seconds())
+        if self._event_emitter is not None:
+            try:
+                await self._event_emitter.emit(
+                    run_id=claim.id,
+                    user_id=claim.user_id,
+                    event_type="QUEUE_WAITED",
+                    summary="completed",
+                    attributes={"queue_wait_seconds": queue_wait},
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                pass
         if (
             self._trace_recorder is not None
             and self._trace_recorder.runtime_config_snapshot_id == snapshot.snapshot_id
         ):
-            queue_wait = max(
-                0.0, (datetime.now(UTC) - message.enqueued_at).total_seconds()
-            )
             async with self._trace_recorder.span(
                 "queue", run_id=claim.id, attributes={"queue_wait_seconds": queue_wait}
             ):

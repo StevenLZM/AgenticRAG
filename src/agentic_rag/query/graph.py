@@ -22,6 +22,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from agentic_rag.memory.models import PublicMessage
 from agentic_rag.memory.service import MemoryService
+from agentic_rag.observability.logging import AgentEventEmitter
 from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.repositories import AgentEvent, EventRepository
 from agentic_rag.query.audit import (
@@ -67,6 +68,7 @@ class QueryGraphDependencies:
     authorization_resolver: EvidenceAuthorizationResolver
     event_repository: EventRepository | QueryGraphEventRecorder | None = None
     trace_recorder: TraceRecorder | None = None
+    event_emitter: AgentEventEmitter | None = None
 
 
 def query_checkpoint_config(state: QueryState) -> RunnableConfig:
@@ -120,7 +122,12 @@ def build_query_graph(
             async with _trace_span(dependencies, state, "retrieval"):
                 async with _trace_span(dependencies, state, "rerank"):
                     update = await run_fast_rag(state, fast_dependencies)
-        await _event(dependencies, state, "FAST_RAG_COMPLETED", str(update.get("next_node", "research_agent")))
+        await _event(
+            dependencies,
+            cast(QueryState, {**state, **update}),
+            "FAST_RAG_COMPLETED",
+            str(update.get("next_node", "research_agent")),
+        )
         return update
 
     async def record_fast_grade(state: QueryState) -> dict[str, object]:
@@ -131,7 +138,8 @@ def build_query_graph(
     async def research_agent_loop(state: QueryState) -> dict[str, object]:
         async with _trace_span(dependencies, state, "graph.node.research_agent_loop"):
             async with _trace_span(dependencies, state, "retrieval"):
-                update = await dependencies.research_loop.ainvoke(state)
+                async with _trace_span(dependencies, state, "tool"):
+                    update = await dependencies.research_loop.ainvoke(state)
         await _event(dependencies, state, "RESEARCH_LOOP_COMPLETED", str(update.get("next_node", "end")))
         return update
 
@@ -323,6 +331,23 @@ async def _trace_span(
 
 
 async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_type: str, summary: str) -> None:
+    if dependencies.event_emitter is not None:
+        if dependencies.event_emitter.runtime_config_snapshot_id != snapshot_from_state(state).snapshot_id:
+            return
+        try:
+            await dependencies.event_emitter.emit(
+                run_id=state["run_id"],
+                user_id=scope_from_state(state).user_id,
+                event_type=event_type,
+                node_name=event_type.lower(),
+                summary="completed",
+                attributes=_event_attributes(state, event_type),
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            pass
+        return
     if dependencies.event_repository is None:
         return
     snapshot = snapshot_from_state(state)
@@ -349,6 +374,39 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
         node_name=event_type.lower(),
     )
     await dependencies.event_repository.append(event)
+
+
+def _event_attributes(state: Mapping[str, object], event_type: str) -> dict[str, object]:
+    """Derive only numeric/enumerated projection fields from trusted graph state."""
+    attributes: dict[str, object] = {}
+    if event_type == "FAST_RAG_COMPLETED":
+        attributes["retrieval_rounds"] = 1
+    if event_type in {"FAST_RAG_COMPLETED", "RESEARCH_LOOP_COMPLETED"}:
+        batches = state.get("retrieval_batches")
+        if isinstance(batches, list):
+            attributes["retrieval_rounds"] = len(batches)
+        evidence = state.get("evidence")
+        if isinstance(evidence, list):
+            attributes["candidate_count"] = len(evidence)
+    if event_type == "CITATION_VALIDATED":
+        answer = state.get("answer")
+        segments = answer.get("segments") if isinstance(answer, Mapping) else None
+        if isinstance(segments, list):
+            content = [segment for segment in segments if isinstance(segment, Mapping) and segment.get("kind") == "content"]
+            attributes["claim_count"] = len(content)
+            attributes["cited_claim_count"] = sum(
+                1 for segment in content if isinstance(segment.get("evidence_ids"), list) and segment["evidence_ids"]
+            )
+        else:
+            attributes["claim_count"] = 0
+            attributes["cited_claim_count"] = 0
+    if event_type == "ANSWER_FINALIZED":
+        termination = state.get("termination_reason")
+        attributes["termination_reason"] = termination if isinstance(termination, str) else "completed"
+        revision_count = state.get("revision_count")
+        if isinstance(revision_count, int) and revision_count > 0:
+            attributes["repair_count"] = revision_count
+    return attributes
 
 
 def _empty_pack(state: QueryState) -> PackedEvidence:

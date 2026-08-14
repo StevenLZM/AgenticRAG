@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,43 @@ def test_privacy_sanitizers_fail_closed_for_raw_prompt_and_tool_fields() -> None
     assert attributes == {"input_tokens": 8}
     assert sanitize_summary("summarize this private user prompt") == "telemetry event"
     assert sanitize_summary("completed") == "completed"
+
+
+async def test_event_emitter_accepts_only_allowlisted_attributes_and_safe_identifiers() -> None:
+    """Unknown input-like telemetry fields must be discarded or rejected before storage."""
+    repository = RecordingEventRepository()
+    emitter = AgentEventEmitter(repository, None, runtime_config_snapshot_id="snapshot-1")
+    attributes = {
+        "input_tokens": 8,
+        "tool_calls": [{"arguments": "private"}],
+        "arguments": "private",
+        "result": "private",
+        "analysis": "private",
+        "thinking": "private",
+        "instruction": "private",
+        "input": "private",
+    }
+    assert sanitize_attributes(attributes) == {"input_tokens": 8}
+    assert sanitize_attributes({"estimated_cost": math.nan, "input_tokens": math.inf}) == {}
+    await emitter.emit(
+        run_id="run-1",
+        user_id="user-1",
+        event_type="LLM_COMPLETED",
+        attributes=attributes,
+    )
+    assert repository.events[0].payload_ref is None
+
+    with pytest.raises(ValueError, match="event_type"):
+        await emitter.emit(
+            run_id="run-1", user_id="user-1", event_type="summarize user prompt"
+        )
+    with pytest.raises(ValueError, match="summary"):
+        await emitter.emit(
+            run_id="run-1",
+            user_id="user-1",
+            event_type="LLM_COMPLETED",
+            summary="summarize user private prompt",
+        )
 
 
 class RecordingEventRepository:

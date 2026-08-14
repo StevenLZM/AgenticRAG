@@ -188,3 +188,70 @@ async def test_metrics_rates_deduplicate_repeated_outcomes_per_run(tmp_path) -> 
     assert projection.metrics["repair_rate"] == 1.0
     assert projection.metrics["degraded_component_rate"] == 1.0
     assert all(value <= 1.0 for key, value in projection.metrics.items() if key.endswith("_rate"))
+
+
+@pytest.mark.integration
+async def test_metrics_outcomes_only_count_terminal_reason(tmp_path) -> None:
+    """A transient refusal event must not become the Run's final outcome."""
+    repository = RecordingEventRepository()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    await emitter.emit(
+        run_id="run-1",
+        user_id="user-1",
+        event_type="RUN_COMPLETED",
+        attributes={"termination_reason": "completed"},
+    )
+    await emitter.emit(run_id="run-1", user_id="user-1", event_type="REFUSAL_STARTED")
+
+    projection = await MetricsProjector(
+        repository, artifacts, runtime_config_snapshot_id="snapshot-1"
+    ).project_window(run_id="run-1", scope=UserScope(user_id="user-1"))
+
+    assert projection.metrics["refusal_rate"] == 0.0
+
+
+@pytest.mark.integration
+async def test_metrics_citation_coverage_accumulates_across_pages(tmp_path) -> None:
+    """Cursor continuation must preserve the numerator and denominator."""
+    repository = RecordingEventRepository()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    await emitter.emit(
+        run_id="run-1", user_id="user-1", event_type="CITATION_VALIDATED",
+        attributes={"cited_claim_count": 1, "claim_count": 2},
+    )
+    await emitter.emit(
+        run_id="run-1", user_id="user-1", event_type="CITATION_VALIDATED",
+        attributes={"cited_claim_count": 1, "claim_count": 1},
+    )
+    projector = MetricsProjector(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    first = await projector.project_window(run_id="run-1", scope=UserScope(user_id="user-1"), limit=1)
+    second = await projector.project_window(
+        run_id="run-1", scope=UserScope(user_id="user-1"), after_id=first.through_id,
+        limit=1, reducer_state=first.reducer_state,
+    )
+
+    assert first.metrics["citation_coverage"] == 0.5
+    assert second.metrics["citation_coverage"] == pytest.approx(2 / 3)
+
+
+@pytest.mark.integration
+async def test_metrics_ignores_artifact_whose_content_no_longer_matches_event_address(tmp_path) -> None:
+    """A changed payload at an event URI must not be trusted by projection."""
+    repository = RecordingEventRepository()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    await emitter.emit(
+        run_id="run-1", user_id="user-1", event_type="LLM_COMPLETED",
+        attributes={"input_tokens": 1},
+    )
+    event = repository.events[0]
+    assert event.payload_ref is not None
+    artifacts.put_json(event.payload_ref.removeprefix("artifact://"), {"attributes": {"input_tokens": 99}})
+
+    projection = await MetricsProjector(
+        repository, artifacts, runtime_config_snapshot_id="snapshot-1"
+    ).project_window(run_id="run-1", scope=UserScope(user_id="user-1"))
+
+    assert projection.metrics["input_tokens"] == 0

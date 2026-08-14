@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -19,35 +20,10 @@ from agentic_rag.persistence.artifacts import ArtifactStore
 from agentic_rag.persistence.repositories import AgentEvent, EventRepository
 
 
-_SENSITIVE_KEY_PARTS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "credential",
-    "cookie",
-    "password",
-    "prompt",
-    "reasoning",
-    "secret",
-    "tool_args",
-    "tool_input",
-    "tool_output",
-    "tool_payload",
-    "tool_result",
-    "tool_response",
-    "chain_of_thought",
-    "hidden_reasoning",
-    "message",
-    "provider_payload",
-    "raw_payload",
-    "payload",
-)
 _SENSITIVE_VALUE = re.compile(
     r"(?:\b(?:api[_ -]?key|authorization|bearer|password|secret)\b|\bsk-[A-Za-z0-9_-]+)",
     flags=re.IGNORECASE,
 )
-_MAX_ATTRIBUTE_DEPTH = 8
-_MAX_ATTRIBUTE_STRING_LENGTH = 1_000
 _SAFE_SUMMARIES = frozenset(
     {
         "completed",
@@ -66,6 +42,42 @@ _SAFE_SUMMARIES = frozenset(
     }
 )
 _EVENT_KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_EVENT_TYPE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_NODE_NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+_NUMERIC_ATTRIBUTES = frozenset(
+    {
+        "queue_wait_seconds",
+        "run_latency_seconds",
+        "node_latency_seconds",
+        "retrieval_rounds",
+        "candidate_count",
+        "concurrency_active",
+        "concurrency_limit",
+        "concurrent_saturation",
+        "input_tokens",
+        "output_tokens",
+        "estimated_cost",
+        "cited_claim_count",
+        "claim_count",
+        "repair_count",
+    }
+)
+_TERMINATION_REASONS = frozenset(
+    {
+        "completed",
+        "clarify",
+        "refuse",
+        "cannot_answer",
+        "research_action_invalid",
+        "audit_failed",
+        "research_round_limit",
+        "cancelled",
+        "failed",
+    }
+)
+_DEGRADED_COMPONENTS = frozenset(
+    {"dense", "bm25", "reranker", "memory", "llm", "elasticsearch", "redis", "artifact_store"}
+)
 
 
 def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -75,15 +87,18 @@ def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
     itself from becoming a searchable durable field and makes accidental raw
     Tool or prompt capture fail closed.
     """
-    if not isinstance(attributes, Mapping):
-        return {}
     result: dict[str, Any] = {}
-    for raw_key, value in attributes.items():
-        if not isinstance(raw_key, str) or _is_sensitive_key(raw_key):
-            continue
-        sanitized = _sanitize_value(value, depth=0)
-        if sanitized is not _OMIT:
-            result[raw_key] = sanitized
+    if not isinstance(attributes, Mapping):
+        return result
+    for key, value in attributes.items():
+        if key in _NUMERIC_ATTRIBUTES and _safe_number(value):
+            result[key] = value
+        elif key == "termination_reason" and value in _TERMINATION_REASONS:
+            result[key] = value
+        elif key == "rating" and value in {"up", "down"}:
+            result[key] = value
+        elif key == "degraded_components" and _safe_components(value):
+            result[key] = list(value)
     return result
 
 
@@ -121,6 +136,11 @@ class AgentEventEmitter:
         self._artifacts = artifacts
         self._snapshot_id = runtime_config_snapshot_id
 
+    @property
+    def runtime_config_snapshot_id(self) -> str:
+        """Expose the immutable baseline identity for safe producer injection."""
+        return self._snapshot_id
+
     async def emit(
         self,
         *,
@@ -141,6 +161,12 @@ class AgentEventEmitter:
         """
         if not run_id.strip() or not user_id.strip() or not event_type.strip():
             raise ValueError("run_id, user_id, and event_type must not be blank")
+        if _EVENT_TYPE.fullmatch(event_type) is None:
+            raise ValueError("event_type must be a safe uppercase identifier")
+        if node_name is not None and _NODE_NAME.fullmatch(node_name) is None:
+            raise ValueError("node_name must be a safe identifier")
+        if summary and sanitize_summary(summary) == "telemetry event":
+            raise ValueError("summary must use the safe telemetry summary allowlist")
         safe_attributes = sanitize_attributes(attributes)
         key = event_key or uuid4().hex
         if _EVENT_KEY.fullmatch(key) is None:
@@ -174,35 +200,20 @@ class AgentEventEmitter:
         return await self._repository.append(event)
 
 
-class _Omit:
-    pass
-
-
-_OMIT = _Omit()
-
-
-def _is_sensitive_key(key: str) -> bool:
-    normalized = key.casefold().replace("-", "_")
-    return normalized in {"token", "access_token", "auth_token"} or any(
-        part in normalized for part in _SENSITIVE_KEY_PARTS
+def _safe_number(value: object) -> bool:
+    return (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
     )
 
 
-def _sanitize_value(value: Any, *, depth: int) -> Any:
-    if depth >= _MAX_ATTRIBUTE_DEPTH:
-        return _OMIT
-    if value is None or isinstance(value, bool | int | float):
-        return value
-    if isinstance(value, str):
-        if _SENSITIVE_VALUE.search(value):
-            return _OMIT
-        return value[:_MAX_ATTRIBUTE_STRING_LENGTH]
-    if isinstance(value, Mapping):
-        return sanitize_attributes(value)
-    if isinstance(value, (list, tuple)):
-        items = [_sanitize_value(item, depth=depth + 1) for item in value]
-        return [item for item in items if item is not _OMIT]
-    return _OMIT
+def _safe_components(value: object) -> bool:
+    return isinstance(value, (list, tuple)) and all(
+        isinstance(component, str) and component in _DEGRADED_COMPONENTS
+        for component in value
+    )
 
 
 def _artifact_digest(

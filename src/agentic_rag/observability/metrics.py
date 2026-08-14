@@ -9,7 +9,7 @@ from typing import Any, cast
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from agentic_rag.domain.models import UserScope
-from agentic_rag.observability.logging import sanitize_attributes
+from agentic_rag.observability.logging import _artifact_digest, sanitize_attributes
 from agentic_rag.persistence.artifacts import ArtifactStore
 from agentic_rag.persistence.repositories import AgentEvent, EventRepository
 
@@ -77,8 +77,8 @@ class MetricsProjector:
         }
         repair_seen = bool(state.get("repair_seen", False))
         degraded_seen = bool(state.get("degraded_seen", False))
-        citation_cited = 0.0
-        citation_expected = 0.0
+        citation_cited = float(state.get("citation_cited", 0.0))
+        citation_expected = float(state.get("citation_expected", 0.0))
         processed = 0
 
         for event in events:
@@ -112,15 +112,10 @@ class MetricsProjector:
                     _add_number(metrics, "run_latency_seconds", (event.created_at - run_started_at).total_seconds())
 
             termination = str(attributes.get("termination_reason", "")).casefold()
-            is_refusal = "REFUS" in event_type or termination in {"refuse", "cannot_answer", "audit_failed"}
-            is_clarify = "CLARIF" in event_type or termination == "clarify"
-            is_loop_limit = "LOOP_LIMIT" in event_type or termination == "research_round_limit"
-            if is_refusal:
-                outcome_seen["refusal"] = True
-            if is_clarify:
-                outcome_seen["clarify"] = True
-            if is_loop_limit:
-                outcome_seen["loop_limit"] = True
+            if event_type in {"RUN_COMPLETED", "RUN_FAILED", "RUN_CANCELLED", "ANSWER_FINALIZED"}:
+                outcome_seen["refusal"] = termination in {"refuse", "cannot_answer", "audit_failed"}
+                outcome_seen["clarify"] = termination == "clarify"
+                outcome_seen["loop_limit"] = termination == "research_round_limit"
             if "REPAIR" in event_type:
                 _add_number(metrics, "repair_count", 1)
                 repair_seen = True
@@ -170,7 +165,9 @@ class MetricsProjector:
                     "terminal_seen": terminal_seen,
                     "outcome_seen": outcome_seen,
                     "repair_seen": repair_seen,
-                    "degraded_seen": degraded_seen,
+                "degraded_seen": degraded_seen,
+                "citation_cited": citation_cited,
+                "citation_expected": citation_expected,
                 },
             ),
         )
@@ -186,7 +183,18 @@ class MetricsProjector:
         if not isinstance(payload, Mapping):
             return {}
         attributes = payload.get("attributes")
-        return sanitize_attributes(attributes) if isinstance(attributes, Mapping) else {}
+        if not isinstance(attributes, Mapping):
+            return {}
+        safe_attributes = sanitize_attributes(attributes)
+        expected_uri = "artifact://observability/events/" + _artifact_digest(
+            event.user_id,
+            event.run_id,
+            event.event_key,
+            {"attributes": safe_attributes},
+        ) + ".json"
+        if event.payload_ref != expected_uri or dict(payload) != {"attributes": safe_attributes}:
+            return {}
+        return safe_attributes
 
 
 def _empty_metrics() -> dict[str, float | int]:

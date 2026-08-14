@@ -140,6 +140,15 @@ class Broker:
 
 
 @dataclass
+class SafeEmitter:
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def emit(self, **kwargs: object) -> int:
+        self.calls.append(dict(kwargs))
+        return len(self.calls)
+
+
+@dataclass
 class GraphFactory:
     calls: list[str] = field(default_factory=list)
 
@@ -238,6 +247,25 @@ async def test_worker_records_queue_span_when_trace_recorder_is_injected() -> No
     await worker.run_one()
 
     assert any(span.name == "queue" and span.run_id == run.id for span in recorder.events)
+
+
+async def test_worker_emits_safe_queue_wait_event_when_emitter_is_injected() -> None:
+    """Queue metrics come from the worker's actual durable delivery path."""
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="What notice applies?")
+    broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+    emitter = SafeEmitter()
+    worker = QueryWorker(
+        runs=runs, broker=broker, graph_factory=lambda **_: _Graph(),
+        worker_id="worker-1", event_emitter=emitter,
+    )
+
+    await worker.run_one()
+
+    assert emitter.calls[0]["event_type"] == "QUEUE_WAITED"
+    assert emitter.calls[0]["attributes"]["queue_wait_seconds"] >= 0
 
 
 @pytest.mark.parametrize(

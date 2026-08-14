@@ -121,6 +121,16 @@ class EventLog:
 
 
 @dataclass
+class SafeEmitter:
+    calls: list[dict[str, object]] = field(default_factory=list)
+    runtime_config_snapshot_id: str = SNAPSHOT.snapshot_id
+
+    async def emit(self, **kwargs: object) -> int:
+        self.calls.append(dict(kwargs))
+        return len(self.calls)
+
+
+@dataclass
 class RecordingEvidenceBuilder:
     delegate: EvidenceBuilder = field(default_factory=EvidenceBuilder)
     calls: list[tuple[object, object, object, object]] = field(default_factory=list)
@@ -154,7 +164,7 @@ def _state() -> dict[str, object]:
     )
 
 
-def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research: dict[str, object] | None = None, evidence_builder: object | None = None, trace_recorder: object | None = None) -> tuple[object, FakeMemory, FakeRetrieval, EventLog]:
+def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research: dict[str, object] | None = None, evidence_builder: object | None = None, trace_recorder: object | None = None, event_emitter: object | None = None) -> tuple[object, FakeMemory, FakeRetrieval, EventLog]:
     from agentic_rag.query.audit import CitationValidator, FaithfulnessAuditor
     from agentic_rag.query.graph import QueryGraphDependencies
 
@@ -188,6 +198,7 @@ def _deps(*, route: str = "fast_rag", grades: list[str] | None = None, research:
         generator=Generator(), faithfulness_auditor=FaithfulnessAuditor(gateway),
         citation_validator=CitationValidator(), authorization_resolver=Resolver(), event_repository=event_log,
         trace_recorder=trace_recorder,
+        event_emitter=event_emitter,
     )
     return deps, memory, retrieval, event_log
 
@@ -217,6 +228,46 @@ async def test_real_query_graph_records_lane_spans_when_trace_recorder_is_inject
     assert result["termination_reason"] == "completed"
     names = {span.name for span in recorder.events}
     assert {"graph.node.memory_loader", "memory", "llm", "retrieval", "rerank", "audit"} <= names
+
+
+async def test_real_query_graph_emits_safe_projection_attributes() -> None:
+    """Graph events use the safe emitter, never raw state summaries or prompts."""
+    from agentic_rag.query.graph import build_query_graph
+
+    emitter = SafeEmitter()
+    deps, _memory, _retrieval, _events = _deps(event_emitter=emitter)
+    result = await build_query_graph(deps).ainvoke(_state())
+
+    assert result["termination_reason"] == "completed"
+    by_type = {call["event_type"]: call for call in emitter.calls}
+    assert by_type["FAST_RAG_COMPLETED"]["attributes"]["retrieval_rounds"] >= 1
+    assert "claim_count" in by_type["CITATION_VALIDATED"]["attributes"]
+    assert by_type["ANSWER_FINALIZED"]["attributes"]["termination_reason"] == "completed"
+
+
+async def test_graph_skips_emitter_with_a_different_runtime_snapshot() -> None:
+    """A baseline mismatch cannot write cross-snapshot projection events."""
+    from agentic_rag.query.graph import build_query_graph
+
+    emitter = SafeEmitter(runtime_config_snapshot_id="other-snapshot")
+    deps, _memory, _retrieval, _events = _deps(event_emitter=emitter)
+    result = await build_query_graph(deps).ainvoke(_state())
+
+    assert result["termination_reason"] == "completed"
+    assert emitter.calls == []
+
+
+async def test_research_delegate_records_tool_lane_span() -> None:
+    """The real research-loop delegate is inside a Tool lane span."""
+    from agentic_rag.observability.tracing import TraceRecorder
+    from agentic_rag.query.graph import build_query_graph
+
+    recorder = TraceRecorder(runtime_config_snapshot_id=SNAPSHOT.snapshot_id)
+    deps, _memory, _retrieval, _events = _deps(route="research", trace_recorder=recorder)
+    result = await build_query_graph(deps).ainvoke(_state())
+
+    assert result["termination_reason"] == "completed"
+    assert any(span.name == "tool" for span in recorder.events)
 
 
 async def test_insufficient_fast_evidence_escalates_to_research_before_audits() -> None:
