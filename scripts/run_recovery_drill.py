@@ -355,6 +355,9 @@ def _mem0_unavailable(state: _DrillState) -> bool:
         ("victim", "victim secret"),
     ]
     scoped = [row for row in rows if row[0] == state.expected_user_id]
+    state.leaked_user_ids.update(
+        user_id for user_id, _text in scoped if user_id != state.expected_user_id
+    )
     try:
         raise ConnectionError("mem0 unavailable")
     except ConnectionError:
