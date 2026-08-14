@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from pathlib import PurePosixPath, PureWindowsPath
 
 import pytest
 from pydantic import ValidationError
@@ -47,6 +48,16 @@ def test_retrieval_metrics_bound_k_instead_of_using_negative_slice_semantics() -
     assert recall_at_k(["p1", "p2"], {"p2"}, -1) == 0.0
     assert mrr(["p1", "p2"], {"p2"}, k=1) == 0.0
     assert ndcg_at_k(["p1", "p2"], {"p2"}, 99) == pytest.approx(1.0 / 1.5849625)
+
+
+def test_retrieval_metrics_cut_raw_prefix_before_deduplicating() -> None:
+    ranked = ["x", "x", "p"]
+
+    assert recall_at_k(ranked, {"p"}, 2) == 0.0
+    assert mrr(ranked, {"p"}, k=2) == 0.0
+    assert ndcg_at_k(ranked, {"p"}, 2) == 0.0
+    # The first relevant result keeps its original rank after prefix dedupe.
+    assert mrr(["x", "p", "p"], {"p"}, k=3) == pytest.approx(0.5)
 
 
 def test_event_metrics_filter_user_and_runtime_snapshot_and_dedupe_replays() -> None:
@@ -98,6 +109,58 @@ def test_event_metrics_filter_user_and_runtime_snapshot_and_dedupe_replays() -> 
     assert result["runs_observed"] == 1
     assert result["average_retrieval_rounds"] == 2.0
     assert result["loop_limit_hit_rate"] == 1.0
+
+
+def test_loop_limit_rate_uses_only_authoritative_terminal_reason() -> None:
+    events = [
+        {
+            "event_key": "temporary-loop",
+            "run_id": "run-1",
+            "user_id": "alice",
+            "runtime_config_snapshot_id": "snap-a",
+            "event_type": "LOOP_LIMIT_REACHED",
+            "attributes": {},
+        },
+        {
+            "event_key": "completed",
+            "run_id": "run-1",
+            "user_id": "alice",
+            "runtime_config_snapshot_id": "snap-a",
+            "event_type": "RUN_COMPLETED",
+            "attributes": {"termination_reason": "completed"},
+        },
+    ]
+
+    result = aggregate_loop_metrics(events, "alice", "snap-a")
+
+    assert result["loop_limit_count"] == 0
+    assert result["loop_limit_hit_rate"] == 0.0
+
+
+def test_event_metrics_fail_closed_for_missing_event_identity_and_fractional_counts() -> None:
+    events = [
+        {
+            "event_key": "",
+            "run_id": "run-missing-key",
+            "user_id": "alice",
+            "runtime_config_snapshot_id": "snap-a",
+            "event_type": "RUN_COMPLETED",
+            "attributes": {"termination_reason": "research_round_limit"},
+        },
+        {
+            "event_key": "fractional",
+            "run_id": "run-fractional",
+            "user_id": "alice",
+            "runtime_config_snapshot_id": "snap-a",
+            "event_type": "RETRIEVAL_COMPLETED",
+            "attributes": {"retrieval_rounds": 1.5},
+        },
+    ]
+
+    result = aggregate_loop_metrics(events, "alice", "snap-a")
+
+    assert result["runs_observed"] == 1
+    assert result["retrieval_rounds_total"] == 0
 
 
 def test_security_metrics_are_deterministic_and_ignore_unscoped_rows() -> None:
@@ -158,6 +221,45 @@ def test_evaluation_case_is_strict_and_requires_reference() -> None:
         EvaluationCase.model_validate({**_case(), "expected_route": "unknown"})
     with pytest.raises(ValidationError):
         EvaluationCase.model_validate({**_case(), "unknown": "rejected"})
+    with pytest.raises(ValidationError):
+        EvaluationCase.model_validate({**_case(), "case_id": 123})
+    with pytest.raises(ValidationError):
+        EvaluationCase.model_validate({**_case(), "reference_parent_ids": [123]})
+
+
+@pytest.mark.parametrize(
+    "fixture_path",
+    [
+        r"C:\fixtures\case.pdf",
+        r"C:/fixtures/case.pdf",
+        r"\\server\share\case.pdf",
+        r"\\server/share/case.pdf",
+        PureWindowsPath("C:/fixtures/case.pdf"),
+        PurePosixPath("/fixtures/case.pdf"),
+        "../fixtures/case.pdf",
+        "fixtures\\case.pdf",
+    ],
+)
+def test_ingestion_fixture_path_is_platform_independent_and_fail_closed(fixture_path: object) -> None:
+    row = {
+        **_case("fidelity-path"),
+        "fixture_path": fixture_path,
+        "expected_ast_locators": ["document/body/paragraph[1]"],
+        "expected_content_types": ["text"],
+    }
+    with pytest.raises((ValidationError, ValueError)):
+        validate_dataset_rows([row], dataset_name="ingestion_fidelity")
+
+
+def test_security_case_rejects_string_coercion_for_expected_leak_count() -> None:
+    row = {
+        **_case("security-strict"),
+        "security_scenario": "cross_user_query",
+        "expected_user_leak_count": "0",
+        "expected_security_outcome": "scoped",
+    }
+    with pytest.raises(ValueError, match="invalid case"):
+        validate_dataset_rows([row], dataset_name="security")
 
 
 def test_dataset_validator_rejects_duplicate_unknown_and_nonfinite_rows(tmp_path: Path) -> None:

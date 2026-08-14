@@ -19,7 +19,7 @@ def recall_at_k(ranked_ids: Sequence[str], relevant_ids: Set[str], k: int) -> fl
     relevant = {value for value in relevant_ids if isinstance(value, str) and value}
     if cutoff == 0 or not relevant:
         return 0.0
-    retrieved = set(_unique_prefix(ranked_ids, cutoff))
+    retrieved = {value for value, _rank in _unique_prefix(ranked_ids, cutoff)}
     return len(retrieved.intersection(relevant)) / len(relevant)
 
 
@@ -28,9 +28,9 @@ def mrr(ranked_ids: Sequence[str], relevant_ids: Set[str], k: int | None = None)
 
     cutoff = _bounded_k(len(ranked_ids) if k is None else k, len(ranked_ids))
     relevant = {value for value in relevant_ids if isinstance(value, str) and value}
-    for index, value in enumerate(_unique_prefix(ranked_ids, cutoff), start=1):
+    for value, rank in _unique_prefix(ranked_ids, cutoff):
         if value in relevant:
-            return 1.0 / index
+            return 1.0 / rank
     return 0.0
 
 
@@ -43,8 +43,8 @@ def ndcg_at_k(ranked_ids: Sequence[str], relevant_ids: Set[str], k: int) -> floa
         return 0.0
     retrieved = _unique_prefix(ranked_ids, cutoff)
     dcg = sum(
-        1.0 / math.log2(index + 2)
-        for index, value in enumerate(retrieved)
+        1.0 / math.log2(rank + 1)
+        for value, rank in retrieved
         if value in relevant
     )
     ideal_count = min(cutoff, len(relevant))
@@ -75,7 +75,7 @@ def aggregate_loop_metrics(
         rounds = _finite_nonnegative(attrs.get("retrieval_rounds"))
         if rounds is not None:
             state["rounds"] = max(float(state["rounds"]), rounds)
-        elif event_type == "RETRIEVAL_COMPLETED":
+        elif event_type == "RETRIEVAL_COMPLETED" and "retrieval_rounds" not in attrs:
             state["rounds"] = float(state["rounds"]) + 1.0
         repairs = _finite_nonnegative(attrs.get("repair_count"))
         if repairs is not None:
@@ -85,13 +85,13 @@ def aggregate_loop_metrics(
         reason = attrs.get("termination_reason")
         if event_type in {"RUN_COMPLETED", "RUN_FAILED", "RUN_CANCELLED", "ANSWER_FINALIZED"}:
             state["terminal"] = reason if isinstance(reason, str) else ""
-        if "LOOP_LIMIT" in event_type or reason == "research_round_limit":
-            state["loop_limit"] = True
 
     runs = len(by_run)
     rounds_total = sum(float(item["rounds"]) for item in by_run.values())
     repair_count = sum(float(item["repair_count"]) for item in by_run.values())
-    loop_limit_count = sum(1 for item in by_run.values() if item["loop_limit"])
+    loop_limit_count = sum(
+        1 for item in by_run.values() if item["terminal"] == "research_round_limit"
+    )
     repaired_runs = sum(1 for item in by_run.values() if item["repair_count"] > 0)
     return {
         "runs_observed": runs,
@@ -171,16 +171,16 @@ def _bounded_k(k: int, length: int) -> int:
     return min(k, length)
 
 
-def _unique_prefix(values: Sequence[str], cutoff: int) -> list[str]:
+def _unique_prefix(values: Sequence[str], cutoff: int) -> list[tuple[str, int]]:
     seen: set[str] = set()
-    result: list[str] = []
-    for value in values:
-        if len(result) >= cutoff:
+    result: list[tuple[str, int]] = []
+    for position, value in enumerate(values, start=1):
+        if position > cutoff:
             break
         if not isinstance(value, str) or value in seen:
             continue
         seen.add(value)
-        result.append(value)
+        result.append((value, position))
     return result
 
 
@@ -203,10 +203,11 @@ def _scoped_events(
         if _EVENT_TYPE.fullmatch(event_type) is None:
             continue
         event_key = row.get("event_key")
-        if isinstance(event_key, str) and event_key:
-            if event_key in seen_keys:
-                continue
-            seen_keys.add(event_key)
+        if not isinstance(event_key, str) or not event_key.strip():
+            continue
+        if event_key in seen_keys:
+            continue
+        seen_keys.add(event_key)
         attrs = row.get("attributes")
         yield {
             "run_id": run_id,
@@ -215,17 +216,16 @@ def _scoped_events(
         }
 
 
-def _finite_nonnegative(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
+def _finite_nonnegative(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
-    number = float(value)
-    return number if math.isfinite(number) and number >= 0 else None
+    return value if value >= 0 else None
 
 
 def _add_counter(counters: dict[str, float | int], key: str, value: object) -> None:
     number = _finite_nonnegative(value)
     if number is not None:
-        counters[key] += int(number)
+        counters[key] += number
 
 
 def _integer_if_whole(number: float) -> int | float:

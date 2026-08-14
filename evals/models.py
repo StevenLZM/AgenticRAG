@@ -6,17 +6,20 @@ import json
 import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints, field_validator
 from typing_extensions import Annotated
 
 
-NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+NonEmptyText = Annotated[
+    str, StringConstraints(strict=True, strip_whitespace=True, min_length=1)
+]
 SafeIdentifier = Annotated[
     str,
     StringConstraints(
+        strict=True,
         strip_whitespace=True,
         min_length=1,
         max_length=128,
@@ -48,8 +51,14 @@ class EvaluationCase(BaseModel):
 
     case_id: SafeIdentifier
     user_id: NonEmptyText = "eval_user"
-    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_000)]
-    reference_answer: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
+    question: Annotated[
+        str,
+        StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=8_000),
+    ]
+    reference_answer: Annotated[
+        str,
+        StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=20_000),
+    ]
     reference_parent_ids: tuple[SafeIdentifier, ...] = Field(min_length=1, max_length=128)
     expected_route: Literal["fast_rag", "research"]
     tags: tuple[SafeIdentifier, ...] = Field(min_length=1, max_length=32)
@@ -80,18 +89,34 @@ class EvaluationCase(BaseModel):
 class IngestionFidelityCase(EvaluationCase):
     """Case with deterministic expected parser/chunk provenance locators."""
 
-    fixture_path: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)]
+    fixture_path: Annotated[
+        str,
+        StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=512),
+    ]
     expected_ast_locators: tuple[NonEmptyText, ...] = Field(min_length=1, max_length=64)
     expected_content_types: tuple[Literal["text", "table", "ocr", "spreadsheet"], ...] = Field(
         min_length=1, max_length=16
     )
 
-    @field_validator("fixture_path")
+    @field_validator("fixture_path", mode="before")
     @classmethod
-    def _relative_fixture_path(cls, value: str) -> str:
-        if value.startswith(("/", "~")) or ".." in Path(value).parts:
+    def _relative_fixture_path(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("fixture_path must be a string")
+        candidate = value.strip()
+        posix_path = PurePosixPath(candidate)
+        windows_path = PureWindowsPath(candidate)
+        if (
+            not candidate
+            or "\\" in candidate
+            or posix_path.is_absolute()
+            or windows_path.is_absolute()
+            or bool(windows_path.drive)
+            or candidate.startswith(("/", "~"))
+            or ".." in posix_path.parts
+        ):
             raise ValueError("fixture_path must be a repository-relative path")
-        return value
+        return candidate
 
 
 class SecurityCase(EvaluationCase):
@@ -105,7 +130,7 @@ class SecurityCase(EvaluationCase):
         "memory_instruction",
         "filter_override",
     ]
-    expected_user_leak_count: int = Field(default=0, ge=0)
+    expected_user_leak_count: StrictInt = Field(default=0, ge=0)
     expected_security_outcome: Literal["blocked", "sanitized", "scoped"]
 
 
