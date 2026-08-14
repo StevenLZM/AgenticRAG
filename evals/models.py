@@ -234,6 +234,10 @@ def _assert_json_safe(value: object, *, path: str) -> None:
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, nested in enumerate(value):
             _assert_json_safe(nested, path=f"{path}[{index}]")
+    elif value is None or isinstance(value, (str, int, bool, float)):
+        return
+    else:
+        raise ValueError(f"{path}: value is not JSON-compatible")
 
 
 def _assert_no_unsafe_keys(value: object, *, path: str) -> None:
