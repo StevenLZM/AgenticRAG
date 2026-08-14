@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -26,6 +26,7 @@ class MetricsWindow(BaseModel):
     events_processed: int
     metrics: dict[str, float | int] = Field(default_factory=dict)
     reducer_state: dict[str, JsonValue] = Field(default_factory=dict)
+    estimated_cost_status: Literal["unavailable", "observed"] = "unavailable"
 
 
 class MetricsProjector:
@@ -79,6 +80,7 @@ class MetricsProjector:
         degraded_seen = bool(state.get("degraded_seen", False))
         citation_cited = float(state.get("citation_cited", 0.0))
         citation_expected = float(state.get("citation_expected", 0.0))
+        estimated_cost_observed = bool(state.get("estimated_cost_observed", False))
         processed = 0
 
         for event in events:
@@ -89,13 +91,14 @@ class MetricsProjector:
             event_type = event.event_type.upper()
             attributes = self._attributes_for(event)
             _add_number(metrics, "queue_wait_seconds", attributes.get("queue_wait_seconds"))
-            _add_number(metrics, "run_latency_seconds", attributes.get("run_latency_seconds"))
-            _add_number(metrics, "node_latency_seconds", attributes.get("node_latency_seconds"))
             _add_number(metrics, "retrieval_rounds", attributes.get("retrieval_rounds"))
             _add_number(metrics, "retrieval_candidates", attributes.get("candidate_count"))
             _add_number(metrics, "input_tokens", attributes.get("input_tokens"))
             _add_number(metrics, "output_tokens", attributes.get("output_tokens"))
-            _add_number(metrics, "estimated_cost", attributes.get("estimated_cost"))
+            estimated_cost = _number(attributes.get("estimated_cost"))
+            if estimated_cost is not None:
+                _add_number(metrics, "estimated_cost", estimated_cost)
+                estimated_cost_observed = True
             _record_saturation(metrics, attributes)
 
             if event_type == "RUN_STARTED":
@@ -104,11 +107,17 @@ class MetricsProjector:
                 node_started_at[event.node_name] = event.created_at
             elif event_type == "GRAPH_NODE_COMPLETED" and event.node_name and event.created_at:
                 started = node_started_at.pop(event.node_name, None)
-                if started is not None:
+                node_latency = _number(attributes.get("node_latency_seconds"))
+                if node_latency is not None:
+                    _add_number(metrics, "node_latency_seconds", node_latency)
+                elif started is not None:
                     _add_number(metrics, "node_latency_seconds", (event.created_at - started).total_seconds())
             if event_type in {"RUN_COMPLETED", "RUN_FAILED", "RUN_CANCELLED"}:
                 terminal_seen = True
-                if run_started_at is not None and event.created_at is not None:
+                run_latency = _number(attributes.get("run_latency_seconds"))
+                if run_latency is not None:
+                    _add_number(metrics, "run_latency_seconds", run_latency)
+                elif run_started_at is not None and event.created_at is not None:
                     _add_number(metrics, "run_latency_seconds", (event.created_at - run_started_at).total_seconds())
 
             termination = str(attributes.get("termination_reason", "")).casefold()
@@ -172,7 +181,11 @@ class MetricsProjector:
                     "degraded_seen": degraded_seen,
                     "citation_cited": citation_cited,
                     "citation_expected": citation_expected,
+                    "estimated_cost_observed": estimated_cost_observed,
                 },
+            ),
+            estimated_cost_status=(
+                "observed" if estimated_cost_observed else "unavailable"
             ),
         )
 

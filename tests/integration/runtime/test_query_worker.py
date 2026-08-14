@@ -16,8 +16,9 @@ from typing import AsyncIterator
 import pytest
 
 from agentic_rag.domain.models import RunStatus, UserScope
+from agentic_rag.observability.logging import stable_event_key
 from agentic_rag.persistence.redis_queue import StreamMessage
-from agentic_rag.persistence.repositories import ActiveRunConflict, QueryRun
+from agentic_rag.persistence.repositories import ActiveRunConflict, LeaseLost, QueryRun
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
@@ -265,8 +266,116 @@ async def test_worker_emits_safe_queue_wait_event_when_emitter_is_injected() -> 
 
     await worker.run_one()
 
-    assert emitter.calls[0]["event_type"] == "QUEUE_WAITED"
-    assert emitter.calls[0]["attributes"]["queue_wait_seconds"] >= 0
+    queue_event = next(call for call in emitter.calls if call["event_type"] == "QUEUE_WAITED")
+    assert queue_event["attributes"]["queue_wait_seconds"] >= 0
+
+
+async def test_worker_emits_stable_run_lifecycle_and_latency_events() -> None:
+    """The production claim path must project one start and one terminal event."""
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="What notice applies?")
+    broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+    emitter = SafeEmitter()
+
+    class SlowGraph:
+        async def ainvoke(
+            self, state: dict[str, object], config: dict[str, object]
+        ) -> dict[str, object]:
+            del state, config
+            await asyncio.sleep(0.005)
+            return {"termination_reason": "completed"}
+
+    worker = QueryWorker(
+        runs=runs,
+        broker=broker,
+        graph_factory=lambda **_: SlowGraph(),
+        worker_id="worker-1",
+        event_emitter=emitter,
+    )
+    await worker.run_one()
+
+    by_type = {call["event_type"]: call for call in emitter.calls}
+    assert {"RUN_STARTED", "RUN_COMPLETED"}.issubset(by_type)
+    assert by_type["RUN_STARTED"]["event_key"] == stable_event_key(run.id, "RUN_STARTED")
+    assert by_type["RUN_COMPLETED"]["event_key"] == stable_event_key(run.id, "RUN_COMPLETED")
+    assert by_type["RUN_COMPLETED"]["attributes"]["run_latency_seconds"] > 0
+
+    # A replayed terminal delivery is fenced by the durable status and cannot
+    # append a second lifecycle event with a new key.
+    await worker.process_message(StreamMessage("1-0-replay", run.id, datetime.now(UTC)))
+    assert [call["event_type"] for call in emitter.calls].count("RUN_COMPLETED") == 1
+
+
+async def test_worker_emits_failed_lifecycle_event_on_timeout() -> None:
+    """Timeouts are durable failures and expose trusted total latency."""
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="What notice applies?")
+    broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+    emitter = SafeEmitter()
+
+    class BlockingGraph:
+        async def ainvoke(
+            self, state: dict[str, object], config: dict[str, object]
+        ) -> dict[str, object]:
+            del state, config
+            await asyncio.Event().wait()
+            return {}
+
+    worker = QueryWorker(
+        runs=runs,
+        broker=broker,
+        graph_factory=lambda **_: BlockingGraph(),
+        worker_id="worker-1",
+        run_timeout_seconds=0.01,
+        event_emitter=emitter,
+    )
+    await worker.run_one()
+
+    failed = [call for call in emitter.calls if call["event_type"] == "RUN_FAILED"]
+    assert len(failed) == 1
+    assert failed[0]["attributes"]["termination_reason"] == "failed"
+    assert failed[0]["attributes"]["run_latency_seconds"] > 0
+
+
+async def test_worker_does_not_emit_terminal_event_after_lease_loss() -> None:
+    """A stale owner cannot publish an authoritative terminal outcome."""
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    class LeaseLostRuns(Runs):
+        async def finish(
+            self,
+            run_id: str,
+            status: RunStatus,
+            result_ref: str | None,
+            error_code: str | None,
+            *,
+            owner: str,
+            claim_generation: int,
+            answer: dict[str, object] | None = None,
+        ) -> None:
+            del run_id, status, result_ref, error_code, owner, claim_generation, answer
+            raise LeaseLost("run-1")
+
+    runs = LeaseLostRuns()
+    run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="What notice applies?")
+    broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+    emitter = SafeEmitter()
+    worker = QueryWorker(
+        runs=runs,
+        broker=broker,
+        graph_factory=lambda **_: _Graph(),
+        worker_id="worker-1",
+        event_emitter=emitter,
+    )
+
+    await worker.run_one()
+
+    assert any(call["event_type"] == "RUN_STARTED" for call in emitter.calls)
+    assert not any(call["event_type"] in {"RUN_COMPLETED", "RUN_FAILED", "RUN_CANCELLED"} for call in emitter.calls)
 
 
 async def test_worker_skips_queue_event_when_emitter_snapshot_does_not_match() -> None:
@@ -421,6 +530,7 @@ async def test_worker_cancels_run_when_cancellation_is_observed_during_execution
     runs = Runs()
     run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="What notice applies?")
     broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+    emitter = SafeEmitter()
     started = asyncio.Event()
 
     class BlockingGraph:
@@ -433,6 +543,7 @@ async def test_worker_cancels_run_when_cancellation_is_observed_during_execution
     worker = QueryWorker(
         runs=runs, broker=broker, graph_factory=lambda **_: BlockingGraph(), worker_id="worker-1",
         lease_seconds=2, heartbeat_interval_seconds=0.01,
+        event_emitter=emitter,
     )
     task = asyncio.create_task(worker.run_one())
     await started.wait()
@@ -441,6 +552,10 @@ async def test_worker_cancels_run_when_cancellation_is_observed_during_execution
 
     assert runs.finishes == [RunStatus.CANCELLED]
     assert broker.acknowledged == ["1-0"]
+    cancelled = [call for call in emitter.calls if call["event_type"] == "RUN_CANCELLED"]
+    assert len(cancelled) == 1
+    assert cancelled[0]["attributes"]["termination_reason"] == "cancelled"
+    assert cancelled[0]["attributes"]["run_latency_seconds"] > 0
 
 
 async def test_worker_fails_and_acks_after_run_timeout() -> None:

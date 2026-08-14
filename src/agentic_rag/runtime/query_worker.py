@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -140,6 +141,12 @@ class QueryWorker:
                 await self._broker.ack(QUERY_STREAM, QUERY_GROUP, message.id)
             return
         snapshot = RuntimeConfigSnapshot.model_validate(claim.runtime_config_snapshot)
+        run_started = time.perf_counter()
+        await self._emit_run_lifecycle(
+            claim,
+            "RUN_STARTED",
+            started_monotonic=run_started,
+        )
         queue_wait = max(0.0, (datetime.now(UTC) - message.enqueued_at).total_seconds())
         if (
             self._event_emitter is not None
@@ -178,26 +185,50 @@ class QueryWorker:
                     async with recorder.span(
                         "queue", run_id=claim.id, attributes={"queue_wait_seconds": queue_wait}
                     ):
-                        await self._process_claimed_message(message, claim)
+                        await self._process_claimed_message(
+                            message, claim, started_monotonic=run_started
+                        )
                 else:
-                    await self._process_claimed_message(message, claim)
+                    await self._process_claimed_message(
+                        message, claim, started_monotonic=run_started
+                    )
             return
         if recorder is not None:
             async with recorder.span(
                 "queue", run_id=claim.id, attributes={"queue_wait_seconds": queue_wait}
             ):
-                await self._process_claimed_message(message, claim)
+                await self._process_claimed_message(
+                    message, claim, started_monotonic=run_started
+                )
             return
-        await self._process_claimed_message(message, claim)
+        await self._process_claimed_message(message, claim, started_monotonic=run_started)
 
     async def _process_claimed_message(
-        self, message: StreamMessage, claim: QueryRun
+        self,
+        message: StreamMessage,
+        claim: QueryRun,
+        *,
+        started_monotonic: float,
     ) -> None:
         if claim.status is RunStatus.CANCEL_REQUESTED:
-            await self._finish_and_ack(message, claim, RunStatus.CANCELLED, None)
+            await self._finish_and_ack(
+                message,
+                claim,
+                RunStatus.CANCELLED,
+                None,
+                started_monotonic=started_monotonic,
+                termination_reason="cancelled",
+            )
             return
         if not claim.question.strip():
-            await self._finish_and_ack(message, claim, RunStatus.FAILED, "missing_query")
+            await self._finish_and_ack(
+                message,
+                claim,
+                RunStatus.FAILED,
+                "missing_query",
+                started_monotonic=started_monotonic,
+                termination_reason="failed",
+            )
             return
         try:
             async with self._concurrency.run_slot():
@@ -206,44 +237,85 @@ class QueryWorker:
                 ):
                     result = await self._invoke_with_heartbeat(claim)
         except RunCancelled:
-            await self._finish_and_ack(message, claim, RunStatus.CANCELLED, None)
+            await self._finish_and_ack(
+                message,
+                claim,
+                RunStatus.CANCELLED,
+                None,
+                started_monotonic=started_monotonic,
+                termination_reason="cancelled",
+            )
             return
         except asyncio.TimeoutError:
-            await self._finish_and_ack(message, claim, RunStatus.FAILED, "run_timeout")
+            await self._finish_and_ack(
+                message,
+                claim,
+                RunStatus.FAILED,
+                "run_timeout",
+                started_monotonic=started_monotonic,
+                termination_reason="failed",
+            )
             return
         except LeaseLost:
             return
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            await self._handle_execution_failure(message, claim, type(error).__name__)
+            await self._handle_execution_failure(
+                message,
+                claim,
+                type(error).__name__,
+                started_monotonic=started_monotonic,
+            )
             return
 
         if not isinstance(result, dict):
-            await self._handle_execution_failure(message, claim, "invalid_graph_result")
+            await self._handle_execution_failure(
+                message,
+                claim,
+                "invalid_graph_result",
+                started_monotonic=started_monotonic,
+            )
             return
         termination = result.get("termination_reason")
         if not isinstance(termination, str):
-            await self._handle_execution_failure(message, claim, "invalid_termination")
+            await self._handle_execution_failure(
+                message,
+                claim,
+                "invalid_termination",
+                started_monotonic=started_monotonic,
+            )
             return
         if termination == "cancelled":
             terminal = RunStatus.CANCELLED
         elif termination in BUSINESS_TERMINAL_REASONS:
             terminal = RunStatus.COMPLETED
         else:
-            await self._handle_execution_failure(message, claim, "invalid_termination")
+            await self._handle_execution_failure(
+                message,
+                claim,
+                "invalid_termination",
+                started_monotonic=started_monotonic,
+            )
             return
         answer = result.get("answer")
         if answer is None and terminal is RunStatus.COMPLETED:
             answer = {"status": termination}
         if not isinstance(answer, dict) and answer is not None:
-            await self._handle_execution_failure(message, claim, "invalid_graph_result")
+            await self._handle_execution_failure(
+                message,
+                claim,
+                "invalid_graph_result",
+                started_monotonic=started_monotonic,
+            )
             return
         await self._finish_and_ack(
             message,
             claim,
             terminal,
             None,
+            started_monotonic=started_monotonic,
+            termination_reason=termination,
             answer=cast(dict[str, object] | None, answer),
         )
 
@@ -314,43 +386,159 @@ class QueryWorker:
         status: RunStatus,
         error_code: str | None,
         *,
+        started_monotonic: float,
+        termination_reason: str,
         answer: dict[str, object] | None = None,
     ) -> None:
         try:
-            await self._runs.finish(
-                claim.id,
-                status,
-                None,
-                error_code,
-                owner=self._worker_id,
-                claim_generation=claim.claim_generation,
-                answer=answer,
-            )
-        except TypeError as error:
-            # Keep deployment-owned lightweight Run ports source-compatible
-            # while they migrate to the answer projection.  Do not swallow
-            # unrelated TypeErrors raised inside repository implementations.
-            if "unexpected keyword argument 'answer'" not in str(error):
-                raise
-            await self._runs.finish(
-                claim.id,
-                status,
-                None,
-                error_code,
-                owner=self._worker_id,
-                claim_generation=claim.claim_generation,
-            )
+            try:
+                await self._runs.finish(
+                    claim.id,
+                    status,
+                    None,
+                    error_code,
+                    owner=self._worker_id,
+                    claim_generation=claim.claim_generation,
+                    answer=answer,
+                )
+            except TypeError as error:
+                # Keep deployment-owned lightweight Run ports source-compatible
+                # while they migrate to the answer projection.  Do not swallow
+                # unrelated TypeErrors raised inside repository implementations.
+                if "unexpected keyword argument 'answer'" not in str(error):
+                    raise
+                await self._runs.finish(
+                    claim.id,
+                    status,
+                    None,
+                    error_code,
+                    owner=self._worker_id,
+                    claim_generation=claim.claim_generation,
+                )
+        except LeaseLost:
+            # The lease fence is authoritative.  Leave the Redis delivery
+            # pending for reclaim and do not append or acknowledge a terminal
+            # event owned by a different worker.
+            return
+        await self._emit_run_lifecycle(
+            claim,
+            _run_event_type(status),
+            started_monotonic=started_monotonic,
+            termination_reason=termination_reason,
+        )
         await self._broker.ack(QUERY_STREAM, QUERY_GROUP, message.id)
 
-    async def _dead_letter_and_fail(self, message: StreamMessage, claim: QueryRun, reason: str) -> None:
+    async def _dead_letter_and_fail(
+        self,
+        message: StreamMessage,
+        claim: QueryRun,
+        reason: str,
+        *,
+        started_monotonic: float,
+    ) -> None:
         await self._broker.dead_letter(
             QUERY_DEAD_STREAM, message, reason,
             dedupe_key=f"query-dead:{claim.id}:{claim.claim_generation}",
         )
-        await self._finish_and_ack(message, claim, RunStatus.FAILED, reason)
+        await self._finish_and_ack(
+            message,
+            claim,
+            RunStatus.FAILED,
+            reason,
+            started_monotonic=started_monotonic,
+            termination_reason="failed",
+        )
 
     async def _handle_execution_failure(
-        self, message: StreamMessage, claim: QueryRun, reason: str
+        self,
+        message: StreamMessage,
+        claim: QueryRun,
+        reason: str,
+        *,
+        started_monotonic: float,
     ) -> None:
         if claim.claim_generation >= self._max_attempts:
-            await self._dead_letter_and_fail(message, claim, reason)
+            await self._dead_letter_and_fail(
+                message,
+                claim,
+                reason,
+                started_monotonic=started_monotonic,
+            )
+
+    async def _emit_run_lifecycle(
+        self,
+        claim: QueryRun,
+        event_type: str,
+        *,
+        started_monotonic: float,
+        termination_reason: str | None = None,
+    ) -> None:
+        """Emit authoritative run lifecycle metadata after the lease boundary.
+
+        ``RUN_STARTED`` is written immediately after a successful claim.  A
+        terminal event is written only after ``RunRepository.finish`` returns,
+        so a stale owner that loses its lease cannot publish an authoritative
+        outcome.  The event key is stable across Redis redelivery and the
+        measured duration is carried as a trusted, server-observed attribute.
+        """
+        emitter = self._event_emitter
+        if emitter is None:
+            return
+        try:
+            snapshot_id = RuntimeConfigSnapshot.model_validate(
+                claim.runtime_config_snapshot
+            ).snapshot_id
+        except (TypeError, ValueError):
+            return
+        if emitter.runtime_config_snapshot_id != snapshot_id:
+            return
+        attributes: dict[str, object] = {}
+        if event_type != "RUN_STARTED":
+            attributes["run_latency_seconds"] = max(
+                0.0, time.perf_counter() - started_monotonic
+            )
+            if termination_reason in {
+                "completed",
+                "clarify",
+                "refuse",
+                "cannot_answer",
+                "research_action_invalid",
+                "audit_failed",
+                "research_round_limit",
+                "cancelled",
+                "failed",
+            }:
+                attributes["termination_reason"] = termination_reason
+        summary = {
+            "RUN_STARTED": "started",
+            "RUN_COMPLETED": "completed",
+            "RUN_FAILED": "failed",
+            "RUN_CANCELLED": "cancelled",
+        }.get(event_type, "telemetry event")
+        try:
+            await emitter.emit(
+                run_id=claim.id,
+                user_id=claim.user_id,
+                event_type=event_type,
+                summary=summary,
+                # A Run has one durable lifecycle even when Redis reclaims a
+                # delivery and increments the attempt/claim generation.  The
+                # run-level key therefore deduplicates starts and terminal
+                # outcomes across all ownership attempts.
+                event_key=stable_event_key(claim.id, event_type),
+                attributes=attributes,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            # Telemetry is informational.  A broken event sink must not turn a
+            # durable terminal Run into a retry or a duplicate execution.
+            return
+
+
+def _run_event_type(status: RunStatus) -> str:
+    return {
+        RunStatus.COMPLETED: "RUN_COMPLETED",
+        RunStatus.FAILED: "RUN_FAILED",
+        RunStatus.CANCELLED: "RUN_CANCELLED",
+    }[status]

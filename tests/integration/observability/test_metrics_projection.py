@@ -96,6 +96,7 @@ async def test_metrics_projection_totals_fixture_events_from_event_log(tmp_path)
     assert projection.metrics["input_tokens"] == 10
     assert projection.metrics["output_tokens"] == 4
     assert projection.metrics["estimated_cost"] == pytest.approx(0.01)
+    assert projection.estimated_cost_status == "observed"
     assert projection.metrics["citation_coverage"] == 1.0
     assert projection.metrics["feedback_count"] == 1
 
@@ -119,6 +120,30 @@ async def test_metrics_projection_ignores_other_snapshot_events(tmp_path) -> Non
 
     assert projection.events_processed == 0
     assert projection.metrics["input_tokens"] == 0
+    assert projection.estimated_cost_status == "unavailable"
+
+
+@pytest.mark.integration
+async def test_metrics_marks_cost_unavailable_without_snapshot_bound_pricing(tmp_path) -> None:
+    """Token telemetry must not imply a fabricated price or zero-cost result."""
+    repository = RecordingEventRepository()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    await emitter.emit(
+        run_id="run-1",
+        user_id="user-1",
+        event_type="LLM_COMPLETED",
+        attributes={"input_tokens": 10, "output_tokens": 4},
+    )
+
+    projection = await MetricsProjector(
+        repository, artifacts, runtime_config_snapshot_id="snapshot-1"
+    ).project_window(run_id="run-1", scope=UserScope(user_id="user-1"))
+
+    assert projection.metrics["input_tokens"] == 10
+    assert projection.metrics["output_tokens"] == 4
+    assert projection.metrics["estimated_cost"] == 0.0
+    assert projection.estimated_cost_status == "unavailable"
 
 
 @pytest.mark.integration
