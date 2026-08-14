@@ -275,7 +275,10 @@ async def generate_with_mandatory_audits(
         prior_audits.append(audit_record)
         if citation.passed and faithfulness.passed:
             return {
-                "answer": {"segments": [segment.model_dump(mode="json") for segment in draft.segments]},
+                "answer": {
+                    "segments": [segment.model_dump(mode="json") for segment in draft.segments],
+                    "audited": True,
+                },
                 "audit_results": prior_audits,
                 "revision_count": revision_count,
                 "errors": prior_errors,
