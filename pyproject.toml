@@ -46,7 +46,7 @@ markers = [
 
 [tool.setuptools.packages.find]
 where = ["src", "."]
-include = ["agentic_rag*", "evals*"]
+include = ["agentic_rag*", "evals*", "scripts*"]
 
 [tool.setuptools.package-data]
 evals = ["datasets/*.jsonl"]
