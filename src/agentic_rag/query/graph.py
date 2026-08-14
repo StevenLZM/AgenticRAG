@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from agentic_rag.memory.models import PublicMessage
 from agentic_rag.memory.service import MemoryService
-from agentic_rag.observability.logging import AgentEventEmitter
+from agentic_rag.observability.logging import AgentEventEmitter, sanitize_summary
 from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.repositories import AgentEvent, EventRepository
 from agentic_rag.query.audit import (
@@ -351,9 +352,11 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
     if dependencies.event_repository is None:
         return
     snapshot = snapshot_from_state(state)
+    safe_event_type = event_type if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", event_type) else "PROGRESS"
+    safe_summary = sanitize_summary(summary)
     event_key_payload = {
-        "event_type": event_type,
-        "summary": summary,
+        "event_type": safe_event_type,
+        "summary": safe_summary,
         "audit_count": len(state.get("audit_results", [])),
         "revision_count": state.get("revision_count", 0),
         "research": state.get("research", {}),
@@ -370,8 +373,8 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
     event = AgentEvent(
         event_key=event_digest,
         trace_id=state["run_id"], run_id=state["run_id"], user_id=scope_from_state(state).user_id,
-        event_type=event_type, summary=summary[:1_000], runtime_config_snapshot_id=snapshot.snapshot_id,
-        node_name=event_type.lower(),
+        event_type=safe_event_type, summary=safe_summary, runtime_config_snapshot_id=snapshot.snapshot_id,
+        node_name=safe_event_type.lower(),
     )
     await dependencies.event_repository.append(event)
 

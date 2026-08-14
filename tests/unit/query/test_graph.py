@@ -348,3 +348,16 @@ async def test_event_replay_has_stable_key_and_no_dynamic_timestamp() -> None:
     assert events.events[0].event_key == events.events[1].event_key
     assert events.events[0].created_at is None
     assert events.events[1].created_at is None
+
+
+async def test_fallback_event_recorder_drops_untrusted_summary_and_identifier() -> None:
+    """A caller cannot use the legacy fallback to persist prompt-like telemetry."""
+    from agentic_rag.query.graph import _event
+
+    deps, _memory, _retrieval, events = _deps()
+    await _event(deps, _state(), "not a safe event", "summarize this private prompt")
+
+    event = events.events[-1]
+    assert event.event_type == "PROGRESS"
+    assert event.node_name == "progress"
+    assert event.summary == "telemetry event"
