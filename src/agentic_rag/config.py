@@ -30,6 +30,20 @@ class Settings(BaseSettings):
     deepseek_api_key: SecretStr | None = None
     qwen_embedding_base_url: str
     qwen_api_key: SecretStr | None = None
+    mem0_enabled: bool = False
+    mem0_collection: str = "agent_memories_v1"
+    mem0_embedding_base_url: str | None = None
+    mem0_embedding_api_key: SecretStr | None = None
+    mem0_embedding_model: str = "text-embedding-v3"
+    mem0_llm_enabled: bool = False
+    mem0_llm_model: str = "deepseek-v4-flash"
+    mem0_llm_base_url: str | None = None
+    mem0_llm_api_key: SecretStr | None = None
+    mem0_elasticsearch_api_key: SecretStr | None = None
+    mem0_elasticsearch_user: str | None = None
+    mem0_elasticsearch_password: SecretStr | None = None
+    mem0_elasticsearch_verify_certs: bool = True
+    mem0_history_db_path: Path = Path("var/mem0/history.db")
     default_user_id: str = "default_user"
     main_model: str = "deepseek-v4-pro"
     light_model: str = "deepseek-v4-flash"
@@ -71,6 +85,13 @@ class Settings(BaseSettings):
         if not value.strip():
             raise ValueError("embedding_tokenizer_model must not be blank")
         return value
+
+    @field_validator("mem0_collection", "mem0_embedding_model", "mem0_llm_model")
+    @classmethod
+    def _nonblank_mem0_names(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Mem0 names must not be blank")
+        return value.strip()
 
 
 @lru_cache

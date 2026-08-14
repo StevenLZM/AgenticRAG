@@ -7,6 +7,8 @@ or contacting Mem0, Elasticsearch, or an embedding provider.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 from agentic_rag.memory.models import MemoryClient
 
 
@@ -51,14 +53,45 @@ class Mem0Adapter:
         *,
         user_id: str,
         metadata: dict[str, object],
+        infer: bool = False,
     ) -> object:
-        return await self._client.add(messages, user_id=user_id, metadata=metadata)
+        try:
+            return await self._client.add(
+                messages,
+                user_id=user_id,
+                metadata=metadata,
+                infer=infer,
+            )
+        except TypeError as error:
+            # Keep older in-process fakes/source-compatible while production
+            # AsyncMemory always receives the explicit infer=False contract.
+            if "infer" not in str(error):
+                raise
+            return await self._client.add(
+                messages, user_id=user_id, metadata=metadata
+            )
 
     async def search(self, query: str, *, user_id: str, limit: int) -> object:
-        return await self._client.search(query, user_id=user_id, limit=limit)
+        client = cast(Any, self._client)
+        try:
+            return await client.search(
+                query, filters={"user_id": user_id}, top_k=limit
+            )
+        except TypeError as error:
+            # Compatibility for the existing narrow fake protocol.  A real
+            # AsyncMemory uses filters, which is the only tenant-safe form.
+            if "filters" not in str(error) and "top_k" not in str(error):
+                raise
+            return await client.search(query, user_id=user_id, limit=limit)
 
     async def get_all(self, *, user_id: str) -> object:
-        return await self._client.get_all(user_id=user_id)
+        client = cast(Any, self._client)
+        try:
+            return await client.get_all(filters={"user_id": user_id}, top_k=100)
+        except TypeError as error:
+            if "filters" not in str(error) and "top_k" not in str(error):
+                raise
+            return await client.get_all(user_id=user_id)
 
     async def delete(self, memory_id: str) -> object:
         return await self._client.delete(memory_id)

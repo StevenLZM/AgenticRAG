@@ -20,6 +20,47 @@ conda run -n agentic-rag python scripts/run_ingestion_worker.py
 
 The API is live at `/health/live`; use `/health/ready` only after all dependencies report `available`. For an upgrade, stop workers first, let the current graph node reach its SQLite checkpoint, apply the migration, and restart in the same order.
 
+## Mem0 long-term memory
+
+Mem0 is disabled by default so a local Query API can start without the optional
+provider. Enable it only after installing `mem0ai==2.0.12` in the `agentic-rag`
+Conda environment and supplying an Elasticsearch authentication method. The
+application owns the user namespace, calls Mem0 with `infer=False`, and uses
+the light-model extractor before writing durable facts:
+
+```dotenv
+AGENTIC_RAG_MEM0_ENABLED=1
+AGENTIC_RAG_MEM0_COLLECTION=agent_memories_v1
+AGENTIC_RAG_MEM0_EMBEDDING_BASE_URL=https://<qwen-endpoint>/v1
+AGENTIC_RAG_MEM0_EMBEDDING_API_KEY=<qwen-key>
+AGENTIC_RAG_MEM0_EMBEDDING_MODEL=text-embedding-v3
+AGENTIC_RAG_MEM0_ELASTICSEARCH_API_KEY=<es-api-key>
+AGENTIC_RAG_MEM0_HISTORY_DB_PATH=var/mem0/history.db
+```
+
+For a Mem0-managed LLM (normally unnecessary because extraction remains an
+application ModelGateway call), set `AGENTIC_RAG_MEM0_LLM_ENABLED=1` together
+with `AGENTIC_RAG_MEM0_LLM_MODEL`, `AGENTIC_RAG_MEM0_LLM_BASE_URL`, and
+`AGENTIC_RAG_MEM0_LLM_API_KEY`. If Mem0 is enabled but its configuration or
+provider construction fails, the API keeps memory degraded, `/health/ready`
+reports `memory=unavailable`, and a bounded `memory_provider_degraded` log is
+emitted; query evidence and tenant isolation do not silently broaden.
+
+Run the real provider contract only with an explicit disposable namespace. It
+skips when variables are absent and fails when a configured provider is
+unhealthy:
+
+```sh
+export AGENTIC_RAG_TEST_MEM0_ENABLED=1
+export AGENTIC_RAG_TEST_MYSQL_DSN='mysql+asyncmy://.../agentic_rag_test'
+export AGENTIC_RAG_TEST_ELASTICSEARCH_URL='http://127.0.0.1:9200'
+export AGENTIC_RAG_TEST_MEM0_EMBEDDING_BASE_URL='https://<qwen-endpoint>/v1'
+export AGENTIC_RAG_TEST_MEM0_EMBEDDING_API_KEY='<qwen-key>'
+export AGENTIC_RAG_TEST_MEM0_ELASTICSEARCH_API_KEY='<es-api-key>'
+conda run -n agentic-rag python -m pytest --import-mode=importlib \
+  tests/e2e/test_mem0_real_services.py -q -s
+```
+
 ## Graceful stop and recovery work
 
 Send `SIGTERM` to the API and workers. The API immediately refuses new work and allows in-flight HTTP work to drain for the configured grace period. Worker graph state is stored in the configured query and ingestion SQLite checkpoint files; restarting the one-worker processes resumes recoverable work. Do not kill or copy an open checkpoint database.

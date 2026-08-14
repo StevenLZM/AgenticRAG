@@ -4,8 +4,24 @@ from __future__ import annotations
 
 import builtins
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast, runtime_checkable
+
+try:
+    from elastic_transport import (
+        ApiError as ElasticApiError,
+        ConnectionError as ElasticConnectionError,
+        ConnectionTimeout as ElasticConnectionTimeout,
+        TransportError as ElasticTransportError,
+    )
+except ImportError:  # pragma: no cover - optional provider dependency
+    ElasticApiError = ElasticConnectionError = ElasticConnectionTimeout = ElasticTransportError = OSError  # type: ignore[assignment,misc]
+
+try:
+    from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+except ImportError:  # pragma: no cover - optional provider dependency
+    APIConnectionError = APITimeoutError = InternalServerError = RateLimitError = OSError  # type: ignore[assignment,misc]
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.memory.mem0_adapter import Mem0Adapter, as_mem0_adapter
@@ -28,6 +44,8 @@ from agentic_rag.runtime.model_gateway import (
     load_prompt,
 )
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -77,7 +95,8 @@ class MemoryServiceImpl:
             raise ValueError("limit must be positive")
         try:
             records = self._records(await self._mem0.search(query, user_id=scope.user_id, limit=limit), scope)
-        except _operational_errors():
+        except _operational_errors() as error:
+            _log_degraded("load_context", error)
             return MemoryContext(degraded=True)
         envelopes = tuple(
             DataEnvelope(
@@ -101,7 +120,8 @@ class MemoryServiceImpl:
         public_messages = list(messages)
         try:
             candidates = await self._extractor.extract(public_messages)
-        except (OSError, TimeoutError, ConnectionError, StructuredOutputValidationError):
+        except (OSError, TimeoutError, ConnectionError, StructuredOutputValidationError) as error:
+            _log_degraded("extract", error)
             return
         for candidate in candidates:
             if not _candidate_is_authorized(candidate, public_messages):
@@ -118,37 +138,43 @@ class MemoryServiceImpl:
                     [{"role": "user", "content": candidate.text}],
                     user_id=scope.user_id,
                     metadata=metadata,
+                    infer=False,
                 )
-            except _operational_errors():
+            except _operational_errors() as error:
                 # Memory capture must not turn an otherwise valid query into a
                 # failed run; a later user statement may safely be captured.
+                _log_degraded("add", error)
                 return
 
     async def list(self, scope: UserScope) -> builtins.list[MemoryRecord]:
         try:
             return self._records(await self._mem0.get_all(user_id=scope.user_id), scope)
-        except _operational_errors():
+        except _operational_errors() as error:
+            _log_degraded("list", error)
             return []
 
     async def delete(self, scope: UserScope, memory_id: str) -> None:
         # Refuse an unowned / nonexistent ID before creating a deletion record.
         try:
             visible = self._records(await self._mem0.get_all(user_id=scope.user_id), scope)
-        except _operational_errors():
+        except _operational_errors() as error:
+            _log_degraded("delete", error)
             return
         if memory_id not in {record.id for record in visible}:
             return
 
         try:
             await self._tombstones.request(scope, memory_id)
-        except _operational_errors():
+        except _operational_errors() as error:
+            _log_degraded("tombstone_request", error)
             return
         await self._attempt_delete(scope, memory_id)
 
     async def reconcile_deletions(self) -> None:
         try:
             pending = await self._tombstones.list_pending()
-        except _operational_errors():
+        except _operational_errors() as error:
+            _log_degraded("tombstone_list_pending", error)
             return
         for tombstone in pending:
             # Tombstones are application-owned; reconstructing this scope is safe.
@@ -179,6 +205,7 @@ class MemoryServiceImpl:
             if memory_id in {record.id for record in remaining}:
                 raise OSError("provider still returns deleted memory")
         except _operational_errors() as error:
+            _log_degraded("delete_reconcile", error)
             try:
                 await self._tombstones.mark_retry(scope, memory_id, str(error))
             except _operational_errors():
@@ -317,4 +344,30 @@ def _candidate_is_authorized(
 # Network/SDK failures are intentionally narrow; invalid provider data becomes
 # an empty fail-closed result instead of a cross-tenant leak.
 def _operational_errors() -> tuple[type[BaseException], ...]:
-    return (OSError, TimeoutError, ConnectionError)
+    return (
+        OSError,
+        TimeoutError,
+        ConnectionError,
+        ElasticApiError,
+        ElasticConnectionError,
+        ElasticConnectionTimeout,
+        ElasticTransportError,
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
+
+
+def _log_degraded(operation: str, error: BaseException) -> None:
+    """Log only bounded provider metadata, never memory/provider content."""
+    logger.warning(
+        "memory_provider_degraded",
+        extra={
+            "component": "mem0",
+            "operation": operation,
+            "reason": type(error).__name__,
+            "outcome": "degraded",
+            "retryable": True,
+        },
+    )

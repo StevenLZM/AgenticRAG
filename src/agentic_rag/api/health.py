@@ -142,6 +142,11 @@ async def check_reranker(initialized: bool) -> None:
         raise RuntimeError("reranker is not initialized")
 
 
+async def check_memory(initialized: bool) -> None:
+    if not initialized:
+        raise RuntimeError("memory provider is not initialized")
+
+
 def build_readiness_checks(
     *,
     settings: Settings,
@@ -151,6 +156,7 @@ def build_readiness_checks(
     artifacts: ArtifactStore,
     checkpoints: CheckpointBackend,
     reranker_initialized: bool,
+    memory_available: bool = True,
 ) -> ReadinessChecks:
     """Bind real adapters to the injectable health-check runner."""
     return ReadinessChecks(
@@ -162,6 +168,7 @@ def build_readiness_checks(
             "artifacts": partial(check_artifacts, artifacts),
             "checkpoints": partial(check_checkpoints, checkpoints),
             "reranker": partial(check_reranker, reranker_initialized),
+            "memory": partial(check_memory, memory_available),
         }
     )
 

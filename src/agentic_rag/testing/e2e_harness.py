@@ -406,8 +406,15 @@ async def _probe(probe: HealthProbe) -> bool:
 
 
 class _ScopedMemoryClient(MemoryClient):
-    async def add(self, messages: list[dict[str, str]], *, user_id: str, metadata: dict[str, object]) -> object:
-        del messages, user_id, metadata
+    async def add(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        user_id: str,
+        metadata: dict[str, object],
+        infer: bool = False,
+    ) -> object:
+        del messages, user_id, metadata, infer
         return None
 
     async def search(self, query: str, *, user_id: str, limit: int) -> object:
@@ -429,8 +436,15 @@ class _ScopedMemoryClient(MemoryClient):
 
 
 class _UnavailableMemoryClient(MemoryClient):
-    async def add(self, messages: list[dict[str, str]], *, user_id: str, metadata: dict[str, object]) -> object:
-        del messages, user_id, metadata
+    async def add(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        user_id: str,
+        metadata: dict[str, object],
+        infer: bool = False,
+    ) -> object:
+        del messages, user_id, metadata, infer
         raise ConnectionError("mem0 unavailable")
 
     async def search(self, query: str, *, user_id: str, limit: int) -> object:

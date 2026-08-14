@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 
 from elasticsearch import AsyncElasticsearch
@@ -25,10 +26,16 @@ from agentic_rag.persistence.repositories import (
 from agentic_rag.runtime.run_manager import RunManager, TransactionalRunRepository
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 from agentic_rag.runtime.query_composition import build_query_snapshot
-from agentic_rag.memory.models import MemoryContext, MemoryRecord
-from agentic_rag.memory.service import MemoryService
 from agentic_rag.domain.models import UserScope
+from agentic_rag.memory.factory import (
+    MemoryCompositionError,
+    UnavailableMemoryService,
+    build_memory_service_sync,
+)
+from agentic_rag.memory.service import MemoryService
 from agentic_rag.safety.uploads import DefaultUploadSafetyScanner
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,10 +67,25 @@ class AppContainer:
 
     async def close(self) -> None:
         """Attempt cleanup of every process-owned async client."""
+        memory_resources = tuple(
+            getattr(self.memory_service, "_owned_resources", ())
+            if self.memory_service is not None
+            else ()
+        )
+
+        async def close_resource(resource: object) -> None:
+            close = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+            if not callable(close):
+                return
+            value = close()
+            if asyncio.iscoroutine(value):
+                await value
+
         await asyncio.gather(
             self.elasticsearch.close(),
             self.redis.aclose(),
             self.mysql_engine.dispose(),
+            *(close_resource(resource) for resource in reversed(memory_resources)),
             return_exceptions=True,
         )
 
@@ -96,6 +118,27 @@ def build_container(settings: Settings) -> AppContainer:
     checkpoints = CheckpointBackend(settings)
     reranker_initialized = bool(settings.reranker_model.strip())
     runtime_snapshot = build_query_snapshot(settings)
+    repositories = Repositories(create_session_factory(mysql_engine))
+    event_repository = _TransactionalEventRepository(repositories.session_factory)
+    memory_container = type("MemoryContainer", (), {"repositories": repositories})()
+    try:
+        memory_service = build_memory_service_sync(
+            memory_container, settings, runtime_snapshot
+        )
+    except MemoryCompositionError as error:
+        # Core query APIs remain available with memory degraded, while the
+        # readiness check and structured log make the operator action explicit.
+        logger.error(
+            "memory_provider_degraded",
+            extra={
+                "component": "mem0",
+                "reason": type(error).__name__,
+                "outcome": "degraded",
+                "retryable": False,
+            },
+        )
+        memory_service = UnavailableMemoryService(type(error).__name__)
+    memory_available = bool(getattr(memory_service, "available", False))
     readiness_checks = build_readiness_checks(
         settings=settings,
         mysql=mysql_engine,
@@ -104,30 +147,8 @@ def build_container(settings: Settings) -> AppContainer:
         artifacts=artifacts,
         checkpoints=checkpoints,
         reranker_initialized=reranker_initialized,
+        memory_available=memory_available or not settings.mem0_enabled,
     )
-    repositories = Repositories(create_session_factory(mysql_engine))
-    event_repository = _TransactionalEventRepository(repositories.session_factory)
-    # Mem0 construction belongs to deployment composition.  Until a client is
-    # injected, this safe no-op implementation exposes no cross-user data and
-    # keeps query creation/status APIs available for local health checks.
-    class _UnavailableMemory:
-        async def load_context(self, scope: UserScope, query: str, limit: int = 10) -> MemoryContext:
-            del scope, query, limit
-            return MemoryContext(degraded=True)
-
-        async def extract_and_store(self, scope: UserScope, run_id: str, messages: object) -> None:
-            del scope, run_id, messages
-
-        async def list(self, scope: UserScope) -> list[MemoryRecord]:
-            del scope
-            raise OSError("memory provider is not configured")
-
-        async def delete(self, scope: UserScope, memory_id: str) -> None:
-            del scope, memory_id
-            raise OSError("memory provider is not configured")
-
-        async def reconcile_deletions(self) -> None:
-            return None
 
     run_manager = RunManager(
         session_factory=repositories.session_factory,
@@ -164,5 +185,5 @@ def build_container(settings: Settings) -> AppContainer:
         runtime_snapshot=runtime_snapshot,
         run_manager=run_manager,
         event_repository=event_repository,
-        memory_service=_UnavailableMemory(),  # type: ignore[arg-type]
+        memory_service=memory_service,
     )

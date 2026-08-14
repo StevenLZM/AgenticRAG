@@ -112,6 +112,7 @@ class MemoryClient(Protocol):
         *,
         user_id: str,
         metadata: dict[str, object],
+        infer: bool = False,
     ) -> object: ...
 
     async def search(
