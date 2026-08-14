@@ -16,6 +16,7 @@ from evals.models import EvaluationCase
 from evals.ragas_adapter import RagasUnavailable
 from evals.report import MixedSnapshotError, build_summary
 from evals.run import EvalCaseResult, EvalRunner, SnapshotMismatchError
+from scripts.verify_acceptance import verify_acceptance
 
 
 def _case(case_id: str = "case-1", snapshot: str = "snapshot-v1") -> EvaluationCase:
@@ -415,3 +416,33 @@ def test_cli_smoke_uses_deterministic_fixture(tmp_path: Path, capsys: pytest.Cap
     assert (output / "results.jsonl").exists()
     assert (output / "summary.json").exists()
     assert "completed_cases" in capsys.readouterr().out
+
+
+def test_fixture_summary_cannot_pass_final_acceptance() -> None:
+    summary = {
+        "evaluation_mode": "fixture",
+        "client_provenance": "fixture",
+        "user_leak_count": 0,
+        "citation_coverage": 1.0,
+        "unaudited_answer_count": 0,
+        "recovery_drill_passed": True,
+        "backup_restore_passed": True,
+    }
+
+    assert verify_acceptance(summary) == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_persists_real_mode_and_client_provenance(tmp_path: Path) -> None:
+    summary = await EvalRunner(
+        FakeQueryClient(),
+        output_dir=tmp_path,
+        evaluation_mode="graph",
+        client_provenance="real_query_graph",
+    ).run([_case()])
+
+    assert summary["evaluation_mode"] == "graph"
+    assert summary["client_provenance"] == "real_query_graph"
+    row = json.loads((tmp_path / "results.jsonl").read_text(encoding="utf-8"))
+    assert row["evaluation_mode"] == "graph"
+    assert row["client_provenance"] == "real_query_graph"

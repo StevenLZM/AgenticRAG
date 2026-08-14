@@ -438,6 +438,42 @@ async def test_worker_persists_business_terminal_reasons_as_completed(
     assert broker.acknowledged == ["1-0"]
 
 
+async def test_worker_persists_safe_evidence_parent_projection_for_api_evaluations() -> None:
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    run = await runs.create_queued(
+        SCOPE, "thread-evidence", SNAPSHOT, question="What is relevant?"
+    )
+    broker = Broker(messages=[StreamMessage("evidence-1", run.id, datetime.now(UTC))])
+
+    class EvidenceGraph:
+        async def ainvoke(
+            self, state: dict[str, object], config: dict[str, object]
+        ) -> dict[str, object]:
+            del state, config
+            return {
+                "termination_reason": "completed",
+                "answer": {"status": "audited"},
+                "evidence": [
+                    {"parent_id": "parent-1", "content": "private evidence"},
+                    {"parent_id": "parent-1", "content": "duplicate"},
+                ],
+            }
+
+    worker = QueryWorker(
+        runs=runs,
+        broker=broker,
+        graph_factory=lambda **_: EvidenceGraph(),
+        worker_id="worker-evidence",
+    )
+    await worker.run_one()
+
+    assert runs.answers == [
+        {"status": "audited", "evidence_parent_ids": ["parent-1"]}
+    ]
+
+
 class _Graph:
     async def ainvoke(self, state: dict[str, object], config: dict[str, object]) -> dict[str, object]:
         del state, config

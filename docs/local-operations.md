@@ -160,13 +160,29 @@ conda run -n agentic-rag python -m pytest -m integration -q
 conda run -n agentic-rag python -m pytest -m e2e -q
 AGENTIC_RAG_RUN_REAL_BACKUP_RESTORE=1 conda run -n agentic-rag python -m pytest -m e2e tests/e2e/test_backup_restore.py -q
 conda run -n agentic-rag python -m pytest -m live_model tests/smoke -q
-conda run -n agentic-rag python -m evals.run --dataset evals/datasets/baseline.jsonl --output var/artifacts/evals/final
-conda run -n agentic-rag python scripts/verify_acceptance.py --report var/artifacts/evals/final/summary.json
+conda run -n agentic-rag python -m evals.run --mode fixture \
+  --dataset evals/datasets/baseline.jsonl --output var/artifacts/evals/fixture
+# Final acceptance must use a runtime-snapshot-matched dataset and a real client:
+conda run -n agentic-rag python -m evals.run --mode graph \
+  --dataset var/artifacts/evals/runtime-baseline.jsonl --output var/artifacts/evals/graph
+# Or evaluate a deployed API (set the snapshot ID used by the dataset):
+AGENTIC_RAG_EVAL_SNAPSHOT_ID='<runtime snapshot id>' \
+conda run -n agentic-rag python -m evals.run --mode api \
+  --base-url http://127.0.0.1:8000 \
+  --dataset var/artifacts/evals/runtime-baseline.jsonl \
+  --output var/artifacts/evals/api
+conda run -n agentic-rag python scripts/verify_acceptance.py \
+  --report var/artifacts/evals/graph/summary.json
 ```
 
-`evals.run` executes the deterministic 24-case fixture and isolated local
-recovery/backup drills, so the final report contains all five hard-gate fields.
-The acceptance command returns failure unless leakage is zero, citation
-coverage is exactly 1.0, unaudited answers are zero, and both recovery and
-backup/restore drills pass. Ragas remains explicitly `unavailable` when no
-backend is configured; it never fabricates a score.
+The default `fixture` mode is an offline smoke test only and prints `SMOKE
+ONLY`; it can never satisfy final acceptance. Graph/API mode persists the real
+client provenance and rejects a case whose runtime snapshot differs from the
+composed QueryGraph/API Run. Prepare `runtime-baseline.jsonl` from the seeded
+documents and the current `RuntimeConfigSnapshot` rather than changing a
+dataset's snapshot ID after the fact. Run `verify_acceptance.py` against the
+Graph/API summary (not the fixture summary). The verifier returns failure
+unless leakage is zero, citation coverage is exactly 1.0, unaudited answers
+are zero, recovery and backup/restore drills pass, and `real_query_count` is
+positive. Ragas remains explicitly `unavailable` when no backend is
+configured; it never fabricates a score.

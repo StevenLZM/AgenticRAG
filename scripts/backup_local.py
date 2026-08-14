@@ -219,16 +219,17 @@ async def _export_elasticsearch(
             )
         except NotFoundError:
             templates = {"index_templates": []}
-        if index not in index_data or not isinstance(index_data[index], Mapping):
+        index_definition = index_data.get(index)
+        if not isinstance(index_definition, Mapping):
             raise BackupError("controlled Elasticsearch index is missing")
-        if not isinstance(index_data[index].get("mappings"), Mapping):
+        if not isinstance(index_definition.get("mappings"), Mapping):
             raise BackupError("controlled Elasticsearch mapping is missing")
         documents: list[dict[str, object]] = []
         if index in index_data:
             documents = await _export_documents(client, index)
         payload = {
             "index": index,
-            "index_definition": index_data.get(index, {}),
+            "index_definition": index_definition,
             "aliases": aliases,
             "index_templates": templates.get("index_templates", []),
             "documents": documents,

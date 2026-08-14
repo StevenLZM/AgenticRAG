@@ -15,6 +15,9 @@ REQUIRED_GATES = (
     "unaudited_answer_count",
     "recovery_drill_passed",
     "backup_restore_passed",
+    "evaluation_mode",
+    "client_provenance",
+    "real_query_count",
 )
 
 
@@ -33,6 +36,11 @@ def verify_acceptance(summary: Mapping[str, Any]) -> int:
             and summary["recovery_drill_passed"]
             and type(summary["backup_restore_passed"]) is bool
             and summary["backup_restore_passed"]
+            and summary.get("evaluation_mode") in {"graph", "api"}
+            and isinstance(summary.get("client_provenance"), str)
+            and summary["client_provenance"] not in {"", "fixture"}
+            and type(summary.get("real_query_count")) is int
+            and summary["real_query_count"] > 0
         ))
     except (KeyError, TypeError):
         return 1

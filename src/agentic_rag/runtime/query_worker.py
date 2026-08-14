@@ -318,6 +318,8 @@ class QueryWorker:
                 started_monotonic=started_monotonic,
             )
             return
+        if isinstance(answer, dict):
+            answer = _public_answer_projection(answer, result)
         await self._finish_and_ack(
             message,
             claim,
@@ -327,7 +329,6 @@ class QueryWorker:
             termination_reason=termination,
             answer=cast(dict[str, object] | None, answer),
         )
-
     async def run_forever(self, *, stop_event: asyncio.Event | None = None) -> None:
         stop = stop_event or asyncio.Event()
         current: asyncio.Task[bool] | None = None
@@ -574,3 +575,23 @@ def _run_event_type(status: RunStatus) -> str:
         RunStatus.FAILED: "RUN_FAILED",
         RunStatus.CANCELLED: "RUN_CANCELLED",
     }[status]
+
+
+def _public_answer_projection(
+    answer: dict[str, object], result: dict[str, object]
+) -> dict[str, object]:
+    """Persist only safe retrieval identifiers alongside the audited answer."""
+    projection = dict(answer)
+    if "evidence_parent_ids" not in projection:
+        evidence = result.get("evidence")
+        parent_ids: list[str] = []
+        if isinstance(evidence, list):
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                parent_id = item.get("parent_id")
+                if isinstance(parent_id, str) and parent_id and parent_id not in parent_ids:
+                    parent_ids.append(parent_id)
+        if parent_ids:
+            projection["evidence_parent_ids"] = parent_ids
+    return projection

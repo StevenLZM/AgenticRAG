@@ -23,6 +23,8 @@ def build_summary(
     baseline_ids: Mapping[str, str] | None = None,
     recovery_drill_passed: bool = False,
     backup_restore_passed: bool = False,
+    evaluation_mode: str = "fixture",
+    client_provenance: str = "fixture",
 ) -> dict[str, object]:
     """Aggregate immutable case rows without exposing prompts or raw payloads.
 
@@ -31,6 +33,14 @@ def build_summary(
     default report comparable across reruns.
     """
 
+    if evaluation_mode not in {"fixture", "graph", "api"}:
+        raise ValueError("evaluation_mode must be fixture, graph or api")
+    if not isinstance(client_provenance, str) or not client_provenance.strip():
+        raise ValueError("client_provenance must be non-empty")
+    if evaluation_mode == "fixture" and client_provenance != "fixture":
+        raise ValueError("fixture mode must use fixture provenance")
+    if evaluation_mode != "fixture" and client_provenance == "fixture":
+        raise ValueError("real evaluation modes require real client provenance")
     rows = sorted(list(results), key=lambda item: item.case_id)
     snapshots = sorted({item.runtime_config_snapshot_id for item in rows})
     allowed = _normalize_baselines(baseline_ids)
@@ -55,6 +65,10 @@ def build_summary(
         "unaudited_answer_count": sum(not row.audited for row in rows),
         "recovery_drill_passed": recovery_drill_passed,
         "backup_restore_passed": backup_restore_passed,
+        "evaluation_mode": evaluation_mode,
+        "client_provenance": client_provenance,
+        "real_query_count": len(rows) if evaluation_mode in {"graph", "api"} else 0,
+        "ragas_status": ragas.get("status", "unavailable"),
     }
     if allowed:
         summary["baseline_ids"] = dict(sorted(allowed.items()))

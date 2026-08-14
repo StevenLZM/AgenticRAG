@@ -11,7 +11,7 @@ import os
 import re
 from collections.abc import Awaitable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -47,6 +47,9 @@ class SnapshotMismatchError(ValueError):
     """Raised when a query response is not from the case's fixed snapshot."""
 
 
+EvaluationMode = Literal["fixture", "graph", "api"]
+
+
 class QueryClient(Protocol):
     async def query(self, case: EvaluationCase) -> Mapping[str, object]: ...
 
@@ -70,6 +73,8 @@ class EvalCaseResult(BaseModel):
     # treated as a resumable completed answer and must be recomputed.
     citation_coverage: float = Field(..., ge=0.0, le=1.0)
     audited: bool
+    evaluation_mode: EvaluationMode = "fixture"
+    client_provenance: str = "fixture"
 
     @field_validator("case_id", "runtime_config_snapshot_id", "route", mode="before")
     @classmethod
@@ -91,6 +96,20 @@ class EvalCaseResult(BaseModel):
         if type(value) is not bool:
             raise ValueError("audited must be boolean")
         return value
+
+    @field_validator("evaluation_mode", mode="before")
+    @classmethod
+    def _strict_evaluation_mode(cls, value: object) -> object:
+        if value not in {"fixture", "graph", "api"}:
+            raise ValueError("evaluation_mode must be fixture, graph or api")
+        return value
+
+    @field_validator("client_provenance", mode="before")
+    @classmethod
+    def _strict_client_provenance(cls, value: object) -> object:
+        if type(value) is not str or _IDENTIFIER.fullmatch(value.strip()) is None:
+            raise ValueError("client_provenance must be a safe identifier")
+        return value.strip()
 
     @field_validator("answer", mode="before")
     @classmethod
@@ -143,10 +162,22 @@ class EvalRunner:
         *,
         output_dir: str | Path,
         ragas_adapter: RagasAdapter | Any | None = None,
+        evaluation_mode: EvaluationMode = "fixture",
+        client_provenance: str = "fixture",
     ) -> None:
+        if evaluation_mode not in {"fixture", "graph", "api"}:
+            raise ValueError("evaluation_mode must be fixture, graph or api")
+        if _IDENTIFIER.fullmatch(client_provenance.strip()) is None:
+            raise ValueError("client_provenance must be a safe identifier")
+        if evaluation_mode == "fixture" and client_provenance != "fixture":
+            raise ValueError("fixture mode must use fixture provenance")
+        if evaluation_mode != "fixture" and client_provenance == "fixture":
+            raise ValueError("real evaluation modes require non-fixture provenance")
         self.client = client
         self.output_dir = Path(output_dir)
         self.ragas_adapter = ragas_adapter if ragas_adapter is not None else RagasAdapter()
+        self.evaluation_mode = evaluation_mode
+        self.client_provenance = client_provenance.strip()
         self.results_path = self.output_dir / "results.jsonl"
         self.summary_path = self.output_dir / "summary.json"
         self.quarantined_rows = 0
@@ -172,6 +203,8 @@ class EvalRunner:
                 baseline_ids=baseline_ids,
                 recovery_drill_passed=recovery_drill_passed,
                 backup_restore_passed=backup_restore_passed,
+                evaluation_mode=self.evaluation_mode,
+                client_provenance=self.client_provenance,
             )
             write_summary(self.summary_path, summary)
             return summary
@@ -184,7 +217,12 @@ class EvalRunner:
         resumed_case_ids: set[str] = set()
         for case in cases:
             cached = existing.get(case.case_id)
-            if cached is not None and cached.runtime_config_snapshot_id == case.runtime_config_snapshot_id:
+            if (
+                cached is not None
+                and cached.runtime_config_snapshot_id == case.runtime_config_snapshot_id
+                and cached.evaluation_mode == self.evaluation_mode
+                and cached.client_provenance == self.client_provenance
+            ):
                 rows[case.case_id] = cached
                 resumed_case_ids.add(case.case_id)
                 continue
@@ -202,6 +240,8 @@ class EvalRunner:
             baseline_ids=baseline_ids,
             recovery_drill_passed=recovery_drill_passed,
             backup_restore_passed=backup_restore_passed,
+            evaluation_mode=self.evaluation_mode,
+            client_provenance=self.client_provenance,
         )
         write_summary(self.summary_path, summary)
         return {
@@ -229,7 +269,10 @@ class EvalRunner:
                 value = json.loads(line, parse_constant=_reject_nonfinite)
                 if not isinstance(value, Mapping):
                     raise ValueError("row must be an object")
-                row = EvalCaseResult.model_validate(dict(value))
+                raw_row = dict(value)
+                if "evaluation_mode" not in raw_row or "client_provenance" not in raw_row:
+                    raise ValueError("result row is missing evaluation provenance")
+                row = EvalCaseResult.model_validate(raw_row)
             except Exception:
                 self.quarantined_rows += 1
                 continue
@@ -303,6 +346,8 @@ class EvalRunner:
             ragas_metrics=ragas,
             citation_coverage=_response_citation_coverage(response),
             audited=_response_audited(response),
+            evaluation_mode=self.evaluation_mode,
+            client_provenance=self.client_provenance,
         )
 
     async def _ragas_metrics(
@@ -352,29 +397,99 @@ class FixtureQueryClient:
             "contexts": [case.reference_answer],
             "citation_coverage": 1.0,
             "audited": True,
+            "client_provenance": "fixture",
         }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run an offline Agentic RAG evaluation dataset")
+    parser = argparse.ArgumentParser(description="Run an Agentic RAG evaluation dataset")
     parser.add_argument("--dataset", required=True, help="path to a baseline/ingestion/security JSONL dataset")
     parser.add_argument("--output", required=True, help="directory for results.jsonl and summary.json")
     parser.add_argument("--limit", type=int, default=None, help="evaluate only the first N cases")
+    parser.add_argument(
+        "--mode",
+        choices=("fixture", "graph", "api"),
+        default="fixture",
+        help="fixture is an offline smoke only; graph/api are real acceptance modes",
+    )
+    parser.add_argument("--base-url", default=None, help="public API base URL for --mode api")
     args = parser.parse_args(argv)
+    if args.mode == "api" and not args.base_url:
+        parser.error("--base-url is required for --mode api")
     cases = load_jsonl_dataset(args.dataset)
     from scripts.backup_local import run_backup_restore_drill
     from scripts.run_recovery_drill import run_recovery_drill
 
     recovery_drill_passed = run_recovery_drill().gate_passed
     backup_restore_passed = run_backup_restore_drill()
-    summary = asyncio.run(
-        EvalRunner(FixtureQueryClient(), output_dir=args.output).run(
-            cases,
-            limit=args.limit,
-            recovery_drill_passed=recovery_drill_passed,
-            backup_restore_passed=backup_restore_passed,
+
+    async def evaluate() -> dict[str, object]:
+        if args.mode == "fixture":
+            return await EvalRunner(
+                FixtureQueryClient(),
+                output_dir=args.output,
+                evaluation_mode="fixture",
+                client_provenance="fixture",
+            ).run(
+                cases,
+                limit=args.limit,
+                recovery_drill_passed=recovery_drill_passed,
+                backup_restore_passed=backup_restore_passed,
+            )
+        if args.mode == "api":
+            from evals.clients import HttpQueryClient
+
+            client = HttpQueryClient(args.base_url)
+            try:
+                return await EvalRunner(
+                    client,
+                    output_dir=args.output,
+                    evaluation_mode="api",
+                    client_provenance=HttpQueryClient.provenance,
+                ).run(
+                    cases,
+                    limit=args.limit,
+                    recovery_drill_passed=recovery_drill_passed,
+                    backup_restore_passed=backup_restore_passed,
+                )
+            finally:
+                await client.aclose()
+
+        from agentic_rag.bootstrap import build_container
+        from agentic_rag.config import Settings
+        from agentic_rag.query.graph import build_query_graph
+        from agentic_rag.runtime.query_composition import (
+            build_query_dependencies,
+            build_query_snapshot,
+            close_query_dependencies,
         )
-    )
+        from evals.clients import GraphQueryClient
+
+        settings = Settings()  # type: ignore[call-arg]
+        container = build_container(settings)
+        dependencies = await build_query_dependencies(container, settings)
+        try:
+            async with container.checkpoints.open_query() as checkpointer:
+                graph = build_query_graph(dependencies, checkpointer)
+                snapshot = build_query_snapshot(settings)
+                return await EvalRunner(
+                    GraphQueryClient(graph, snapshot=snapshot),
+                    output_dir=args.output,
+                    evaluation_mode="graph",
+                    client_provenance=GraphQueryClient.provenance,
+                ).run(
+                    cases,
+                    limit=args.limit,
+                    recovery_drill_passed=recovery_drill_passed,
+                    backup_restore_passed=backup_restore_passed,
+                )
+        finally:
+            await close_query_dependencies(dependencies)
+            await container.close()
+
+    summary = asyncio.run(evaluate())
+    if args.mode == "fixture":
+        print("SMOKE ONLY: fixture evaluation cannot satisfy final acceptance")
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return 0
 
@@ -594,6 +709,7 @@ def _reject_nonfinite(value: str) -> Any:
 
 __all__ = [
     "EvalCaseResult",
+    "EvaluationMode",
     "EvalRunner",
     "FixtureQueryClient",
     "MixedSnapshotError",

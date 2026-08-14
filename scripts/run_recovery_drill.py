@@ -364,8 +364,9 @@ class _FixtureMemoryClient(MemoryClient):
         *,
         user_id: str,
         metadata: dict[str, object],
+        infer: bool = False,
     ) -> object:
-        del messages, user_id, metadata
+        del messages, user_id, metadata, infer
         return None
 
     async def search(self, query: str, *, user_id: str, limit: int) -> object:

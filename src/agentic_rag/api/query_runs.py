@@ -46,6 +46,7 @@ class QueryRunResponse(BaseModel):
     run_id: str
     status: RunStatus
     thread_id: str
+    runtime_config_snapshot_id: str
     question: str = ""
     result_ref: str | None = None
     error_code: str | None = None
@@ -61,6 +62,7 @@ class QueryRunResponse(BaseModel):
             run_id=run.id,
             status=run.status,
             thread_id=run.thread_id,
+            runtime_config_snapshot_id=run.runtime_config_snapshot_id,
             question=run.question,
             result_ref=run.result_ref,
             error_code=run.error_code,
