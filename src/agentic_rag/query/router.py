@@ -13,6 +13,7 @@ from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
 from agentic_rag.memory.models import MemoryContext
+from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.memory.service import MemoryService
 from agentic_rag.models.schemas import RouteDecision
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
@@ -53,8 +54,20 @@ class MemoryContextLoader:
         except asyncio.CancelledError:
             raise
         except (OSError, TimeoutError, ConnectionError) as error:
+            await emit_degradation(
+                component="memory",
+                reason="memory_unavailable",
+                run_id=state["run_id"],
+                snapshot_id=snapshot_from_state(state).snapshot_id,
+                attempt=1,
+                retryable=True,
+                outcome="degraded",
+            )
             context = MemoryContext(degraded=True)
-            errors = [*state.get("errors", []), {"code": "memory_unavailable", "detail": str(error)}]
+            errors = [
+                *state.get("errors", []),
+                {"code": "memory_unavailable", "detail": type(error).__name__},
+            ]
             return {
                 "memory_context": context.model_dump(mode="json"),
                 "errors": errors,
@@ -89,9 +102,27 @@ async def route_query(state: QueryState, gateway: ModelGateway) -> dict[str, obj
     except asyncio.CancelledError:
         raise
     except (StructuredOutputValidationError, ValidationError, TypeError, ValueError) as error:
-        return _research_fallback(state, "router_schema_invalid", str(error))
+        await emit_degradation(
+            component="router",
+            reason="router_schema_invalid",
+            run_id=state["run_id"],
+            snapshot_id=snapshot.snapshot_id,
+            attempt=1,
+            retryable=False,
+            outcome="degraded",
+        )
+        return _research_fallback(state, "router_schema_invalid", type(error).__name__)
     except (OSError, TimeoutError, ConnectionError) as error:
-        return _research_fallback(state, "router_unavailable", str(error))
+        await emit_degradation(
+            component="router",
+            reason="router_unavailable",
+            run_id=state["run_id"],
+            snapshot_id=snapshot.snapshot_id,
+            attempt=1,
+            retryable=True,
+            outcome="degraded",
+        )
+        return _research_fallback(state, "router_unavailable", type(error).__name__)
     next_node = "fast_rag" if decision.route == "fast_rag" else "research_agent"
     return {"route": decision.model_dump(mode="json"), "next_node": next_node}
 

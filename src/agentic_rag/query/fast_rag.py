@@ -10,6 +10,7 @@ from typing import Protocol
 from pydantic import ValidationError
 
 from agentic_rag.models.schemas import EvidenceGrade, RouteDecision
+from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.query.evidence_builder import EvidenceBuilder, EvidenceCoverageTarget, PackedEvidence
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.retrieval.graph import RetrievalService, RetrievalUnavailable
@@ -54,11 +55,21 @@ async def run_fast_rag(
     except asyncio.CancelledError:
         raise
     except (OSError, TimeoutError, ConnectionError, RetrievalUnavailable) as error:
+        await emit_degradation(
+            component="retrieval",
+            reason="retrieval_unavailable",
+            run_id=state["run_id"],
+            snapshot_id=snapshot.snapshot_id,
+            attempt=1,
+            retryable=True,
+            outcome="degraded",
+            event_type="RETRIEVAL_DEGRADED",
+        )
         return {
             "research": {"gaps": ["fast retrieval unavailable"]},
             "errors": [
                 *state.get("errors", []),
-                {"code": "fast_retrieval_unavailable", "detail": str(error)},
+                {"code": "fast_retrieval_unavailable", "detail": type(error).__name__},
             ],
             "next_node": "research_agent",
         }
@@ -77,10 +88,22 @@ async def run_fast_rag(
     except asyncio.CancelledError:
         raise
     except (OSError, TimeoutError, ConnectionError, ValidationError, TypeError, ValueError) as error:
+        await emit_degradation(
+            component="llm",
+            reason="model_unavailable",
+            run_id=state["run_id"],
+            snapshot_id=snapshot.snapshot_id,
+            attempt=1,
+            retryable=True,
+            outcome="degraded",
+        )
         return {
             **base,
             "research": {"gaps": ["evidence grading unavailable"]},
-            "errors": [*state.get("errors", []), {"code": "evidence_grader_unavailable", "detail": str(error)}],
+            "errors": [
+                *state.get("errors", []),
+                {"code": "evidence_grader_unavailable", "detail": type(error).__name__},
+            ],
             "next_node": "research_agent",
         }
     if grade.decision == "sufficient":

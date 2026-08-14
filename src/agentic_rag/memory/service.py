@@ -37,6 +37,7 @@ from agentic_rag.memory.models import (
     PublicMessage,
 )
 from agentic_rag.safety.context import DataEnvelope
+from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.runtime.model_gateway import (
     ModelCall,
     ModelGateway,
@@ -96,7 +97,7 @@ class MemoryServiceImpl:
         try:
             records = self._records(await self._mem0.search(query, user_id=scope.user_id, limit=limit), scope)
         except _operational_errors() as error:
-            _log_degraded("load_context", error)
+            await _log_degraded("load_context", error)
             return MemoryContext(degraded=True)
         envelopes = tuple(
             DataEnvelope(
@@ -121,7 +122,7 @@ class MemoryServiceImpl:
         try:
             candidates = await self._extractor.extract(public_messages)
         except (OSError, TimeoutError, ConnectionError, StructuredOutputValidationError) as error:
-            _log_degraded("extract", error)
+            await _log_degraded("extract", error)
             return
         for candidate in candidates:
             if not _candidate_is_authorized(candidate, public_messages):
@@ -143,14 +144,14 @@ class MemoryServiceImpl:
             except _operational_errors() as error:
                 # Memory capture must not turn an otherwise valid query into a
                 # failed run; a later user statement may safely be captured.
-                _log_degraded("add", error)
+                await _log_degraded("add", error)
                 return
 
     async def list(self, scope: UserScope) -> builtins.list[MemoryRecord]:
         try:
             return self._records(await self._mem0.get_all(user_id=scope.user_id), scope)
         except _operational_errors() as error:
-            _log_degraded("list", error)
+            await _log_degraded("list", error)
             return []
 
     async def delete(self, scope: UserScope, memory_id: str) -> None:
@@ -158,7 +159,7 @@ class MemoryServiceImpl:
         try:
             visible = self._records(await self._mem0.get_all(user_id=scope.user_id), scope)
         except _operational_errors() as error:
-            _log_degraded("delete", error)
+            await _log_degraded("delete", error)
             return
         if memory_id not in {record.id for record in visible}:
             return
@@ -166,7 +167,7 @@ class MemoryServiceImpl:
         try:
             await self._tombstones.request(scope, memory_id)
         except _operational_errors() as error:
-            _log_degraded("tombstone_request", error)
+            await _log_degraded("tombstone_request", error)
             return
         await self._attempt_delete(scope, memory_id)
 
@@ -174,7 +175,7 @@ class MemoryServiceImpl:
         try:
             pending = await self._tombstones.list_pending()
         except _operational_errors() as error:
-            _log_degraded("tombstone_list_pending", error)
+            await _log_degraded("tombstone_list_pending", error)
             return
         for tombstone in pending:
             # Tombstones are application-owned; reconstructing this scope is safe.
@@ -205,9 +206,9 @@ class MemoryServiceImpl:
             if memory_id in {record.id for record in remaining}:
                 raise OSError("provider still returns deleted memory")
         except _operational_errors() as error:
-            _log_degraded("delete_reconcile", error)
+            await _log_degraded("delete_reconcile", error)
             try:
-                await self._tombstones.mark_retry(scope, memory_id, str(error))
+                await self._tombstones.mark_retry(scope, memory_id, type(error).__name__)
             except _operational_errors():
                 pass
             return
@@ -359,7 +360,7 @@ def _operational_errors() -> tuple[type[BaseException], ...]:
     )
 
 
-def _log_degraded(operation: str, error: BaseException) -> None:
+async def _log_degraded(operation: str, error: BaseException) -> None:
     """Log only bounded provider metadata, never memory/provider content."""
     logger.warning(
         "memory_provider_degraded",
@@ -370,4 +371,13 @@ def _log_degraded(operation: str, error: BaseException) -> None:
             "outcome": "degraded",
             "retryable": True,
         },
+    )
+    await emit_degradation(
+        component="memory",
+        reason="memory_unavailable",
+        run_id=None,
+        snapshot_id="",
+        attempt=1,
+        retryable=True,
+        outcome="degraded",
     )

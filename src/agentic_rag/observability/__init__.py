@@ -2,6 +2,7 @@
 
 from agentic_rag.observability.logging import (
     AgentEventEmitter,
+    emit_degradation,
     emit_model_usage,
     event_emission_scope,
     stable_event_key,
@@ -12,6 +13,7 @@ from agentic_rag.observability.tracing import SpanRecord, TraceRecorder
 
 __all__ = [
     "AgentEventEmitter",
+    "emit_degradation",
     "emit_model_usage",
     "event_emission_scope",
     "MetricsProjector",

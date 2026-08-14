@@ -14,6 +14,7 @@ from langgraph.errors import NodeCancelledError
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.models.embeddings import EmbeddingPort
+from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.retrieval.filters import FilterBuilder
 from agentic_rag.retrieval.fusion import rrf_fuse
 from agentic_rag.retrieval.models import (
@@ -160,6 +161,22 @@ def build_retrieval_graph(
                 assert isinstance(result, list)
                 hits[component] = result
 
+        for component, failure in failures.items():
+            await emit_degradation(
+                component=component,
+                reason=(
+                    "lane_timeout"
+                    if failure.error_type in {"TimeoutError", "CancelledError"}
+                    else "lane_failure"
+                ),
+                run_id=None,
+                snapshot_id=state["snapshot"].snapshot_id,
+                attempt=1,
+                retryable=True,
+                outcome="degraded",
+                event_type="RETRIEVAL_DEGRADED",
+            )
+
         if len(failures) == len(results):
             raise RetrievalUnavailable(failures)
 
@@ -196,6 +213,15 @@ def build_retrieval_graph(
         )
         degraded = state["degraded_components"]
         if result.degraded:
+            await emit_degradation(
+                component="reranker",
+                reason="reranker_unavailable",
+                run_id=None,
+                snapshot_id=state["snapshot"].snapshot_id,
+                attempt=1,
+                retryable=True,
+                outcome="degraded",
+            )
             degraded = (*degraded, "reranker")
         return _stage_update(
             state,

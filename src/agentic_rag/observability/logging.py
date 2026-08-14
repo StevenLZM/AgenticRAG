@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -17,11 +18,14 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from agentic_rag.persistence.artifacts import ArtifactStore
 from agentic_rag.persistence.repositories import AgentEvent, EventRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 _SENSITIVE_VALUE = re.compile(
@@ -39,6 +43,9 @@ _SAFE_SUMMARIES = frozenset(
         "clarify",
         "refuse",
         "progress update",
+        "degraded",
+        "refused",
+        "dlq",
         "model_completed",
         "queue_waited",
         "retrieval_completed",
@@ -96,8 +103,56 @@ _TERMINATION_REASONS = frozenset(
     }
 )
 _DEGRADED_COMPONENTS = frozenset(
-    {"dense", "bm25", "reranker", "memory", "llm", "elasticsearch", "redis", "artifact_store"}
+    {
+        "dense",
+        "bm25",
+        "reranker",
+        "memory",
+        "mem0",
+        "llm",
+        "elasticsearch",
+        "redis",
+        "artifact_store",
+        "retrieval",
+        "router",
+        "generation",
+        "audit",
+        "citation",
+        "outbox",
+        "query_worker",
+        "worker",
+        "mysql",
+        "checkpoint",
+        "unknown",
+    }
 )
+_DEGRADATION_REASONS = frozenset(
+    {
+        "lane_failure",
+        "lane_timeout",
+        "retrieval_unavailable",
+        "reranker_unavailable",
+        "memory_unavailable",
+        "router_unavailable",
+        "router_schema_invalid",
+        "model_unavailable",
+        "model_schema_invalid",
+        "generation_unavailable",
+        "audit_failed",
+        "authorization_unavailable",
+        "provider_outage",
+        "circuit_open",
+        "outbox_retry",
+        "lease_lost",
+        "cancelled",
+        "worker_timeout",
+        "worker_dlq",
+        "invalid_input",
+        "unknown",
+    }
+)
+_DEGRADATION_OUTCOMES = frozenset({"degraded", "refused", "dlq"})
+_SAFE_CONTEXT_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -112,6 +167,16 @@ def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
         return result
     for key, value in attributes.items():
         if key in _NUMERIC_ATTRIBUTES and _safe_number(value):
+            result[key] = value
+        elif key == "attempt" and _safe_number(value) and int(value) == value:
+            result[key] = int(value)
+        elif key == "retryable" and type(value) is bool:
+            result[key] = value
+        elif key == "component" and value in _DEGRADED_COMPONENTS:
+            result[key] = value
+        elif key == "reason" and value in _DEGRADATION_REASONS:
+            result[key] = value
+        elif key == "outcome" and value in _DEGRADATION_OUTCOMES:
             result[key] = value
         elif key == "termination_reason" and value in _TERMINATION_REASONS:
             result[key] = value
@@ -283,6 +348,111 @@ async def emit_model_usage(
         raise
     except Exception:
         return
+
+
+async def emit_degradation(
+    *,
+    component: str,
+    reason: str,
+    run_id: str | None,
+    snapshot_id: str,
+    attempt: int,
+    retryable: bool,
+    outcome: Literal["degraded", "refused", "dlq"],
+    event_type: str | None = None,
+) -> None:
+    """Emit one bounded signal for a fallback, refusal, or circuit outcome.
+
+    This helper is best-effort: telemetry failure must never turn a safe
+    business fallback into a failed query.  Both the logger and durable event
+    contain only allowlisted enums and non-sensitive server identifiers.
+    When called inside :func:`event_emission_scope`, the event is persisted only
+    if the scope's run and snapshot match the supplied values.
+    """
+    safe_component = component if component in _DEGRADED_COMPONENTS else "unknown"
+    safe_reason = reason if reason in _DEGRADATION_REASONS else "unknown"
+    safe_outcome = outcome if outcome in _DEGRADATION_OUTCOMES else "degraded"
+    safe_attempt = attempt if type(attempt) is int and attempt >= 0 else 0
+    safe_retryable = retryable if type(retryable) is bool else False
+    raw_snapshot = snapshot_id.strip() if isinstance(snapshot_id, str) else ""
+    safe_snapshot = raw_snapshot if _SAFE_CONTEXT_ID.fullmatch(raw_snapshot) else "unknown"
+    scope = _EMISSION_SCOPE.get()
+    safe_run = (
+        run_id.strip()
+        if isinstance(run_id, str) and _SAFE_CONTEXT_ID.fullmatch(run_id.strip())
+        else None
+    )
+    if scope is not None:
+        if not raw_snapshot:
+            safe_snapshot = scope.emitter.runtime_config_snapshot_id
+        if safe_run is None:
+            safe_run = scope.run_id
+        elif safe_run != scope.run_id:
+            safe_run = None
+        if safe_snapshot != scope.emitter.runtime_config_snapshot_id:
+            safe_snapshot = "unknown"
+    resolved_event_type = event_type or _degradation_event_type(
+        safe_component, safe_reason, safe_outcome
+    )
+    if _EVENT_TYPE.fullmatch(resolved_event_type) is None:
+        resolved_event_type = "COMPONENT_DEGRADED"
+    logger.warning(
+        "degradation component=%s reason=%s outcome=%s retryable=%s attempt=%s run_id=%s snapshot_id=%s",
+        safe_component,
+        safe_reason,
+        safe_outcome,
+        safe_retryable,
+        safe_attempt,
+        safe_run or "none",
+        safe_snapshot,
+    )
+    if scope is None or safe_run is None or safe_snapshot == "unknown":
+        return
+    if scope.emitter.runtime_config_snapshot_id != safe_snapshot:
+        return
+    try:
+        await scope.emitter.emit(
+            run_id=safe_run,
+            user_id=scope.user_id or "unknown",
+            event_type=resolved_event_type,
+            summary=safe_outcome,
+            event_key=stable_event_key(
+                safe_run,
+                "degradation",
+                resolved_event_type,
+                safe_component,
+                safe_reason,
+                str(safe_attempt),
+                safe_outcome,
+            ),
+            attributes={
+                "attempt": safe_attempt,
+                "component": safe_component,
+                "reason": safe_reason,
+                "retryable": safe_retryable,
+                "outcome": safe_outcome,
+            },
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        # The warning above is the fallback when the durable repository/artifact
+        # boundary itself is unavailable.
+        return
+
+
+def _degradation_event_type(component: str, reason: str, outcome: str) -> str:
+    if reason == "circuit_open":
+        return "CIRCUIT_OPEN"
+    if outcome == "dlq":
+        return "WORKER_DLQ"
+    if component in {"dense", "bm25", "retrieval"}:
+        return "RETRIEVAL_DEGRADED"
+    if component == "outbox":
+        return "OUTBOX_RETRY"
+    if outcome == "refused":
+        return "COMPONENT_REFUSED"
+    return "COMPONENT_DEGRADED"
 
 
 def stable_event_key(*parts: str) -> str:

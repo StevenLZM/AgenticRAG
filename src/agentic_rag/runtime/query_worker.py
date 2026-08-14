@@ -8,13 +8,14 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agentic_rag.domain.models import RunStatus, UserScope
 from agentic_rag.observability.logging import (
     AgentEventEmitter,
+    emit_degradation,
     event_emission_scope,
     stable_event_key,
 )
@@ -230,6 +231,14 @@ class QueryWorker:
             )
             return
         if not claim.question.strip():
+            await self._emit_degradation(
+                claim,
+                "invalid_input",
+                attempt=claim.claim_generation,
+                retryable=False,
+                outcome="refused",
+                event_type="QUERY_REFUSED",
+            )
             await self._finish_and_ack(
                 message,
                 claim,
@@ -246,6 +255,10 @@ class QueryWorker:
                 ):
                     result = await self._invoke_with_heartbeat(claim)
         except RunCancelled:
+            await self._emit_degradation(
+                claim, "cancelled", attempt=claim.claim_generation, retryable=False,
+                outcome="refused", event_type="QUERY_CANCELLED"
+            )
             await self._finish_and_ack(
                 message,
                 claim,
@@ -256,6 +269,10 @@ class QueryWorker:
             )
             return
         except asyncio.TimeoutError:
+            await self._emit_degradation(
+                claim, "worker_timeout", attempt=claim.claim_generation, retryable=True,
+                outcome="degraded", event_type="QUERY_TIMEOUT"
+            )
             await self._finish_and_ack(
                 message,
                 claim,
@@ -266,6 +283,10 @@ class QueryWorker:
             )
             return
         except LeaseLost:
+            await self._emit_degradation(
+                claim, "lease_lost", attempt=claim.claim_generation, retryable=True,
+                outcome="degraded", event_type="LEASE_LOST"
+            )
             return
         except asyncio.CancelledError:
             raise
@@ -372,6 +393,16 @@ class QueryWorker:
                 raise
             except Exception:
                 logger.exception("query_outbox_dispatch_failed")
+                await emit_degradation(
+                    component="outbox",
+                    reason="outbox_retry",
+                    run_id=None,
+                    snapshot_id="",
+                    attempt=1,
+                    retryable=True,
+                    outcome="degraded",
+                    event_type="OUTBOX_RETRY",
+                )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self._outbox_interval)
             except asyncio.TimeoutError:
@@ -452,6 +483,14 @@ class QueryWorker:
             # The lease fence is authoritative.  Leave the Redis delivery
             # pending for reclaim and do not append or acknowledge a terminal
             # event owned by a different worker.
+            await self._emit_degradation(
+                claim,
+                "lease_lost",
+                attempt=claim.claim_generation,
+                retryable=True,
+                outcome="degraded",
+                event_type="LEASE_LOST",
+            )
             return
         await self._emit_run_lifecycle(
             claim,
@@ -469,6 +508,14 @@ class QueryWorker:
         *,
         started_monotonic: float,
     ) -> None:
+        await self._emit_degradation(
+            claim,
+            "worker_dlq",
+            attempt=claim.claim_generation,
+            retryable=False,
+            outcome="dlq",
+            event_type="WORKER_DLQ",
+        )
         await self._broker.dead_letter(
             QUERY_DEAD_STREAM, message, reason,
             dedupe_key=f"query-dead:{claim.id}:{claim.claim_generation}",
@@ -497,6 +544,38 @@ class QueryWorker:
                 reason,
                 started_monotonic=started_monotonic,
             )
+        else:
+            await self._emit_degradation(
+                claim,
+                "provider_outage",
+                attempt=claim.claim_generation,
+                retryable=True,
+                outcome="degraded",
+                event_type="QUERY_RETRY",
+            )
+
+    async def _emit_degradation(
+        self,
+        claim: QueryRun,
+        reason: str,
+        *,
+        attempt: int,
+        retryable: bool,
+        outcome: Literal["degraded", "refused", "dlq"],
+        event_type: str,
+    ) -> None:
+        await emit_degradation(
+            component="query_worker",
+            reason=reason,
+            run_id=claim.id,
+            snapshot_id=RuntimeConfigSnapshot.model_validate(
+                claim.runtime_config_snapshot
+            ).snapshot_id,
+            attempt=attempt,
+            retryable=retryable,
+            outcome=outcome,
+            event_type=event_type,
+        )
 
     async def _emit_run_lifecycle(
         self,

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import replace
 
 import pytest
 
 from agentic_rag.domain.models import UserScope
+from agentic_rag.observability.logging import AgentEventEmitter, event_emission_scope
+from agentic_rag.persistence.artifacts import LocalArtifactStore
+from agentic_rag.persistence.repositories import AgentEvent
 from agentic_rag.retrieval.graph import (
     RetrievalDependencies,
     RetrievalService,
@@ -115,6 +119,19 @@ class FakeParentFetcher:
         ]
 
 
+class RecordingEvents:
+    def __init__(self) -> None:
+        self.events: list[AgentEvent] = []
+
+    async def append(self, event: AgentEvent) -> int:
+        self.events.append(replace(event, id=len(self.events) + 1))
+        return len(self.events)
+
+    async def list_after(self, *args: object, **kwargs: object) -> list[AgentEvent]:
+        del args, kwargs
+        return []
+
+
 @pytest.fixture
 def deps() -> RetrievalDependencies:
     return RetrievalDependencies(
@@ -168,6 +185,29 @@ async def test_graph_degrades_to_bm25_when_dense_fails(
     assert batch.degraded_components == ("dense",)
     assert [parent.parent_id for parent in batch.parents] == ["parent-bm25"]
     assert result["lane_failures"]["dense"].error_type == "OSError"
+
+
+async def test_single_lane_degradation_emits_bounded_durable_signal(
+    deps: RetrievalDependencies,
+    tmp_path,
+) -> None:
+    events = RecordingEvents()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(
+        events,
+        artifacts,
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+    )
+    deps.vector.error = OSError("private provider response must not be persisted")
+
+    async with event_emission_scope(emitter, "run-1", "retrieval", user_id=SCOPE.user_id):
+        result = await RetrievalService(deps).retrieve(REQUEST, SCOPE, SNAPSHOT)
+
+    assert result.degraded_components == ("dense",)
+    assert events.events[-1].event_type == "RETRIEVAL_DEGRADED"
+    assert events.events[-1].payload_ref is not None
+    payload = artifacts.read_json(artifacts.describe(events.events[-1].payload_ref))
+    assert "private provider response" not in str(payload)
 
 
 async def test_graph_fails_closed_when_both_lanes_fail(

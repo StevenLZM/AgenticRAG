@@ -18,7 +18,8 @@ from typing import Any, Generic, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from agentic_rag.observability.logging import emit_model_usage
+from agentic_rag.observability.logging import emit_degradation, emit_model_usage
+from agentic_rag.runtime.circuit import CircuitOpenError, CircuitState
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
@@ -83,6 +84,7 @@ class ModelGateway:
         backoff_base_seconds: float = 0.25,
         sleep: Sleep = asyncio.sleep,
         random_source: Callable[[], float] = random.random,
+        circuit: CircuitState | None = None,
     ) -> None:
         if max_retries < 0 or max_retries > 2:
             raise ValueError("max_retries must be between 0 and 2")
@@ -91,6 +93,7 @@ class ModelGateway:
         self._backoff_base_seconds = backoff_base_seconds
         self._sleep = sleep
         self._random = random_source
+        self._circuit = circuit or CircuitState()
 
     async def complete(self, call: ModelCall) -> ModelResponse[str]:
         """Return plain text, retrying only transient provider failures."""
@@ -136,6 +139,16 @@ class ModelGateway:
             try:
                 value = _validate_schema(schema, _extract_text(response))
             except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as repair_error:
+                await emit_degradation(
+                    component="llm",
+                    reason="model_schema_invalid",
+                    run_id=None,
+                    snapshot_id=call.snapshot.snapshot_id,
+                    attempt=attempts,
+                    retryable=False,
+                    outcome="refused",
+                    event_type="MODEL_REPAIR_EXHAUSTED",
+                )
                 raise StructuredOutputValidationError(
                     "model output did not satisfy the requested schema after repair"
                 ) from repair_error
@@ -158,15 +171,65 @@ class ModelGateway:
 
     async def _request_with_retries(self, call: ModelCall) -> tuple[object, int]:
         for attempt in range(1, self._max_retries + 2):
+            if not self._circuit.allow_call():
+                await emit_degradation(
+                    component="llm",
+                    reason="circuit_open",
+                    run_id=None,
+                    snapshot_id=call.snapshot.snapshot_id,
+                    attempt=attempt,
+                    retryable=True,
+                    outcome="degraded",
+                    event_type="CIRCUIT_OPEN",
+                )
+                raise CircuitOpenError("model provider circuit is open")
             try:
                 response = await asyncio.wait_for(
                     self._create(call), timeout=call.effective_timeout_seconds
                 )
+                self._circuit.record_success()
                 return response, attempt
+            except CircuitOpenError:
+                raise
             except BaseException as error:
                 if not _is_transient(error) or attempt > self._max_retries:
+                    if _is_transient(error) and attempt > self._max_retries:
+                        self._circuit.record_failure()
+                        await emit_degradation(
+                            component="llm",
+                            reason="model_unavailable",
+                            run_id=None,
+                            snapshot_id=call.snapshot.snapshot_id,
+                            attempt=attempt,
+                            retryable=True,
+                            outcome="degraded",
+                            event_type="MODEL_RETRY_EXHAUSTED",
+                        )
                     raise
                 # Jitter prevents synchronized reattempts across independent runs.
+                opened = self._circuit.record_failure()
+                await emit_degradation(
+                    component="llm",
+                    reason="provider_outage",
+                    run_id=None,
+                    snapshot_id=call.snapshot.snapshot_id,
+                    attempt=attempt,
+                    retryable=True,
+                    outcome="degraded",
+                    event_type="MODEL_RETRY",
+                )
+                if opened:
+                    await emit_degradation(
+                        component="llm",
+                        reason="circuit_open",
+                        run_id=None,
+                        snapshot_id=call.snapshot.snapshot_id,
+                        attempt=attempt,
+                        retryable=True,
+                        outcome="degraded",
+                        event_type="CIRCUIT_OPEN",
+                    )
+                    raise CircuitOpenError("model provider circuit opened") from error
                 delay = self._backoff_base_seconds * (2 ** (attempt - 1))
                 await self._sleep(delay * (0.5 + self._random()))
         raise AssertionError("retry loop must either return or raise")

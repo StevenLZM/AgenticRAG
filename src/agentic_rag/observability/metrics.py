@@ -81,12 +81,20 @@ class MetricsProjector:
         citation_cited = float(state.get("citation_cited", 0.0))
         citation_expected = float(state.get("citation_expected", 0.0))
         estimated_cost_observed = bool(state.get("estimated_cost_observed", False))
+        seen_event_keys = {
+            value
+            for value in state.get("seen_event_keys", [])
+            if isinstance(value, str) and value
+        }
         processed = 0
 
         for event in events:
             through_id = max(through_id, event.id or after_id)
             if event.runtime_config_snapshot_id != self._snapshot_id:
                 continue
+            if event.event_key in seen_event_keys:
+                continue
+            seen_event_keys.add(event.event_key)
             processed += 1
             event_type = event.event_type.upper()
             attributes = self._attributes_for(event)
@@ -182,6 +190,9 @@ class MetricsProjector:
                     "citation_cited": citation_cited,
                     "citation_expected": citation_expected,
                     "estimated_cost_observed": estimated_cost_observed,
+                    # Keep replay protection bounded while retaining enough
+                    # cursor history for normal page-by-page projections.
+                    "seen_event_keys": sorted(seen_event_keys)[-4096:],
                 },
             ),
             estimated_cost_status=(

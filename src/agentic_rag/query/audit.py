@@ -10,6 +10,7 @@ from typing import Annotated, Protocol
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from agentic_rag.domain.models import UserScope
+from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.models.schemas import EvidenceGrade
 from agentic_rag.persistence.repositories import ParentRepository
 from agentic_rag.query.evidence_builder import EvidenceItem, EvidenceManifestEntry, PackedEvidence
@@ -246,6 +247,8 @@ async def generate_with_mandatory_audits(
     revision_count = raw_revision_count if isinstance(raw_revision_count, int) else 0
     prior_audits = _as_list(state.get("audit_results"))
     prior_errors = _as_list(state.get("errors"))
+    raw_run_id = state.get("run_id")
+    run_id = raw_run_id if isinstance(raw_run_id, str) else None
     repair_issues: tuple[str, ...] = ()
     for attempt in range(2):
         try:
@@ -255,7 +258,20 @@ async def generate_with_mandatory_audits(
         except (KeyboardInterrupt, SystemExit):
             raise
         except AnswerGenerationUnavailable as error:
-            return _refusal(revision_count, prior_audits, [*prior_errors, {"code": "generation_unavailable", "detail": str(error)}])
+            await emit_degradation(
+                component="generation",
+                reason="generation_unavailable",
+                run_id=run_id,
+                snapshot_id=snapshot.snapshot_id,
+                attempt=attempt + 1,
+                retryable=True,
+                outcome="refused",
+            )
+            return _refusal(
+                revision_count,
+                prior_audits,
+                [*prior_errors, {"code": "generation_unavailable", "detail": type(error).__name__}],
+            )
         faithfulness = await faithfulness_auditor.audit(question, draft, packed_evidence, scope=scope, snapshot=snapshot)
         if authorization_resolver is None:
             citation = CitationValidation(passed=False, reasons=("authorization_resolver_required",))
@@ -289,6 +305,16 @@ async def generate_with_mandatory_audits(
         if attempt == 0 and revision_count < snapshot.max_answer_revisions:
             revision_count += 1
             continue
+        await emit_degradation(
+            component="audit",
+            reason="audit_failed",
+            run_id=run_id,
+            snapshot_id=snapshot.snapshot_id,
+            attempt=attempt + 1,
+            retryable=False,
+            outcome="refused",
+            event_type="AUDIT_REFUSED",
+        )
         return _refusal(revision_count, prior_audits, prior_errors)
     raise AssertionError("audit repair loop must return")
 

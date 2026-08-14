@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from redis.exceptions import RedisError
 
+from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.persistence.redis_queue import StreamBroker
 from agentic_rag.persistence.repositories import OutboxRecord, OutboxRepository
 
@@ -36,6 +37,16 @@ class OutboxDispatcher:
                 await self.redispatch(row)
             except RedisError:
                 await self._outbox.schedule_retry(row.id)
+                await emit_degradation(
+                    component="outbox",
+                    reason="outbox_retry",
+                    run_id=row.aggregate_id,
+                    snapshot_id="",
+                    attempt=row.attempt_count + 1,
+                    retryable=True,
+                    outcome="degraded",
+                    event_type="OUTBOX_RETRY",
+                )
             else:
                 dispatched += 1
         return dispatched
