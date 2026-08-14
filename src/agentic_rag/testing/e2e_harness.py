@@ -97,11 +97,12 @@ HealthProbe = Callable[[], Awaitable[bool] | bool]
 class SecurityRegressionHarness:
     """Run tenant, content-safety and durable-telemetry adversarial checks."""
 
-    def __init__(self, *, artifact_root: Path) -> None:
+    def __init__(self, *, artifact_root: Path, inject_raw_event: bool = False) -> None:
         root = Path(artifact_root)
         # LocalArtifactStore enforces the root ownership/mode boundary.  The
         # test caller owns the temporary root; no environment path is accepted.
         self._artifacts = LocalArtifactStore(root)
+        self._inject_raw_event = inject_raw_event
 
     async def run(self) -> SecurityRegressionResult:
         attacker = UserScope(user_id="attacker")
@@ -200,6 +201,21 @@ class SecurityRegressionHarness:
                 "attempts": 1,
             },
         )
+        if self._inject_raw_event:
+            # Bypass the sanitized emitter to model a compromised/mutated
+            # durable row. The regression scanner must catch these fields.
+            await events.append(
+                AgentEvent(
+                    event_key="mutated-raw-event",
+                    trace_id="run-attacker",
+                    run_id="run-attacker",
+                    user_id=attacker.user_id,
+                    event_type="TOOL_OUTPUT",
+                    summary="raw prompt/tool input",
+                    runtime_config_snapshot_id=snapshot.snapshot_id,
+                    node_name="tool",
+                )
+            )
         # A second tenant is present in the durable repository and provider
         # fixture.  Scope filtering must keep it out of the attacker's view.
         await emitter.emit(
@@ -225,7 +241,14 @@ class SecurityRegressionHarness:
             if "prompt" in path.casefold() or "tool" in path.casefold()
         )
         all_payloads = _artifact_payloads(self._artifacts, all_artifact_paths)
-        raw_sensitive_fields = tuple(sorted(_sensitive_fields(all_payloads)))
+        raw_sensitive_fields = tuple(
+            sorted(
+                {
+                    *_sensitive_fields(all_payloads),
+                    *_sensitive_event_fields(events.events),
+                }
+            )
+        )
         durable_payloads = tuple(
             _read_event_payload(self._artifacts, event.payload_ref)
             for event in scoped_events
@@ -565,4 +588,21 @@ def _sensitive_fields(values: object, prefix: str = "") -> set[str]:
     elif isinstance(values, list):
         for index, value in enumerate(values):
             found.update(_sensitive_fields(value, f"{prefix}[{index}]"))
+    return found
+
+
+def _sensitive_event_fields(events: list[AgentEvent]) -> set[str]:
+    """Detect raw prompt/tool text in durable Event identity/summary fields."""
+    found: set[str] = set()
+    markers = ("prompt", "tool", "secret", "reasoning")
+    for index, event in enumerate(events):
+        values = {
+            "event_type": event.event_type,
+            "node_name": event.node_name or "",
+            "summary": event.summary,
+        }
+        for field_name, value in values.items():
+            lowered = str(value).casefold()
+            if any(marker in lowered for marker in markers):
+                found.add(f"events[{index}].{field_name}")
     return found

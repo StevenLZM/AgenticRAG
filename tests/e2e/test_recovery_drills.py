@@ -35,6 +35,7 @@ def test_recovery_drill_report_is_deterministic_and_has_all_scenarios() -> None:
     assert first.replayed_parent_count > 0
     assert first.replayed_child_count > 0
     assert first.artifact_quarantine_count == 1
+    assert first.memory_scope_user_ids == ("attacker",)
     assert all(first.scenario_invariants.values())
 
 

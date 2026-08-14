@@ -61,3 +61,16 @@ async def test_durable_output_contains_no_raw_prompt_or_tool_fields(
     assert all("tool" not in path.casefold() for path in result.durable_output)
     assert result.raw_sensitive_fields == ()
     assert result.user_leak_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mutated_durable_event_fields_are_counted_as_sensitive(
+    tmp_path: Path,
+) -> None:
+    result = await SecurityRegressionHarness(
+        artifact_root=tmp_path / "artifacts",
+        inject_raw_event=True,
+    ).run()
+
+    assert result.raw_sensitive_fields
+    assert result.user_leak_count > 0

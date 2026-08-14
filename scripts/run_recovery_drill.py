@@ -9,6 +9,7 @@ by small in-memory fakes that deliberately replay writes.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -28,6 +29,12 @@ if str(source_root) not in sys.path:
     sys.path.insert(0, str(source_root))
 
 from agentic_rag.domain.models import UserScope  # noqa: E402
+from agentic_rag.memory.models import (  # noqa: E402
+    MemoryClient,
+    MemoryTombstoneStore,
+    Tombstone,
+)
+from agentic_rag.memory.service import MemoryServiceImpl  # noqa: E402
 from agentic_rag.persistence.artifacts import ArtifactRef, LocalArtifactStore  # noqa: E402
 from agentic_rag.persistence.repositories import AgentEvent  # noqa: E402
 
@@ -78,6 +85,7 @@ class RecoveryDrillReport(BaseModel):
         default=0,
         ge=0, description="missing or invalid Artifacts quarantined"
     )
+    memory_scope_user_ids: tuple[str, ...] = ()
     user_leak_count: int = Field(ge=0)
 
     @model_validator(mode="before")
@@ -181,6 +189,7 @@ class _DrillState:
     scenario_invariants: dict[str, bool] = field(default_factory=dict)
     scenario_statuses: dict[str, ScenarioStatus] = field(default_factory=dict)
     artifact_quarantine_count: int = 0
+    memory_scope_user_ids: tuple[str, ...] = ()
     leaked_user_ids: set[str] = field(default_factory=set)
 
 
@@ -232,6 +241,7 @@ def run_recovery_drill() -> RecoveryDrillReport:
             replayed_child_count=_replays(state.children.attempts),
             replayed_event_count=_replays(state.events.attempts),
             artifact_quarantine_count=state.artifact_quarantine_count,
+            memory_scope_user_ids=state.memory_scope_user_ids,
             user_leak_count=len(state.leaked_user_ids),
         )
 
@@ -347,23 +357,93 @@ def _missing_artifact_quarantine(state: _DrillState) -> bool:
     return state.artifact_quarantine_count == 1
 
 
-def _mem0_unavailable(state: _DrillState) -> bool:
-    # Both namespaces are present in the provider fixture. Scope filtering is
-    # performed before the outage fallback; the outage itself returns no rows.
-    rows = [
-        (state.expected_user_id, "attacker preference"),
-        ("victim", "victim secret"),
-    ]
-    scoped = [row for row in rows if row[0] == state.expected_user_id]
-    state.leaked_user_ids.update(
-        user_id for user_id, _text in scoped if user_id != state.expected_user_id
-    )
-    try:
+class _FixtureMemoryClient(MemoryClient):
+    async def add(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        user_id: str,
+        metadata: dict[str, object],
+    ) -> object:
+        del messages, user_id, metadata
+        return None
+
+    async def search(self, query: str, *, user_id: str, limit: int) -> object:
+        del query, user_id, limit
+        # Return both namespaces deliberately; MemoryServiceImpl must apply
+        # the server-owned scope rather than trusting provider user_id input.
+        return {
+            "results": [
+                {
+                    "id": "memory-attacker",
+                    "memory": "attacker preference",
+                    "user_id": "attacker",
+                },
+                {
+                    "id": "memory-victim",
+                    "memory": "victim secret",
+                    "user_id": "victim",
+                },
+            ]
+        }
+
+    async def get_all(self, *, user_id: str) -> object:
+        del user_id
+        return {"results": []}
+
+    async def delete(self, memory_id: str) -> object:
+        del memory_id
+        return None
+
+
+class _UnavailableMemoryClient(_FixtureMemoryClient):
+    async def search(self, query: str, *, user_id: str, limit: int) -> object:
+        del query, user_id, limit
         raise ConnectionError("mem0 unavailable")
-    except ConnectionError:
-        degraded_rows: list[tuple[str, str]] = []
+
+
+class _NoopMemoryTombstones(MemoryTombstoneStore):
+    async def request(self, scope: UserScope, memory_id: str) -> Tombstone:
+        return Tombstone(user_id=scope.user_id, memory_id=memory_id)
+
+    async def list_pending(self, limit: int = 100) -> list[Tombstone]:
+        del limit
+        return []
+
+    async def mark_completed(self, scope: UserScope, memory_id: str) -> None:
+        del scope, memory_id
+
+    async def mark_retry(self, scope: UserScope, memory_id: str, error: str) -> None:
+        del scope, memory_id, error
+
+
+def _mem0_unavailable(state: _DrillState) -> bool:
+    async def read_contexts() -> tuple[object, object]:
+        scope = UserScope(user_id=state.expected_user_id)
+        tombstones = _NoopMemoryTombstones()
+        scoped_service = MemoryServiceImpl(
+            _FixtureMemoryClient(), tombstones=tombstones, policy_version="drill-v1"
+        )
+        unavailable_service = MemoryServiceImpl(
+            _UnavailableMemoryClient(), tombstones=tombstones, policy_version="drill-v1"
+        )
+        return (
+            await scoped_service.load_context(scope, "summarize"),
+            await unavailable_service.load_context(scope, "summarize"),
+        )
+
+    scoped_context, unavailable_context = asyncio.run(read_contexts())
+    records = getattr(scoped_context, "records", ())
+    state.memory_scope_user_ids = tuple(record.user_id for record in records)
+    state.leaked_user_ids.update(
+        user_id
+        for user_id in state.memory_scope_user_ids
+        if user_id != state.expected_user_id
+    )
     state.events.append(_event("memory:attacker:degraded", state.expected_user_id))
-    return len(scoped) == 1 and degraded_rows == []
+    return state.memory_scope_user_ids == (state.expected_user_id,) and bool(
+        getattr(unavailable_context, "degraded", False)
+    ) and not getattr(unavailable_context, "records", ())
 
 
 def _publish_to_redis(value: str, *, fail: bool) -> None:
