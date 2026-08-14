@@ -119,6 +119,10 @@ class MetricsProjector:
             if "REPAIR" in event_type:
                 _add_number(metrics, "repair_count", 1)
                 repair_seen = True
+            repair_count = _number(attributes.get("repair_count"))
+            if repair_count is not None:
+                _add_number(metrics, "repair_count", repair_count)
+                repair_seen = repair_seen or repair_count > 0
             if "DEGRADED" in event_type or attributes.get("degraded_components"):
                 _add_number(metrics, "degraded_component_count", 1)
                 degraded_seen = True
@@ -165,9 +169,9 @@ class MetricsProjector:
                     "terminal_seen": terminal_seen,
                     "outcome_seen": outcome_seen,
                     "repair_seen": repair_seen,
-                "degraded_seen": degraded_seen,
-                "citation_cited": citation_cited,
-                "citation_expected": citation_expected,
+                    "degraded_seen": degraded_seen,
+                    "citation_cited": citation_cited,
+                    "citation_expected": citation_expected,
                 },
             ),
         )

@@ -68,6 +68,15 @@ class FakeClient:
         self.responses = FakeResponsesApi(values)
 
 
+@dataclass
+class UsageEmitter:
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def emit(self, **kwargs: object) -> int:
+        self.calls.append(dict(kwargs))
+        return len(self.calls)
+
+
 class FakeChatCompletionsApi(FakeResponsesApi):
     async def create(self, **kwargs: object) -> object:
         self.calls.append(kwargs)
@@ -119,6 +128,21 @@ async def test_transient_failure_is_retried_by_gateway_once_per_attempt() -> Non
     assert result.requested_model == "light-model"
     assert result.actual_model == "provider-resolved-model"
     assert (result.input_tokens, result.output_tokens) == (7, 3)
+
+
+async def test_gateway_emits_real_usage_only_inside_task_local_event_scope() -> None:
+    """The gateway emits provider-derived counts without receiving prompt content."""
+    from agentic_rag.observability.logging import event_emission_scope
+
+    emitter = UsageEmitter()
+    async with event_emission_scope(emitter, "run-1", "llm", user_id="user-1"):
+        await ModelGateway(FakeClient(["hello"]), sleep=lambda _: _no_sleep()).complete(ROUTE_CALL)
+
+    assert len(emitter.calls) == 1
+    event = emitter.calls[0]
+    assert event["event_type"] == "LLM_COMPLETED"
+    assert event["attributes"] == {"input_tokens": 7, "output_tokens": 3, "attempts": 1, "latency_ms": event["attributes"]["latency_ms"]}
+    assert event["event_key"]
 
 
 async def test_sdk_connection_error_is_retried_without_retrying_value_errors() -> None:

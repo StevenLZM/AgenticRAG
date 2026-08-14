@@ -45,6 +45,8 @@ async def run(settings: Settings, dependencies_factory: DependenciesFactory) -> 
                 broker=container.broker,
                 graph_factory=build_graph_factory(dependencies, checkpointer),
                 worker_id=f"{socket.gethostname()}:{os.getpid()}",
+                trace_recorder=dependencies.trace_recorder,
+                event_emitter=dependencies.event_emitter,
             )
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()

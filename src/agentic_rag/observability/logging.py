@@ -7,11 +7,15 @@ metadata.
 
 from __future__ import annotations
 
-import re
+import asyncio
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+import re
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -60,7 +64,23 @@ _NUMERIC_ATTRIBUTES = frozenset(
         "cited_claim_count",
         "claim_count",
         "repair_count",
+        "attempts",
+        "latency_ms",
     }
+)
+
+
+@dataclass(slots=True)
+class _EmissionScope:
+    emitter: "AgentEventEmitter"
+    run_id: str
+    operation: str
+    user_id: str | None
+    sequence: int = 0
+
+
+_EMISSION_SCOPE: ContextVar[_EmissionScope | None] = ContextVar(
+    "agentic_rag_event_emission_scope", default=None
 )
 _TERMINATION_REASONS = frozenset(
     {
@@ -198,6 +218,81 @@ class AgentEventEmitter:
             created_at=created_at,
         )
         return await self._repository.append(event)
+
+
+@asynccontextmanager
+async def event_emission_scope(
+    emitter: AgentEventEmitter,
+    run_id: str,
+    operation: str,
+    *,
+    user_id: str | None = None,
+) -> AsyncIterator[None]:
+    """Bind one safe Event emitter to the current async ModelGateway task."""
+    if not run_id.strip() or _NODE_NAME.fullmatch(operation) is None:
+        raise ValueError("run_id and operation must be safe non-blank identifiers")
+    if user_id is not None and not user_id.strip():
+        raise ValueError("user_id must be non-blank when supplied")
+    parent = _EMISSION_SCOPE.get()
+    if (
+        parent is not None
+        and parent.emitter is emitter
+        and parent.run_id == run_id
+        and (parent.user_id == user_id or user_id is None)
+    ):
+        composed = f"{parent.operation}.{operation}"
+        if _NODE_NAME.fullmatch(composed) is not None:
+            operation = composed
+        if user_id is None:
+            user_id = parent.user_id
+    token: Token[_EmissionScope | None] = _EMISSION_SCOPE.set(
+        _EmissionScope(emitter, run_id, operation, user_id)
+    )
+    try:
+        yield
+    finally:
+        _EMISSION_SCOPE.reset(token)
+
+
+async def emit_model_usage(
+    *, input_tokens: int, output_tokens: int, attempts: int, latency_ms: int
+) -> None:
+    """Write provider-derived model counters when an approved task scope exists."""
+    scope = _EMISSION_SCOPE.get()
+    if scope is None or scope.user_id is None:
+        return
+    scope.sequence += 1
+    try:
+        await scope.emitter.emit(
+            run_id=scope.run_id,
+            user_id=scope.user_id,
+            event_type="LLM_COMPLETED",
+            node_name=scope.operation,
+            summary="model_completed",
+            event_key=stable_event_key(
+                scope.run_id, scope.operation, str(scope.sequence), "LLM_COMPLETED"
+            ),
+            attributes={
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "attempts": attempts,
+                "latency_ms": latency_ms,
+            },
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return
+
+
+def stable_event_key(*parts: str) -> str:
+    """Return a deterministic key from non-sensitive, server-owned semantics."""
+    digest = hashlib.sha256()
+    for part in parts:
+        encoded = part.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()[:64]
 
 
 def _safe_number(value: object) -> bool:

@@ -8,9 +8,8 @@ being placed in ``QueryState``.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import re
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -23,7 +22,12 @@ from langgraph.graph.state import CompiledStateGraph
 
 from agentic_rag.memory.models import PublicMessage
 from agentic_rag.memory.service import MemoryService
-from agentic_rag.observability.logging import AgentEventEmitter, sanitize_summary
+from agentic_rag.observability.logging import (
+    AgentEventEmitter,
+    event_emission_scope,
+    sanitize_summary,
+    stable_event_key,
+)
 from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.repositories import AgentEvent, EventRepository
 from agentic_rag.query.audit import (
@@ -141,7 +145,12 @@ def build_query_graph(
             async with _trace_span(dependencies, state, "retrieval"):
                 async with _trace_span(dependencies, state, "tool"):
                     update = await dependencies.research_loop.ainvoke(state)
-        await _event(dependencies, state, "RESEARCH_LOOP_COMPLETED", str(update.get("next_node", "end")))
+        await _event(
+            dependencies,
+            cast(QueryState, {**state, **update}),
+            "RESEARCH_LOOP_COMPLETED",
+            str(update.get("next_node", "end")),
+        )
         return update
 
     async def evidence_builder(state: QueryState) -> dict[str, object]:
@@ -323,12 +332,76 @@ async def _trace_span(
     dependencies: QueryGraphDependencies, state: QueryState, name: str
 ) -> AsyncIterator[None]:
     """Record a safe local span only when it matches the Run's snapshot."""
+    snapshot_id = snapshot_from_state(state).snapshot_id
     recorder = dependencies.trace_recorder
-    if recorder is None or recorder.runtime_config_snapshot_id != snapshot_from_state(state).snapshot_id:
-        yield
+    emitter = dependencies.event_emitter
+    safe_recorder = (
+        recorder if recorder is not None and recorder.runtime_config_snapshot_id == snapshot_id else None
+    )
+    safe_emitter = (
+        emitter if emitter is not None and emitter.runtime_config_snapshot_id == snapshot_id else None
+    )
+    if safe_emitter is None:
+        if safe_recorder is None:
+            yield
+            return
+        async with safe_recorder.span(name, run_id=state["run_id"]):
+            yield
         return
-    async with recorder.span(name, run_id=state["run_id"]):
-        yield
+    async with event_emission_scope(
+        safe_emitter,
+        state["run_id"],
+        name,
+        user_id=scope_from_state(state).user_id,
+    ):
+        await _span_event(safe_emitter, state, name, "GRAPH_NODE_STARTED")
+        started = time.perf_counter()
+        try:
+            if safe_recorder is None:
+                yield
+            else:
+                async with safe_recorder.span(name, run_id=state["run_id"]):
+                    yield
+        finally:
+            await _span_event(
+                safe_emitter,
+                state,
+                name,
+                "GRAPH_NODE_COMPLETED",
+                attributes={"node_latency_seconds": time.perf_counter() - started},
+            )
+
+
+async def _span_event(
+    emitter: AgentEventEmitter,
+    state: QueryState,
+    name: str,
+    event_type: str,
+    *,
+    attributes: Mapping[str, object] | None = None,
+) -> None:
+    """Emit fixed graph-boundary events without retaining graph state."""
+    try:
+        await emitter.emit(
+            run_id=state["run_id"],
+            user_id=scope_from_state(state).user_id,
+            event_type=event_type,
+            node_name=name,
+            summary="started" if event_type.endswith("STARTED") else "completed",
+            attributes=attributes,
+            event_key=stable_event_key(
+                state["run_id"],
+                name,
+                event_type,
+                str(state.get("revision_count", 0)),
+                str(len(state.get("audit_results", []))),
+                str(len(state.get("retrieval_batches", []))),
+            ),
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        pass
 
 
 async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_type: str, summary: str) -> None:
@@ -343,6 +416,13 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
                 node_name=event_type.lower(),
                 summary="completed",
                 attributes=_event_attributes(state, event_type),
+                event_key=stable_event_key(
+                    state["run_id"],
+                    event_type,
+                    str(state.get("revision_count", 0)),
+                    str(len(state.get("audit_results", []))),
+                    str(state.get("next_node", "")),
+                ),
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
@@ -354,24 +434,15 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
     snapshot = snapshot_from_state(state)
     safe_event_type = event_type if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", event_type) else "PROGRESS"
     safe_summary = sanitize_summary(summary)
-    event_key_payload = {
-        "event_type": safe_event_type,
-        "summary": safe_summary,
-        "audit_count": len(state.get("audit_results", [])),
-        "revision_count": state.get("revision_count", 0),
-        "research": state.get("research", {}),
-        "next_node": state.get("next_node"),
-    }
-    event_digest = hashlib.sha256(
-        json.dumps(
-            {"run_id": state["run_id"], **event_key_payload},
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        ).encode()
-    ).hexdigest()[:20]
     event = AgentEvent(
-        event_key=event_digest,
+        event_key=stable_event_key(
+            state["run_id"],
+            safe_event_type,
+            str(state.get("revision_count", 0)),
+            str(len(state.get("audit_results", []))),
+            str(len(state.get("retrieval_batches", []))),
+            str(state.get("next_node", "")),
+        ),
         trace_id=state["run_id"], run_id=state["run_id"], user_id=scope_from_state(state).user_id,
         event_type=safe_event_type, summary=safe_summary, runtime_config_snapshot_id=snapshot.snapshot_id,
         node_name=safe_event_type.lower(),

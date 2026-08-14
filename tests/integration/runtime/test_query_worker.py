@@ -142,6 +142,7 @@ class Broker:
 @dataclass
 class SafeEmitter:
     calls: list[dict[str, object]] = field(default_factory=list)
+    runtime_config_snapshot_id: str = SNAPSHOT.snapshot_id
 
     async def emit(self, **kwargs: object) -> int:
         self.calls.append(dict(kwargs))
@@ -266,6 +267,21 @@ async def test_worker_emits_safe_queue_wait_event_when_emitter_is_injected() -> 
 
     assert emitter.calls[0]["event_type"] == "QUEUE_WAITED"
     assert emitter.calls[0]["attributes"]["queue_wait_seconds"] >= 0
+
+
+async def test_worker_skips_queue_event_when_emitter_snapshot_does_not_match() -> None:
+    """A worker must not mix queue telemetry across immutable snapshots."""
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    runs = Runs()
+    run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="What notice applies?")
+    broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+    emitter = SafeEmitter(runtime_config_snapshot_id="other")
+    worker = QueryWorker(runs=runs, broker=broker, graph_factory=lambda **_: _Graph(), worker_id="worker-1", event_emitter=emitter)
+
+    await worker.run_one()
+
+    assert emitter.calls == []
 
 
 @pytest.mark.parametrize(

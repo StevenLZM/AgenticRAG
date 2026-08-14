@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 
@@ -25,6 +25,23 @@ SNAPSHOT = RuntimeConfigSnapshot(
     retrieval_config_version="retrieval", index_generation="index-v1",
     memory_config_version="memory-v1",
 )
+
+
+async def _no_sleep(_: float) -> None:
+    return None
+
+
+class _UsageResponses:
+    async def create(self, **_: object) -> dict[str, object]:
+        return {
+            "output_text": "ok",
+            "model": "test-provider",
+            "usage": {"input_tokens": 7, "output_tokens": 3},
+        }
+
+
+class _UsageClient:
+    responses = _UsageResponses()
 
 
 def _batch() -> EvidenceBatch:
@@ -243,6 +260,41 @@ async def test_real_query_graph_emits_safe_projection_attributes() -> None:
     assert by_type["FAST_RAG_COMPLETED"]["attributes"]["retrieval_rounds"] >= 1
     assert "claim_count" in by_type["CITATION_VALIDATED"]["attributes"]
     assert by_type["ANSWER_FINALIZED"]["attributes"]["termination_reason"] == "completed"
+
+
+async def test_real_graph_model_gateway_call_emits_usage_inside_graph_scope() -> None:
+    """A graph-invoked gateway call inherits the LLM emitter scope."""
+    from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway
+    from agentic_rag.query.graph import build_query_graph
+
+    class ProviderGateway:
+        def __init__(self, delegate: FakeGateway) -> None:
+            self._delegate = delegate
+            self._gateway = ModelGateway(_UsageClient(), sleep=lambda _: _no_sleep())
+
+        async def complete_structured(self, call: object, schema: type[object]) -> object:
+            await self._gateway.complete(
+                ModelCall(
+                    messages=({"role": "user", "content": "test"},),
+                    snapshot=SNAPSHOT,
+                )
+            )
+            return await self._delegate.complete_structured(call, schema)
+
+    emitter = SafeEmitter()
+    deps, _memory, _retrieval, _events = _deps(event_emitter=emitter)
+    result = await build_query_graph(replace(deps, gateway=ProviderGateway(deps.gateway))).ainvoke(_state())
+
+    assert result["termination_reason"] == "completed"
+    model_events = [call for call in emitter.calls if call["event_type"] == "LLM_COMPLETED"]
+    assert model_events
+    assert model_events[0]["node_name"] == "graph.node.route.llm"
+    assert model_events[0]["attributes"] == {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "attempts": 1,
+        "latency_ms": model_events[0]["attributes"]["latency_ms"],
+    }
 
 
 async def test_graph_skips_emitter_with_a_different_runtime_snapshot() -> None:

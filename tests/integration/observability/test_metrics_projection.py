@@ -212,6 +212,27 @@ async def test_metrics_outcomes_only_count_terminal_reason(tmp_path) -> None:
 
 
 @pytest.mark.integration
+async def test_metrics_projects_finalized_repair_count(tmp_path) -> None:
+    """Audit revision totals are carried by the real terminal graph event."""
+    repository = RecordingEventRepository()
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(repository, artifacts, runtime_config_snapshot_id="snapshot-1")
+    await emitter.emit(
+        run_id="run-1",
+        user_id="user-1",
+        event_type="ANSWER_FINALIZED",
+        attributes={"termination_reason": "completed", "repair_count": 2},
+    )
+
+    projection = await MetricsProjector(
+        repository, artifacts, runtime_config_snapshot_id="snapshot-1"
+    ).project_window(run_id="run-1", scope=UserScope(user_id="user-1"))
+
+    assert projection.metrics["repair_count"] == 2
+    assert projection.metrics["repair_rate"] == 1.0
+
+
+@pytest.mark.integration
 async def test_metrics_citation_coverage_accumulates_across_pages(tmp_path) -> None:
     """Cursor continuation must preserve the numerator and denominator."""
     repository = RecordingEventRepository()

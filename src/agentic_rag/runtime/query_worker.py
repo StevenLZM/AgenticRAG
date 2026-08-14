@@ -11,7 +11,11 @@ from typing import Protocol, cast
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from agentic_rag.domain.models import RunStatus, UserScope
-from agentic_rag.observability.logging import AgentEventEmitter
+from agentic_rag.observability.logging import (
+    AgentEventEmitter,
+    event_emission_scope,
+    stable_event_key,
+)
 from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.redis_queue import StreamBroker, StreamMessage
 from agentic_rag.persistence.repositories import LeaseLost, QueryRun, RunRepository
@@ -137,24 +141,49 @@ class QueryWorker:
             return
         snapshot = RuntimeConfigSnapshot.model_validate(claim.runtime_config_snapshot)
         queue_wait = max(0.0, (datetime.now(UTC) - message.enqueued_at).total_seconds())
-        if self._event_emitter is not None:
+        if (
+            self._event_emitter is not None
+            and self._event_emitter.runtime_config_snapshot_id == snapshot.snapshot_id
+        ):
             try:
                 await self._event_emitter.emit(
                     run_id=claim.id,
                     user_id=claim.user_id,
                     event_type="QUEUE_WAITED",
                     summary="completed",
+                    event_key=stable_event_key(
+                        claim.id, message.id, str(claim.claim_generation), "QUEUE_WAITED"
+                    ),
                     attributes={"queue_wait_seconds": queue_wait},
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
                 pass
-        if (
-            self._trace_recorder is not None
+        recorder = (
+            self._trace_recorder
+            if self._trace_recorder is not None
             and self._trace_recorder.runtime_config_snapshot_id == snapshot.snapshot_id
-        ):
-            async with self._trace_recorder.span(
+            else None
+        )
+        emitter = (
+            self._event_emitter
+            if self._event_emitter is not None
+            and self._event_emitter.runtime_config_snapshot_id == snapshot.snapshot_id
+            else None
+        )
+        if emitter is not None:
+            async with event_emission_scope(emitter, claim.id, "queue", user_id=claim.user_id):
+                if recorder is not None:
+                    async with recorder.span(
+                        "queue", run_id=claim.id, attributes={"queue_wait_seconds": queue_wait}
+                    ):
+                        await self._process_claimed_message(message, claim)
+                else:
+                    await self._process_claimed_message(message, claim)
+            return
+        if recorder is not None:
+            async with recorder.span(
                 "queue", run_id=claim.id, attributes={"queue_wait_seconds": queue_wait}
             ):
                 await self._process_claimed_message(message, claim)

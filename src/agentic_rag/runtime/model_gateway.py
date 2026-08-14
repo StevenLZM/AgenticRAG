@@ -18,6 +18,7 @@ from typing import Any, Generic, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from agentic_rag.observability.logging import emit_model_usage
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
@@ -95,7 +96,7 @@ class ModelGateway:
         """Return plain text, retrying only transient provider failures."""
         started = time.perf_counter()
         response, attempts = await self._request_with_retries(call)
-        return ModelResponse[str](
+        result = ModelResponse[str](
             value=_extract_text(response),
             requested_model=call.requested_model,
             actual_model=_as_string(_get(response, "model")) or call.requested_model,
@@ -104,6 +105,13 @@ class ModelGateway:
             attempts=attempts,
             latency_ms=round((time.perf_counter() - started) * 1_000),
         )
+        await emit_model_usage(
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            attempts=result.attempts,
+            latency_ms=result.latency_ms,
+        )
+        return result
 
     async def complete_structured(
         self, call: ModelCall, schema: type[T]
@@ -131,7 +139,7 @@ class ModelGateway:
                 raise StructuredOutputValidationError(
                     "model output did not satisfy the requested schema after repair"
                 ) from repair_error
-        return ModelResponse[T](
+        result = ModelResponse[T](
             value=value,
             requested_model=call.requested_model,
             actual_model=_as_string(_get(response, "model")) or call.requested_model,
@@ -140,6 +148,13 @@ class ModelGateway:
             attempts=attempts,
             latency_ms=round((time.perf_counter() - started) * 1_000),
         )
+        await emit_model_usage(
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            attempts=result.attempts,
+            latency_ms=result.latency_ms,
+        )
+        return result
 
     async def _request_with_retries(self, call: ModelCall) -> tuple[object, int]:
         for attempt in range(1, self._max_retries + 2):
