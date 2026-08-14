@@ -2,7 +2,7 @@
 
 > 快照日期：2026-08-14
 >
-> 当前状态：Phase 1–4 已完成并通过独立审查；Phase 5 Task 1–3 已完成并通过独立审查。当前实现位于独立 worktree，尚未合并到 `main`。
+> 当前状态：Phase 1–4 已完成并通过独立审查；Phase 5 Task 1–4 已完成并通过独立审查。当前实现位于独立 worktree，尚未合并到 `main`。
 >
 > 本文档是恢复开发时的首要状态入口；详细设计、接口约束和任务拆分以文末权威文档为准。
 
@@ -34,9 +34,9 @@ git log -5 --oneline
 | Phase 2：Document Ingestion | 完成 | 6/6 | 安全上传、Docling AST、Parent/Child、Embedding、发布/对账、可恢复 Worker |
 | Phase 3：Retrieval and Evidence | 完成 | 6/6 | Dense/BM25、RRF/Rerank、Parent 聚合、降级检索图、EvidenceBuilder |
 | Phase 4：Query and Agent Runtime | 完成 | 9/9 | ModelGateway、Memory、Fast/Research、Subagent、审计、QueryGraph、Worker、API |
-| Phase 5：Evaluation and Operations | 进行中 | 3/5 | Trace/在线指标、确定性评测和离线可恢复报告已完成；对抗/负载/恢复、备份恢复和最终验收待完成 |
+| Phase 5：Evaluation and Operations | 进行中 | 4/5 | Trace/在线指标、确定性评测、离线可恢复报告、对抗/负载/恢复演练已完成；备份恢复和最终验收待完成 |
 
-**总体完成：`30/32` 个路线图任务，约 `93.8%`。**
+**总体完成：`31/32` 个路线图任务，约 `96.9%`。**
 
 ## 3. 已实现能力
 
@@ -79,7 +79,7 @@ Phase 4 当前具备的关键边界：
 - 终止原因 `clarify`、`refuse`、`cannot_answer`、`audit_failed`、`research_round_limit`、`research_action_invalid` 等映射为结构化业务完成；未知或非字符串原因仍重试并最终进入失败/DLQ。
 - API 覆盖 `/v1/query-runs`、SSE 重连、取消、同步 `/v1/query`、`/v1/memories` 和 `/v1/feedback`；未知 SSE 事件摘要脱敏，未配置 Memory provider 时读写均 fail-closed。
 
-### 3.4 Phase 5：评测与运维（已完成 Task 1）
+### 3.4 Phase 5：评测与运维（已完成 Task 1–4）
 
 - Task 1 最终提交为 `8729171`（基线实现 `053e8e4`，后续安全/接入修复至 `b83b716`、生命周期与成本语义修复 `ecf2274`、队列重领取去重 `8729171`）。
 - `TraceRecorder` 提供本地 OpenTelemetry-compatible 嵌套 span，绑定 `run_id`、快照和 parent/span 层级；取消、异常和跨 Run/Recorder 上下文均 fail-closed。
@@ -100,20 +100,30 @@ Task 3（`15a9150`，基线实现 `6e603a4`）已完成：
 - `RagasAdapter` 允许显式离线 backend；未安装/未配置时输出 `status=unavailable` 空指标，不伪造分数。报告默认拒绝混合 snapshot，仅接受命名 baseline 映射进行比较。
 - CLI `python -m evals.run --dataset ... --output ... [--limit N]` 提供确定性 fixture smoke，产出 results/summary 且不访问外部服务。
 
+Task 4（`2e99e00..1947806`，基线实现 `2e99e00`）已完成并通过独立复审：
+
+- 新增安全回归 E2E：验证文档 prompt injection/filter override、隐藏 Unicode、Evidence ID 伪造、跨用户 evidence/memory/checkpoint/event 隔离、Mem0 不可用降级，以及 Artifact/Event payload 中的原始 prompt/tool/hidden reasoning 脱敏；安全扫描覆盖 durable payload 与 event type/node/summary。
+- 新增背压 E2E：通过真实 `ConcurrencyManager` 观察 run/LLM/reranker 最大并发，独立压测至少 8 个 LLM slot，记录 queue wait 时间，并使用可注入 API/Worker health probes 验证活性。
+- 新增 `scripts/run_recovery_drill.py`：七个固定故障场景使用隔离 in-memory fakes 和现有 `AgentEvent`、`UserScope`、`MemoryServiceImpl`、`LocalArtifactStore` 边界；覆盖 SSE 重连、Query/Ingestion 重放、Outbox Redis 故障、ES 激活中断、Artifact quarantine、Mem0 scope/outage。报告包含 scenario invariants、replay/duplicate/leak/quarantine 计数，使用 fsync+replace 原子写入，失败或泄漏时返回非零。
+- Task 4 最终验证：E2E 10 passed；全量 importlib 测试 530 passed、38 skipped；Ruff、scoped mypy、diff-check 通过；直接脚本与 module CLI 均返回 0，报告确定性且无临时文件残留。
+
 ## 4. 最近验证证据
 
-验证基于实现分支最终提交 `15a9150`，使用 `conda` 环境 `agentic-rag`：
+验证基于实现分支最终提交 `1947806`，使用 `conda` 环境 `agentic-rag`：
 
 ```text
-full importlib test suite: 493 passed, 38 skipped
+full importlib test suite: 530 passed, 38 skipped
 Task 1 focused observability/graph/worker/model suite: 70 passed
 Task 2 focused evaluation suite: 23 passed
 Task 3 focused runner/evaluation suite: 50 passed
 Task 3 related eval/query/runtime/observability subset: 168 passed
 full unit suite after Task 3: 459 passed
+Task 4 focused E2E suite: 10 passed
+Recovery drill CLI: direct/module invocation exit 0; duplicates=0, leaks=0
 ruff check src tests: All checks passed
 mypy Task 1 changed source: no issues found
 git diff --check b83b716..8729171: clean
+git diff --check 2e99e00..1947806: clean
 ```
 
 外部服务集成测试的 skip 是显式配置结果，未提供以下独立测试资源时不会伪造通过：
@@ -143,7 +153,7 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 
 ## 6. 尚未实现与上线前注意事项
 
-- Phase 5 仍缺少两项交付：对抗/负载/恢复测试、备份恢复/就绪检查/最终验收。
+- Phase 5 仍缺少一项交付：备份恢复、就绪检查和最终验收。
 - 当前 V1 只有 `user_id` 命名空间隔离，没有完整鉴权、RBAC 或用户身份解析；生产入口不能继续依赖 `default_user`。
 - Memory 的真实 Mem0 provider 由部署注入；未配置时服务会 fail-closed，不应把 no-op 结果当作生产记忆。
 - Elasticsearch、MySQL、Redis、Mem0 的真实联调尚未在本环境执行；上线前必须使用独立测试资源完成门禁。
@@ -151,15 +161,15 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 
 ## 7. 下一次开发的准确起点
 
-下一任务是 **Phase 5 Task 4：Adversarial, Load and Recovery Test Suites**。
+下一任务是 **Phase 5 Task 5：Backup, Restore, Readiness and Final Acceptance**。
 
 恢复步骤：
 
-1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净、HEAD 为 `15a9150` 或其后续 docs-only 提交。
-2. 运行 Phase 4、Task 1–3 回归门禁，确认 Query Worker/API/审计/遥测/评测没有回归。
-3. 完整阅读 Phase 5 计划与全局约束，为 Task 4 编写 RED 测试和独立 brief。
-4. 配置可丢弃的 MySQL/Redis/Elasticsearch 测试资源；有 Mem0 provider 时再启用真实 Memory 集成。
-5. 按 TDD、实现报告、独立 reviewer、fix/re-review 流程推进，不跳过评测的可重复性和运行时指标契约。
+1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净、HEAD 为 `1947806` 或其后续 docs-only 提交。
+2. 运行 Phase 4、Task 1–4 回归门禁，确认 Query Worker/API/审计/遥测/评测以及安全/恢复测试没有回归。
+3. 完整阅读 Phase 5 计划与全局约束，为 Task 5 编写 RED 测试和独立 brief。
+4. 为备份/恢复演练配置可丢弃的 MySQL/Redis/Elasticsearch/Artifact 测试命名空间；真实 Mem0 provider 仍只在显式 opt-in 时启用。
+5. 按 TDD、实现报告、独立 reviewer、fix/re-review 流程推进，并以最终验收清单收口，不跳过评测可重复性、恢复安全和真实服务门禁。
 
 Phase 5 顺序：
 
@@ -167,10 +177,8 @@ Phase 5 顺序：
 Trace Recorder + Online Metrics (complete)
   -> Deterministic Retrieval/AgentLoop Evaluation (complete)
   -> Offline Ragas Reports (complete)
-  -> Adversarial/Load/Recovery Suites (next)
-  -> Offline Ragas Reports
-  -> Adversarial/Load/Recovery Suites
-  -> Backup/Restore/Readiness/Final Acceptance
+  -> Adversarial/Load/Recovery Suites (complete)
+  -> Backup/Restore/Readiness/Final Acceptance (next)
 ```
 
 ## 8. 权威文档索引
@@ -186,5 +194,5 @@ Trace Recorder + Online Metrics (complete)
 ## 9. 恢复开发时的第一条提示词建议
 
 ```text
-继续开发 AgenticRAG。先完整阅读 docs/development-progress.md、总体设计、实现路线图和 Phase 5 计划；确认当前 worktree/branch/HEAD 与进度快照一致，运行 Phase 4 回归门禁，然后使用 Subagent-Driven Development 从 Phase 5 Task 1 开始。不要重做 Phase 1–4，不要跳过真实服务门禁、评测可重复性或恢复测试。
+继续开发 AgenticRAG。先完整阅读 docs/development-progress.md、总体设计、实现路线图和 Phase 5 计划；确认当前 worktree/branch/HEAD 与进度快照一致，运行 Phase 4 + Task 1–4 回归门禁，然后使用 Subagent-Driven Development 从 Phase 5 Task 5 开始。不要重做 Phase 1–4，不要跳过真实服务门禁、评测可重复性、恢复测试或最终验收。
 ```
