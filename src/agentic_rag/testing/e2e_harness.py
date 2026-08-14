@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
+import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.ingestion.assembler import (
@@ -58,8 +60,12 @@ class SecurityRegressionResult:
     memory_degraded: bool
     checkpoint_namespace: str
     event_user_ids: tuple[str, ...]
+    durable_event_user_ids: tuple[str, ...]
+    memory_user_ids: tuple[str, ...]
     durable_output: tuple[str, ...]
+    durable_payloads: tuple[dict[str, object], ...]
     raw_sensitive_paths: tuple[str, ...]
+    raw_sensitive_fields: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,8 +85,13 @@ class BackpressureResult:
     completed_queries: int
     failed_queries: int
     queue_wait_samples: int
+    queue_wait_seconds_total: float
+    llm_tasks_submitted: int
     api_liveness: bool
     worker_liveness: bool
+
+
+HealthProbe = Callable[[], Awaitable[bool] | bool]
 
 
 class SecurityRegressionHarness:
@@ -142,12 +153,19 @@ class SecurityRegressionHarness:
             forged_validation.passed or "unknown_evidence" not in forged_validation.reasons
         )
 
-        memory = MemoryServiceImpl(
+        scoped_memory = MemoryServiceImpl(
+            _ScopedMemoryClient(),
+            tombstones=_NoopTombstones(),
+            policy_version="policy-v1",
+        )
+        scoped_memory_context = await scoped_memory.load_context(attacker, "summarize")
+        memory_user_ids = tuple(record.user_id for record in scoped_memory_context.records)
+        unavailable_memory = MemoryServiceImpl(
             _UnavailableMemoryClient(),
             tombstones=_NoopTombstones(),
             policy_version="policy-v1",
         )
-        memory_context = await memory.load_context(attacker, "summarize")
+        memory_context = await unavailable_memory.load_context(attacker, "summarize")
 
         state = new_query_state(
             run_id="run-attacker",
@@ -182,15 +200,49 @@ class SecurityRegressionHarness:
                 "attempts": 1,
             },
         )
+        # A second tenant is present in the durable repository and provider
+        # fixture.  Scope filtering must keep it out of the attacker's view.
+        await emitter.emit(
+            run_id="run-attacker",
+            user_id="victim",
+            event_type="SECURITY_CHECK",
+            node_name="security",
+            summary="completed",
+            event_key="victim-check",
+            attributes={
+                "prompt": "victim instruction",
+                "tool_input": {"user_id": "victim"},
+                "attempts": 2,
+            },
+        )
+        scoped_events = await events.list_after(
+            "run-attacker", attacker, after_id=0, limit=100
+        )
         all_artifact_paths = tuple(sorted(_artifact_paths(self._artifacts)))
         raw_sensitive_paths = tuple(
             path
             for path in all_artifact_paths
             if "prompt" in path.casefold() or "tool" in path.casefold()
         )
+        all_payloads = _artifact_payloads(self._artifacts, all_artifact_paths)
+        raw_sensitive_fields = tuple(sorted(_sensitive_fields(all_payloads)))
+        durable_payloads = tuple(
+            _read_event_payload(self._artifacts, event.payload_ref)
+            for event in scoped_events
+            if event.payload_ref is not None
+        )
+        durable_event_user_ids = tuple(event.user_id for event in scoped_events)
+        event_user_ids = durable_event_user_ids
+        user_leak_count = (
+            cross_user_evidence_count
+            + forged_evidence_count
+            + sum(user_id != attacker.user_id for user_id in durable_event_user_ids)
+            + sum(user_id != attacker.user_id for user_id in memory_user_ids)
+            + len(raw_sensitive_fields)
+        )
 
         return SecurityRegressionResult(
-            user_leak_count=cross_user_evidence_count + forged_evidence_count,
+            user_leak_count=user_leak_count,
             cross_user_evidence_count=cross_user_evidence_count,
             forged_evidence_count=forged_evidence_count,
             filter_override_blocked=filter_override_blocked,
@@ -198,22 +250,36 @@ class SecurityRegressionHarness:
             hidden_unicode_quarantined="invisible_unicode" in reasons,
             memory_degraded=memory_context.degraded and not memory_context.records,
             checkpoint_namespace=checkpoint_namespace,
-            event_user_ids=tuple(event.user_id for event in events.events),
+            event_user_ids=event_user_ids,
+            durable_event_user_ids=durable_event_user_ids,
+            memory_user_ids=memory_user_ids,
             durable_output=all_artifact_paths,
+            durable_payloads=durable_payloads,
             raw_sensitive_paths=raw_sensitive_paths,
+            raw_sensitive_fields=raw_sensitive_fields,
         )
 
 
 class BackpressureHarness:
     """Submit fixed concurrent work through the real ConcurrencyManager."""
 
-    def __init__(self, *, run_limit: int, llm_limit: int, reranker_limit: int) -> None:
+    def __init__(
+        self,
+        *,
+        run_limit: int,
+        llm_limit: int,
+        reranker_limit: int,
+        api_health_probe: HealthProbe | None = None,
+        worker_health_probe: HealthProbe | None = None,
+    ) -> None:
         self._limits = MaxObserved(run=run_limit, llm=llm_limit, reranker=reranker_limit)
         self._manager = ConcurrencyManager(
             run_limit=run_limit,
             llm_limit=llm_limit,
             reranker_limit=reranker_limit,
         )
+        self._api_health_probe = api_health_probe
+        self._worker_health_probe = worker_health_probe
 
     async def submit_parallel_queries(self, count: int) -> BackpressureResult:
         if count < 1:
@@ -222,6 +288,7 @@ class BackpressureHarness:
         maximum = {"run": 0, "llm": 0, "reranker": 0}
         lock = asyncio.Lock()
         queue_wait_samples = 0
+        queue_wait_seconds_total = 0.0
 
         async def observe(key: str, delta: int) -> None:
             async with lock:
@@ -229,12 +296,17 @@ class BackpressureHarness:
                 maximum[key] = max(maximum[key], current[key])
 
         async def query(index: int) -> bool:
-            nonlocal queue_wait_samples
+            nonlocal queue_wait_samples, queue_wait_seconds_total
             del index
             try:
+                await asyncio.sleep(0)
+                wait_started = time.perf_counter()
                 async with self._manager.run_slot():
+                    waited = time.perf_counter() - wait_started
                     async with lock:
-                        queue_wait_samples += 1
+                        if waited > 0:
+                            queue_wait_samples += 1
+                            queue_wait_seconds_total += waited
                     await observe("run", 1)
                     try:
                         # Two model calls exercise the same global LLM budget;
@@ -259,17 +331,78 @@ class BackpressureHarness:
             except Exception:
                 return False
 
-        outcomes = await asyncio.gather(*(query(index) for index in range(count)))
+        async def standalone_llm_call() -> bool:
+            try:
+                async with self._manager.llm_slot():
+                    await observe("llm", 1)
+                    await asyncio.sleep(0)
+                    await observe("llm", -1)
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return False
+
+        llm_tasks_submitted = max(8, count)
+        query_outcomes, llm_outcomes = await asyncio.gather(
+            asyncio.gather(*(query(index) for index in range(count))),
+            asyncio.gather(*(standalone_llm_call() for _ in range(llm_tasks_submitted))),
+        )
+        completed_queries = sum(query_outcomes)
+        llm_completed = sum(llm_outcomes)
+        api_liveness = completed_queries == count
+        worker_liveness = api_liveness and llm_completed == llm_tasks_submitted
+        if self._api_health_probe is not None:
+            api_liveness = api_liveness and await _probe(self._api_health_probe)
+        if self._worker_health_probe is not None:
+            worker_liveness = worker_liveness and await _probe(self._worker_health_probe)
         return BackpressureResult(
             max_observed=MaxObserved(
                 run=maximum["run"], llm=maximum["llm"], reranker=maximum["reranker"]
             ),
-            completed_queries=sum(outcomes),
-            failed_queries=count - sum(outcomes),
+            completed_queries=completed_queries,
+            failed_queries=count - completed_queries,
             queue_wait_samples=queue_wait_samples,
-            api_liveness=True,
-            worker_liveness=True,
+            queue_wait_seconds_total=queue_wait_seconds_total,
+            llm_tasks_submitted=llm_tasks_submitted,
+            api_liveness=api_liveness,
+            worker_liveness=worker_liveness,
         )
+
+
+async def _probe(probe: HealthProbe) -> bool:
+    try:
+        result = probe()
+        if inspect.isawaitable(result):
+            result = await result
+        return result is True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+class _ScopedMemoryClient(MemoryClient):
+    async def add(self, messages: list[dict[str, str]], *, user_id: str, metadata: dict[str, object]) -> object:
+        del messages, user_id, metadata
+        return None
+
+    async def search(self, query: str, *, user_id: str, limit: int) -> object:
+        del query, user_id, limit
+        return {
+            "results": [
+                {"id": "memory-attacker", "memory": "attacker preference", "user_id": "attacker"},
+                {"id": "memory-victim", "memory": "victim secret", "user_id": "victim"},
+            ]
+        }
+
+    async def get_all(self, *, user_id: str) -> object:
+        del user_id
+        return {"results": []}
+
+    async def delete(self, memory_id: str) -> object:
+        del memory_id
+        return None
 
 
 class _UnavailableMemoryClient(MemoryClient):
@@ -399,3 +532,37 @@ def _parent(parent_id: str, user_id: str) -> ParentEvidence:
 def _artifact_paths(store: LocalArtifactStore) -> list[str]:
     root = getattr(store, "_root")
     return [path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()]
+
+
+def _artifact_payloads(
+    store: LocalArtifactStore, paths: tuple[str, ...] | list[str]
+) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for path in paths:
+        if not path.startswith("observability/events/"):
+            continue
+        ref = store.describe(f"artifact://{path}")
+        value = store.read_json(ref)
+        if isinstance(value, dict):
+            payloads.append(value)
+    return payloads
+
+
+def _read_event_payload(store: LocalArtifactStore, payload_ref: str) -> dict[str, object]:
+    value = store.read_json(store.describe(payload_ref))
+    return value if isinstance(value, dict) else {}
+
+
+def _sensitive_fields(values: object, prefix: str = "") -> set[str]:
+    found: set[str] = set()
+    if isinstance(values, dict):
+        for key, value in values.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            lowered = str(key).casefold()
+            if any(marker in lowered for marker in ("prompt", "tool", "secret", "reasoning")):
+                found.add(path)
+            found.update(_sensitive_fields(value, path))
+    elif isinstance(values, list):
+        for index, value in enumerate(values):
+            found.update(_sensitive_fields(value, f"{prefix}[{index}]"))
+    return found

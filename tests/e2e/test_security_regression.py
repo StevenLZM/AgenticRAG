@@ -43,6 +43,9 @@ async def test_cross_user_evidence_memory_checkpoint_and_events_are_fail_closed(
     assert result.memory_degraded is True
     assert result.checkpoint_namespace == "query:attacker:thread-1"
     assert result.event_user_ids == ("attacker",)
+    assert result.memory_user_ids == ("attacker",)
+    assert result.durable_event_user_ids == ("attacker",)
+    assert result.durable_payloads == ({"attributes": {"attempts": 1}},)
 
 
 @pytest.mark.asyncio
@@ -56,3 +59,5 @@ async def test_durable_output_contains_no_raw_prompt_or_tool_fields(
     assert result.durable_output
     assert all("prompt" not in path.casefold() for path in result.durable_output)
     assert all("tool" not in path.casefold() for path in result.durable_output)
+    assert result.raw_sensitive_fields == ()
+    assert result.user_leak_count == 0

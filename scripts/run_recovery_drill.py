@@ -1,9 +1,9 @@
 """Run deterministic, isolated API/worker/index recovery drills.
 
 The default command never reads application settings and never opens a network
-connection.  Every scenario uses a tiny in-memory state machine that models
-the existing idempotency/fencing boundaries.  This makes the report safe to
-run on a developer laptop with real services and data running elsewhere.
+connection. Every scenario uses the same durable identity shapes as production
+(``AgentEvent``, scoped ``UserScope`` and content-addressed Artifacts), backed
+by small in-memory fakes that deliberately replay writes.
 """
 
 from __future__ import annotations
@@ -11,13 +11,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+# Running this module directly or as ``scripts.run_recovery_drill`` does not
+# automatically add the source layout to ``sys.path``. Keep it self-contained
+# without requiring an editable install or a caller-owned PYTHONPATH.
+source_root = Path(__file__).resolve().parents[1] / "src"
+if str(source_root) not in sys.path:
+    sys.path.insert(0, str(source_root))
+
+from agentic_rag.domain.models import UserScope  # noqa: E402
+from agentic_rag.persistence.artifacts import ArtifactRef, LocalArtifactStore  # noqa: E402
+from agentic_rag.persistence.repositories import AgentEvent  # noqa: E402
 
 
 DRILL_SCENARIOS: tuple[str, ...] = (
@@ -38,27 +50,61 @@ class RecoveryDrillReport(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     scenarios: dict[str, ScenarioStatus]
-    duplicate_parent_ids: int = Field(ge=0)
-    duplicate_child_ids: int = Field(ge=0)
-    duplicate_event_keys: int = Field(ge=0)
+    scenario_invariants: dict[str, bool] = Field(
+        default_factory=lambda: {scenario: True for scenario in DRILL_SCENARIOS}
+    )
+    duplicate_parent_ids: int = Field(
+        ge=0, description="duplicate IDs present in the durable Parent projection"
+    )
+    duplicate_child_ids: int = Field(
+        ge=0, description="duplicate IDs present in the durable Child projection"
+    )
+    duplicate_event_keys: int = Field(
+        ge=0, description="duplicate event keys present in durable Event rows"
+    )
+    replayed_parent_count: int = Field(
+        default=0,
+        ge=0, description="replayed Parent upsert attempts deduplicated by the fake"
+    )
+    replayed_child_count: int = Field(
+        default=0,
+        ge=0, description="replayed Child upsert attempts deduplicated by the fake"
+    )
+    replayed_event_count: int = Field(
+        default=0,
+        ge=0, description="replayed Event append attempts deduplicated by event_key"
+    )
+    artifact_quarantine_count: int = Field(
+        default=0,
+        ge=0, description="missing or invalid Artifacts quarantined"
+    )
     user_leak_count: int = Field(ge=0)
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_scenarios(cls, value: object) -> object:
+    def _normalize_maps(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
-        raw = value.get("scenarios")
-        if not isinstance(raw, dict) or set(raw) != set(DRILL_SCENARIOS):
-            raise ValueError("scenarios must contain exactly the fixed drill set")
-        # Pydantic preserves insertion order; normalizing it keeps model dumps
-        # stable even when a caller supplied a differently ordered mapping.
-        return {**value, "scenarios": {scenario: raw[scenario] for scenario in DRILL_SCENARIOS}}
+        normalized = dict(value)
+        for field_name in ("scenarios", "scenario_invariants"):
+            raw = value.get(field_name)
+            if field_name == "scenario_invariants" and raw is None:
+                normalized[field_name] = {
+                    scenario: True for scenario in DRILL_SCENARIOS
+                }
+                continue
+            if not isinstance(raw, dict) or set(raw) != set(DRILL_SCENARIOS):
+                raise ValueError(f"{field_name} must contain exactly the fixed drill set")
+            normalized[field_name] = {
+                scenario: raw[scenario] for scenario in DRILL_SCENARIOS
+            }
+        return normalized
 
     @property
     def gate_passed(self) -> bool:
         return (
             all(status == "passed" for status in self.scenarios.values())
+            and all(self.scenario_invariants.values())
             and self.duplicate_parent_ids == 0
             and self.duplicate_child_ids == 0
             and self.duplicate_event_keys == 0
@@ -76,16 +122,66 @@ class RecoveryDrillReport(BaseModel):
 
 
 @dataclass(slots=True)
-class _DrillState:
-    parent_ids: list[str] = field(default_factory=list)
-    child_ids: list[str] = field(default_factory=list)
-    event_keys: list[str] = field(default_factory=list)
-    visible_user_ids: set[str] = field(default_factory=set)
-    scenarios: dict[str, ScenarioStatus] = field(default_factory=dict)
+class _IdempotentIds:
+    rows: dict[str, str] = field(default_factory=dict)
+    attempts: list[str] = field(default_factory=list)
 
-    def add_event(self, key: str, user_id: str) -> None:
-        self.event_keys.append(key)
-        self.visible_user_ids.add(user_id)
+    def upsert(self, identifier: str, user_id: str) -> None:
+        self.attempts.append(identifier)
+        self.rows.setdefault(identifier, user_id)
+
+
+@dataclass(slots=True)
+class _DurableEventRepository:
+    """Faithful EventRepository fake: duplicate event keys return the first row."""
+
+    rows: dict[str, AgentEvent] = field(default_factory=dict)
+    attempts: list[str] = field(default_factory=list)
+
+    def append(self, event: AgentEvent) -> int:
+        self.attempts.append(event.event_key)
+        existing = self.rows.get(event.event_key)
+        if existing is not None:
+            return existing.id or 0
+        assigned = replace(event, id=len(self.rows) + 1)
+        self.rows[event.event_key] = assigned
+        return assigned.id or 0
+
+    def list_after(
+        self, run_id: str, scope: UserScope, after_id: int, limit: int
+    ) -> list[AgentEvent]:
+        return [
+            event
+            for event in sorted(self.rows.values(), key=lambda item: item.id or 0)
+            if event.run_id == run_id
+            and event.user_id == scope.user_id
+            and (event.id or 0) > after_id
+        ][:limit]
+
+
+@dataclass(slots=True)
+class _ActivationIndex:
+    active: dict[str, str] = field(default_factory=dict)
+    interrupted: bool = False
+
+    def activate(self, user_id: str, version_id: str) -> None:
+        self.active[user_id] = version_id
+        if not self.interrupted:
+            self.interrupted = True
+            raise RuntimeError("activation interrupted after deterministic write")
+
+
+@dataclass(slots=True)
+class _DrillState:
+    artifacts: LocalArtifactStore
+    expected_user_id: str = "attacker"
+    parents: _IdempotentIds = field(default_factory=_IdempotentIds)
+    children: _IdempotentIds = field(default_factory=_IdempotentIds)
+    events: _DurableEventRepository = field(default_factory=_DurableEventRepository)
+    scenario_invariants: dict[str, bool] = field(default_factory=dict)
+    scenario_statuses: dict[str, ScenarioStatus] = field(default_factory=dict)
+    artifact_quarantine_count: int = 0
+    leaked_user_ids: set[str] = field(default_factory=set)
 
 
 class _RedisFailure(RuntimeError):
@@ -94,118 +190,177 @@ class _RedisFailure(RuntimeError):
 
 def run_recovery_drill() -> RecoveryDrillReport:
     """Execute all drills against fresh isolated state and return their report."""
-    state = _DrillState()
-    runners = {
-        "api_restart_during_sse": _api_restart_during_sse,
-        "query_worker_termination_after_retrieval": _query_worker_termination_after_retrieval,
-        "ingestion_worker_termination_after_staging": _ingestion_worker_termination_after_staging,
-        "outbox_mysql_success_redis_failure": _outbox_mysql_success_redis_failure,
-        "es_activation_interruption": _es_activation_interruption,
-        "missing_artifact_quarantine": _missing_artifact_quarantine,
-        "mem0_unavailable": _mem0_unavailable,
-    }
-    for scenario in DRILL_SCENARIOS:
-        try:
-            runners[scenario](state)
-        except Exception:
-            state.scenarios[scenario] = "failed"
-        else:
-            state.scenarios[scenario] = "passed"
+    with tempfile.TemporaryDirectory(prefix="agentic-rag-drill-") as root:
+        state = _DrillState(artifacts=LocalArtifactStore(Path(root)))
+        runners = {
+            "api_restart_during_sse": _api_restart_during_sse,
+            "query_worker_termination_after_retrieval": _query_worker_termination_after_retrieval,
+            "ingestion_worker_termination_after_staging": _ingestion_worker_termination_after_staging,
+            "outbox_mysql_success_redis_failure": _outbox_mysql_success_redis_failure,
+            "es_activation_interruption": _es_activation_interruption,
+            "missing_artifact_quarantine": _missing_artifact_quarantine,
+            "mem0_unavailable": _mem0_unavailable,
+        }
+        for scenario in DRILL_SCENARIOS:
+            try:
+                invariant = runners[scenario](state)
+            except Exception:
+                invariant = False
+            state.scenario_invariants[scenario] = invariant is True
+            state.scenario_statuses[scenario] = "passed" if invariant is True else "failed"
 
-    return RecoveryDrillReport(
-        scenarios={scenario: state.scenarios.get(scenario, "failed") for scenario in DRILL_SCENARIOS},
-        duplicate_parent_ids=_duplicates(state.parent_ids),
-        duplicate_child_ids=_duplicates(state.child_ids),
-        duplicate_event_keys=_duplicates(state.event_keys),
-        user_leak_count=_user_leaks(state.visible_user_ids),
+        attacker = UserScope(user_id=state.expected_user_id)
+        visible_events = state.events.list_after("run-1", attacker, after_id=0, limit=100)
+        state.leaked_user_ids.update(
+            event.user_id
+            for event in visible_events
+            if event.user_id != state.expected_user_id
+        )
+        return RecoveryDrillReport(
+            scenarios={
+                scenario: state.scenario_statuses.get(scenario, "failed")
+                for scenario in DRILL_SCENARIOS
+            },
+            scenario_invariants={
+                scenario: state.scenario_invariants.get(scenario, False)
+                for scenario in DRILL_SCENARIOS
+            },
+            duplicate_parent_ids=_duplicates(list(state.parents.rows)),
+            duplicate_child_ids=_duplicates(list(state.children.rows)),
+            duplicate_event_keys=_duplicates(list(state.events.rows)),
+            replayed_parent_count=_replays(state.parents.attempts),
+            replayed_child_count=_replays(state.children.attempts),
+            replayed_event_count=_replays(state.events.attempts),
+            artifact_quarantine_count=state.artifact_quarantine_count,
+            user_leak_count=len(state.leaked_user_ids),
+        )
+
+
+def _event(key: str, user_id: str, *, run_id: str = "run-1") -> AgentEvent:
+    return AgentEvent(
+        event_key=key,
+        trace_id=run_id,
+        run_id=run_id,
+        user_id=user_id,
+        event_type="PROGRESS",
+        summary="completed",
+        runtime_config_snapshot_id="snapshot-v1",
+        node_name="drill",
     )
 
 
-def _api_restart_during_sse(state: _DrillState) -> None:
-    # A reconnect starts after the last durable cursor.  The second API process
-    # may replay a delivery, but the stable event key makes it one Event.
-    state.add_event("run-1:retrieval", "attacker")
-    cursor = 1
-    state.add_event("run-1:answer", "attacker")
-    replay = ["run-1:answer"]
-    for key in replay:
-        if key not in state.event_keys:
-            state.add_event(key, "attacker")
-    assert cursor == 1 and state.event_keys[-1] == "run-1:answer"
+def _api_restart_during_sse(state: _DrillState) -> bool:
+    attacker = state.expected_user_id
+    state.events.append(_event("run-1:retrieval", attacker))
+    state.events.append(_event("run-1:answer", attacker))
+    # A victim event shares the run id but must remain outside the attacker's
+    # reconnect stream because the EventRepository applies UserScope.
+    state.events.append(_event("run-1:victim-private", "victim"))
+    # Reconnect/replay intentionally appends the same key. The repository
+    # returns the original row instead of creating a duplicate Event.
+    state.events.append(_event("run-1:answer", attacker))
+    visible = state.events.list_after("run-1", UserScope(user_id=attacker), 0, 100)
+    return len(visible) == 2 and all(row.user_id == attacker for row in visible)
 
 
-def _query_worker_termination_after_retrieval(state: _DrillState) -> None:
-    # Retrieval checkpoint is written before the worker is terminated.  Resume
-    # repeats the graph boundary but must not append a second durable Parent.
+def _query_worker_termination_after_retrieval(state: _DrillState) -> bool:
     parent_id = "parent:attacker:run-1"
     child_id = "child:attacker:run-1"
-    state.parent_ids.append(parent_id)
-    state.child_ids.append(child_id)
-    # The resume write observes the existing deterministic IDs and becomes an
-    # idempotent upsert; the attempted replay is intentionally not appended.
-    if parent_id not in state.parent_ids:
-        state.parent_ids.append(parent_id)
-    if child_id not in state.child_ids:
-        state.child_ids.append(child_id)
-    state.add_event("run-1:retrieval-completed", "attacker")
+    parent_rows_before = set(state.parents.rows)
+    child_rows_before = set(state.children.rows)
+    parent_attempts_before = len(state.parents.attempts)
+    child_attempts_before = len(state.children.attempts)
+    state.parents.upsert(parent_id, state.expected_user_id)
+    state.children.upsert(child_id, state.expected_user_id)
+    # Worker termination after Retrieval causes a deterministic replay.
+    state.parents.upsert(parent_id, state.expected_user_id)
+    state.children.upsert(child_id, state.expected_user_id)
+    state.events.append(_event("run-1:retrieval-completed", state.expected_user_id))
+    return (
+        parent_id in state.parents.rows
+        and child_id in state.children.rows
+        and len(set(state.parents.rows) - parent_rows_before) == 1
+        and len(set(state.children.rows) - child_rows_before) == 1
+        and _replays(state.parents.attempts[parent_attempts_before:]) >= 1
+        and _replays(state.children.attempts[child_attempts_before:]) >= 1
+    )
 
 
-def _ingestion_worker_termination_after_staging(state: _DrillState) -> None:
+def _ingestion_worker_termination_after_staging(state: _DrillState) -> bool:
     parent_id = "parent:attacker:document-1:version-1:0"
     child_id = "child:attacker:document-1:version-1:0"
-    # A staging retry observes deterministic IDs and performs an idempotent
-    # upsert instead of creating a second Parent/Child row.
-    for collection, value in ((state.parent_ids, parent_id), (state.child_ids, child_id)):
-        if value not in collection:
-            collection.append(value)
-        if value not in collection:
-            collection.append(value)
-    state.add_event("ingestion:job-1:staged", "attacker")
+    parent_rows_before = set(state.parents.rows)
+    child_rows_before = set(state.children.rows)
+    parent_attempts_before = len(state.parents.attempts)
+    child_attempts_before = len(state.children.attempts)
+    state.parents.upsert(parent_id, state.expected_user_id)
+    state.children.upsert(child_id, state.expected_user_id)
+    # Publication restart replays staging writes through the same idempotent
+    # deterministic IDs, not a pre-deduplicated input list.
+    state.parents.upsert(parent_id, state.expected_user_id)
+    state.children.upsert(child_id, state.expected_user_id)
+    state.events.append(_event("ingestion:job-1:staged", state.expected_user_id))
+    return (
+        parent_id in state.parents.rows
+        and child_id in state.children.rows
+        and len(set(state.parents.rows) - parent_rows_before) == 1
+        and len(set(state.children.rows) - child_rows_before) == 1
+        and _replays(state.parents.attempts[parent_attempts_before:]) >= 1
+        and _replays(state.children.attempts[child_attempts_before:]) >= 1
+    )
 
 
-def _outbox_mysql_success_redis_failure(state: _DrillState) -> None:
+def _outbox_mysql_success_redis_failure(state: _DrillState) -> bool:
     pending = {"outbox-1": "pending"}
     try:
         _publish_to_redis(pending["outbox-1"], fail=True)
     except _RedisFailure:
-        pending["outbox-1"] = "pending"
+        # MySQL remains the durable pending authority after Redis fails.
+        assert pending["outbox-1"] == "pending"
     _publish_to_redis(pending["outbox-1"], fail=False)
     pending["outbox-1"] = "dispatched"
-    assert pending["outbox-1"] == "dispatched"
-    state.add_event("outbox:outbox-1:dispatched", "attacker")
+    state.events.append(_event("outbox:outbox-1:dispatched", state.expected_user_id))
+    return pending["outbox-1"] == "dispatched"
 
 
-def _es_activation_interruption(state: _DrillState) -> None:
-    active = {"attacker": "version-1"}
+def _es_activation_interruption(state: _DrillState) -> bool:
+    index = _ActivationIndex()
     try:
-        active["attacker"] = "version-2"
-        raise RuntimeError("activation interrupted after pointer write")
+        index.activate(state.expected_user_id, "version-2")
     except RuntimeError:
-        # Retry of the deterministic activation converges on the same pointer.
-        active["attacker"] = "version-2"
-    assert active == {"attacker": "version-2"}
-    state.add_event("index:attacker:version-2:active", "attacker")
+        pass
+    index.activate(state.expected_user_id, "version-2")
+    state.events.append(_event("index:attacker:version-2:active", state.expected_user_id))
+    return index.active.get(state.expected_user_id) == "version-2"
 
 
-def _missing_artifact_quarantine(state: _DrillState) -> None:
-    artifact = None
-    status = "building"
-    if artifact is None:
-        status = "quarantined"
-    assert status == "quarantined"
-    state.add_event("ingestion:version-1:quarantined", "attacker")
+def _missing_artifact_quarantine(state: _DrillState) -> bool:
+    missing = ArtifactRef(
+        uri="artifact://documents/attacker/document-1/version-1/missing.json",
+        sha256="0" * 64,
+        size_bytes=0,
+    )
+    if state.artifacts.verify(missing):
+        return False
+    state.artifact_quarantine_count += 1
+    state.events.append(_event("ingestion:version-1:quarantined", state.expected_user_id))
+    return state.artifact_quarantine_count == 1
 
 
-def _mem0_unavailable(state: _DrillState) -> None:
-    # Provider outage is explicitly degraded and never substitutes another
-    # user's namespace or writes a synthetic memory.
-    provider_records: list[tuple[str, str]] = []
+def _mem0_unavailable(state: _DrillState) -> bool:
+    # Both namespaces are present in the provider fixture. Scope filtering is
+    # performed before the outage fallback; the outage itself returns no rows.
+    rows = [
+        (state.expected_user_id, "attacker preference"),
+        ("victim", "victim secret"),
+    ]
+    scoped = [row for row in rows if row[0] == state.expected_user_id]
     try:
         raise ConnectionError("mem0 unavailable")
     except ConnectionError:
-        provider_records = []
-    assert provider_records == []
-    state.add_event("memory:attacker:degraded", "attacker")
+        degraded_rows: list[tuple[str, str]] = []
+    state.events.append(_event("memory:attacker:degraded", state.expected_user_id))
+    return len(scoped) == 1 and degraded_rows == []
 
 
 def _publish_to_redis(value: str, *, fail: bool) -> None:
@@ -219,16 +374,16 @@ def _duplicates(values: list[str]) -> int:
     return sum(count - 1 for count in counts.values() if count > 1)
 
 
-def _user_leaks(user_ids: set[str]) -> int:
-    # All records in the isolated drill are server-owned attacker rows.  Any
-    # other namespace would be a leak; no provider response is trusted here.
-    return sum(1 for user_id in user_ids if user_id != "attacker")
+def _replays(values: list[str]) -> int:
+    return _duplicates(values)
 
 
 def _atomic_write(path: Path, payload: str) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
     temporary_path = Path(temporary)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
