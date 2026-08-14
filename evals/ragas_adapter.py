@@ -10,6 +10,8 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import math
+import re
 from typing import Any, Protocol, cast
 
 
@@ -84,34 +86,36 @@ class RagasAdapter:
         )
         if inspect.isawaitable(value):
             value = await value
-        return _normalize_result(value)
+        return normalize_ragas_result(value)
 
 
-def _normalize_result(value: object) -> RagasEvaluation:
+def normalize_ragas_result(value: object) -> RagasEvaluation:
+    """Normalize and validate every adapter outcome at one shared boundary."""
+
     if isinstance(value, RagasEvaluation):
         return _validate_result(value)
     if not isinstance(value, Mapping):
         raise TypeError("offline Ragas backend must return a mapping")
-    status = value.get("status", "available")
+    raw_metrics = value.get("metrics", value)
+    status = value.get("status", "available" if raw_metrics else "unavailable")
     if not isinstance(status, str) or status not in {"available", "unavailable"}:
         raise ValueError("Ragas status must be available or unavailable")
-    raw_metrics = value.get("metrics", value)
     if not isinstance(raw_metrics, Mapping):
         raise TypeError("Ragas metrics must be a mapping")
     metrics: dict[str, float] = {}
     for name, metric in raw_metrics.items():
         if name in {"status", "reason", "metrics"}:
             continue
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("Ragas metric names must be non-empty strings")
+        if not isinstance(name, str) or _METRIC_NAME.fullmatch(name.strip()) is None:
+            raise ValueError("Ragas metric names must be safe non-empty strings")
         if isinstance(metric, bool) or not isinstance(metric, (int, float)):
             raise ValueError(f"Ragas metric {name!r} must be numeric")
         numeric = float(metric)
-        if numeric != numeric or numeric in {float("inf"), float("-inf")}:
+        if not math.isfinite(numeric):
             raise ValueError(f"Ragas metric {name!r} must be finite")
         metrics[name] = numeric
     reason = value.get("reason")
-    if reason is not None and not isinstance(reason, str):
+    if reason is not None and (not isinstance(reason, str) or not reason.strip() or len(reason) > 1_000):
         raise ValueError("Ragas reason must be a string")
     return _validate_result(RagasEvaluation(status=status, metrics=metrics, reason=reason))
 
@@ -124,9 +128,24 @@ def _validate_result(value: RagasEvaluation) -> RagasEvaluation:
     if value.status == "available" and not value.metrics:
         raise ValueError("available Ragas results must contain metrics")
     for name, metric in value.metrics.items():
-        if not name.strip() or metric != metric or metric in {float("inf"), float("-inf")}:
+        if not isinstance(name, str) or _METRIC_NAME.fullmatch(name.strip()) is None:
+            raise ValueError("Ragas metrics must have safe names")
+        if isinstance(metric, bool) or not isinstance(metric, (int, float)) or not math.isfinite(float(metric)):
             raise ValueError("Ragas metrics must be finite and named")
+    if value.reason is not None and (
+        not isinstance(value.reason, str) or not value.reason.strip() or len(value.reason) > 1_000
+    ):
+        raise ValueError("Ragas reason must be a bounded string")
     return value
 
 
-__all__ = ["OfflineRagasBackend", "RagasAdapter", "RagasEvaluation", "RagasUnavailable"]
+_METRIC_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
+
+
+__all__ = [
+    "OfflineRagasBackend",
+    "RagasAdapter",
+    "RagasEvaluation",
+    "RagasUnavailable",
+    "normalize_ragas_result",
+]

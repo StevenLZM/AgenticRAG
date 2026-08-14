@@ -20,7 +20,7 @@ class MixedSnapshotError(ValueError):
 def build_summary(
     results: Iterable[EvalCaseResult],
     *,
-    baseline_ids: Mapping[str, str] | Sequence[str] | None = None,
+    baseline_ids: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Aggregate immutable case rows without exposing prompts or raw payloads.
 
@@ -82,22 +82,17 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 
 def _normalize_baselines(
-    baseline_ids: Mapping[str, str] | Sequence[str] | None,
+    baseline_ids: Mapping[str, str] | None,
 ) -> dict[str, str]:
     if baseline_ids is None:
         return {}
-    if isinstance(baseline_ids, Mapping):
-        normalized: dict[str, str] = {}
-        for name, snapshot in baseline_ids.items():
-            if not isinstance(name, str) or not name.strip() or not isinstance(snapshot, str) or not snapshot.strip():
-                raise ValueError("baseline IDs must map non-empty names to non-empty snapshots")
-            normalized[name] = snapshot
-        return normalized
-    normalized = {}
-    for index, snapshot in enumerate(baseline_ids):
-        if not isinstance(snapshot, str) or not snapshot.strip():
-            raise ValueError("baseline IDs must be non-empty snapshot IDs")
-        normalized[f"baseline-{index + 1}"] = snapshot
+    if not isinstance(baseline_ids, Mapping):
+        raise ValueError("baseline_ids must be a named baseline mapping of baseline to snapshot")
+    normalized: dict[str, str] = {}
+    for name, snapshot in baseline_ids.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(snapshot, str) or not snapshot.strip():
+            raise ValueError("baseline IDs must map non-empty names to non-empty snapshots")
+        normalized[name] = snapshot
     return normalized
 
 

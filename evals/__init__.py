@@ -23,7 +23,12 @@ from evals.models import (
     validate_dataset_directory,
     validate_dataset_rows,
 )
-from evals.ragas_adapter import RagasAdapter, RagasEvaluation, RagasUnavailable
+from evals.ragas_adapter import (
+    RagasAdapter,
+    RagasEvaluation,
+    RagasUnavailable,
+    normalize_ragas_result,
+)
 from evals.report import MixedSnapshotError, build_summary, write_summary
 
 __all__ = [
@@ -47,6 +52,7 @@ __all__ = [
     "loop_metrics",
     "mrr",
     "ndcg_at_k",
+    "normalize_ragas_result",
     "recall_at_k",
     "security_metrics",
     "validate_dataset_directory",

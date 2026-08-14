@@ -82,6 +82,21 @@ async def test_corrupt_result_row_is_ignored_and_recomputed(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_duplicate_valid_result_rows_are_quarantined_and_recomputed(tmp_path: Path) -> None:
+    first_client = FakeQueryClient()
+    await EvalRunner(first_client, output_dir=tmp_path).run([_case()])
+    row = (tmp_path / "results.jsonl").read_text(encoding="utf-8")
+    (tmp_path / "results.jsonl").write_text(row + row, encoding="utf-8")
+
+    second_client = FakeQueryClient()
+    summary = await EvalRunner(second_client, output_dir=tmp_path).run([_case()])
+
+    assert second_client.call_count == 1
+    assert summary["quarantined_rows"] == 2
+    assert len((tmp_path / "results.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.asyncio
 async def test_runner_rejects_client_response_from_different_snapshot(tmp_path: Path) -> None:
     with pytest.raises(SnapshotMismatchError):
         await EvalRunner(
@@ -121,6 +136,34 @@ def test_report_rejects_mixed_runtime_snapshots() -> None:
     with pytest.raises(MixedSnapshotError):
         build_summary([one, two])
 
+    with pytest.raises(ValueError, match="named baseline"):
+        build_summary([one, two], baseline_ids=["snapshot-a", "snapshot-b"])
+
+
+@pytest.mark.parametrize(
+    "events_ref",
+    [
+        "https://example.test/events",
+        "artifact://../secret",
+        "artifact://events with spaces",
+        "artifact://authorization: bearer secret",
+        "prompt text without a URI",
+        "artifact://events\nnext",
+    ],
+)
+def test_eval_case_result_events_ref_accepts_only_safe_uri_references(events_ref: str) -> None:
+    with pytest.raises(ValueError):
+        EvalCaseResult(
+            case_id="case-1",
+            runtime_config_snapshot_id="snapshot-v1",
+            answer="answer",
+            evidence_parent_ids=("parent-1",),
+            route="fast_rag",
+            events_ref=events_ref,
+            deterministic_metrics={"parent_recall_at_6": 0.0},
+            ragas_metrics={"status": "unavailable"},
+        )
+
 
 @pytest.mark.asyncio
 async def test_runner_extracts_task2_deterministic_metrics(tmp_path: Path) -> None:
@@ -141,8 +184,59 @@ async def test_runner_extracts_task2_deterministic_metrics(tmp_path: Path) -> No
     assert row["deterministic_metrics"]["parent_recall_at_6"] == 1.0
     assert row["deterministic_metrics"]["mrr"] == pytest.approx(0.5)
     assert row["deterministic_metrics"]["ndcg_at_10"] == pytest.approx(1.0 / 1.5849625)
-    assert row["deterministic_metrics"]["leakage"] == 1
+    assert row["deterministic_metrics"]["leakage"] == 0
     assert summary["metrics"]["parent_recall_at_6"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_leakage_comes_only_from_scoped_security_events(tmp_path: Path) -> None:
+    class EventClient(FakeQueryClient):
+        async def query(self, case: EvaluationCase) -> dict[str, object]:
+            result = await super().query(case)
+            result.update(
+                {
+                    "leaked_parent_ids": ["untrusted-claim"],
+                    "user_leak_count": 99,
+                    "events": [
+                        {
+                            "event_key": "security-1",
+                            "run_id": "run-1",
+                            "user_id": case.user_id,
+                            "runtime_config_snapshot_id": case.runtime_config_snapshot_id,
+                            "event_type": "SECURITY_VIOLATION",
+                            "attributes": {"user_leak_count": 1},
+                        }
+                    ],
+                }
+            )
+            return result
+
+    await EvalRunner(EventClient(), output_dir=tmp_path).run([_case()])
+    row = json.loads((tmp_path / "results.jsonl").read_text(encoding="utf-8"))
+    assert row["deterministic_metrics"]["leakage"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ragas_result",
+    [
+        {"status": "available", "metrics": {}},
+        {"status": "available", "metrics": {"faithfulness": "not-a-score"}},
+        {"status": "available", "metrics": {"faithfulness": float("nan")}},
+        {"status": "unavailable", "metrics": {"faithfulness": 0.2}},
+    ],
+)
+async def test_runner_rejects_malformed_injected_ragas_results(
+    tmp_path: Path, ragas_result: dict[str, object]
+) -> None:
+    class InvalidRagas:
+        async def evaluate(self, **_: object) -> dict[str, object]:
+            return ragas_result
+
+    with pytest.raises((TypeError, ValueError)):
+        await EvalRunner(
+            FakeQueryClient(), output_dir=tmp_path, ragas_adapter=InvalidRagas()
+        ).run([_case()])
 
 
 @pytest.mark.asyncio

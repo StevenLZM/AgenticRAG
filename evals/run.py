@@ -23,12 +23,14 @@ from evals.metrics import (
     recall_at_k,
 )
 from evals.models import EvaluationCase, load_jsonl_dataset
-from evals.ragas_adapter import RagasAdapter, RagasEvaluation
+from evals.ragas_adapter import RagasAdapter, normalize_ragas_result
 from evals.report import MixedSnapshotError, atomic_write_text, build_summary, write_summary
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _URI = re.compile(r"^[^\x00-\x1f\x7f]{1,1024}$")
+_EVENT_REF_SCHEME = re.compile(r"^(?:artifact|fixture|inline)://")
+_EVENT_REF_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _SECRET_TEXT = re.compile(
     r"(?:api[_ -]?key|authorization:\s*bearer|password\s*=|sk-[A-Za-z0-9_-]{8,}|"
     r"chain[- ]of[- ]thought|hidden reasoning|provider[_ -]?secret)",
@@ -79,9 +81,7 @@ class EvalCaseResult(BaseModel):
     @field_validator("events_ref", mode="before")
     @classmethod
     def _strict_events_ref(cls, value: object) -> object:
-        if type(value) is not str or _URI.fullmatch(value.strip()) is None:
-            raise ValueError("events_ref must be a bounded non-control string")
-        return value.strip()
+        return _safe_events_ref(value)
 
     @field_validator("evidence_parent_ids", mode="before")
     @classmethod
@@ -134,7 +134,7 @@ class EvalRunner:
         *,
         limit: int | None = None,
         resume: bool = True,
-        baseline_ids: Mapping[str, str] | Sequence[str] | None = None,
+        baseline_ids: Mapping[str, str] | None = None,
     ) -> dict[str, object]:
         cases = _normalize_cases(dataset)
         if limit is not None:
@@ -185,6 +185,7 @@ class EvalRunner:
             lines = self.results_path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return {}
+        invalid_case_ids: set[str] = set()
         for line in lines:
             if not line.strip():
                 self.quarantined_rows += 1
@@ -196,6 +197,17 @@ class EvalRunner:
                 row = EvalCaseResult.model_validate(dict(value))
             except Exception:
                 self.quarantined_rows += 1
+                continue
+            if row.case_id in invalid_case_ids:
+                self.quarantined_rows += 1
+                continue
+            if row.case_id in result:
+                # A valid duplicate is not a harmless replay: choosing one row
+                # would make resume depend on file order.  Invalidate the case
+                # and force one fresh Query invocation.
+                result.pop(row.case_id, None)
+                invalid_case_ids.add(row.case_id)
+                self.quarantined_rows += 2
                 continue
             result[row.case_id] = row
         return result
@@ -267,25 +279,7 @@ class EvalRunner:
         )
         if inspect.isawaitable(value):
             value = await value
-        if isinstance(value, RagasEvaluation):
-            outcome = value
-        elif isinstance(value, Mapping):
-            raw_metrics = value.get("metrics", value)
-            status = value.get("status", "available" if raw_metrics else "unavailable")
-            if not isinstance(status, str) or not isinstance(raw_metrics, Mapping):
-                raise ValueError("Ragas adapter returned malformed result")
-            outcome = RagasEvaluation(
-                status=status,
-                metrics={
-                    str(name): float(metric)
-                    for name, metric in raw_metrics.items()
-                    if name not in {"status", "reason", "metrics"}
-                    if isinstance(metric, (int, float)) and not isinstance(metric, bool)
-                },
-                reason=value.get("reason") if isinstance(value.get("reason"), str) else None,
-            )
-        else:
-            raise TypeError("Ragas adapter must return RagasEvaluation or mapping")
+        outcome = normalize_ragas_result(value)
         if outcome.status == "unavailable":
             result: dict[str, float | str] = {"status": "unavailable"}
             if outcome.reason:
@@ -424,10 +418,8 @@ def _response_route(response: Mapping[str, object], fallback: str) -> str:
 def _response_events_ref(response: Mapping[str, object], case_id: str) -> str:
     value = response.get("events_ref", response.get("events_reference"))
     if value is None:
-        return f"inline://events/{case_id}"
-    if type(value) is not str or _URI.fullmatch(value.strip()) is None:
-        raise ValueError("query response omitted a valid events reference")
-    return value.strip()
+        value = f"inline://events/{case_id}"
+    return _safe_events_ref(value)
 
 
 def _response_events(response: Mapping[str, object]) -> list[Mapping[str, object]]:
@@ -461,7 +453,7 @@ def _deterministic_metrics(
         "parent_recall_at_6": recall_at_k(ranked_parent_ids, relevant, 6),
         "mrr": mrr(ranked_parent_ids, relevant, 6),
         "ndcg_at_10": ndcg_at_k(ranked_parent_ids, relevant, 10),
-        "leakage": _response_leakage(response, events, case),
+        "leakage": _response_leakage(events, case),
     }
     # Loop and security helpers are the sole source for event-derived metrics;
     # the runner does not reconstruct graph or retrieval decisions.
@@ -475,19 +467,28 @@ def _deterministic_metrics(
     return metrics
 
 
-def _response_leakage(
-    response: Mapping[str, object], events: Sequence[Mapping[str, object]], case: EvaluationCase
-) -> int:
-    for field in ("leaked_parent_ids", "leaked_evidence_ids"):
-        value = response.get(field)
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-            return len({item for item in value if type(item) is str})
-    value = response.get("user_leak_count", response.get("leakage"))
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-        return value
+def _response_leakage(events: Sequence[Mapping[str, object]], case: EvaluationCase) -> int:
+    """Read leakage only from Task 2's scoped, deduplicated event reducer."""
+
     security = aggregate_security_metrics(events, case.user_id, case.runtime_config_snapshot_id)
     leak = security.get("user_leak_count", 0)
     return int(leak) if isinstance(leak, int) else 0
+
+
+def _safe_events_ref(value: object) -> str:
+    if type(value) is not str or _URI.fullmatch(value.strip()) is None:
+        raise ValueError("events_ref must be a bounded URI")
+    reference = value.strip()
+    if _SECRET_TEXT.search(reference) or not _EVENT_REF_SCHEME.match(reference):
+        raise ValueError("events_ref must use an approved artifact, fixture or inline URI")
+    remainder = reference.split("://", 1)[1]
+    segments = remainder.split("/")
+    if not segments or any(
+        segment in {"", ".", ".."} or _EVENT_REF_SEGMENT.fullmatch(segment) is None
+        for segment in segments
+    ):
+        raise ValueError("events_ref contains an unsafe URI segment")
+    return reference
 
 
 def _validate_metric_map(value: object, *, allow_status: bool) -> dict[str, float | int | str]:
