@@ -74,6 +74,7 @@ class QueryGraphDependencies:
     event_repository: EventRepository | QueryGraphEventRecorder | None = None
     trace_recorder: TraceRecorder | None = None
     event_emitter: AgentEventEmitter | None = None
+    owned_resources: tuple[object, ...] = ()
 
 
 def query_checkpoint_config(state: QueryState) -> RunnableConfig:
