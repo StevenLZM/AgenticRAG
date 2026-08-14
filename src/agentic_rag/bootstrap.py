@@ -23,6 +23,8 @@ from agentic_rag.persistence.repositories import (
     SqlAlchemyIngestionJobRepository,
 )
 from agentic_rag.runtime.run_manager import RunManager, TransactionalRunRepository
+from agentic_rag.runtime.models import RuntimeConfigSnapshot
+from agentic_rag.runtime.query_composition import build_query_snapshot
 from agentic_rag.memory.models import MemoryContext, MemoryRecord
 from agentic_rag.memory.service import MemoryService
 from agentic_rag.domain.models import UserScope
@@ -51,6 +53,7 @@ class AppContainer:
     mysql_engine: AsyncEngine
     redis: Redis
     reranker_initialized: bool
+    runtime_snapshot: RuntimeConfigSnapshot
     run_manager: RunManager | None = None
     event_repository: object | None = None
     memory_service: MemoryService | None = None
@@ -92,6 +95,7 @@ def build_container(settings: Settings) -> AppContainer:
     artifacts = LocalArtifactStore(settings.artifact_root)
     checkpoints = CheckpointBackend(settings)
     reranker_initialized = bool(settings.reranker_model.strip())
+    runtime_snapshot = build_query_snapshot(settings)
     readiness_checks = build_readiness_checks(
         settings=settings,
         mysql=mysql_engine,
@@ -157,6 +161,7 @@ def build_container(settings: Settings) -> AppContainer:
         mysql_engine=mysql_engine,
         redis=redis,
         reranker_initialized=reranker_initialized,
+        runtime_snapshot=runtime_snapshot,
         run_manager=run_manager,
         event_repository=event_repository,
         memory_service=_UnavailableMemory(),  # type: ignore[arg-type]

@@ -92,7 +92,7 @@ def _credential(value: object, name: str) -> str:
     return secret
 
 
-def _snapshot(settings: Settings) -> RuntimeConfigSnapshot:
+def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
     try:
         hashes = prompt_hashes(_PROMPTS)
     except (OSError, ValueError) as error:
@@ -132,7 +132,7 @@ async def build_query_dependencies(container: object, settings: Settings) -> Que
             "reranker dependency sentence-transformers is not installed"
         ) from error
 
-    snapshot = _snapshot(settings)
+    snapshot = build_query_snapshot(settings)
     elasticsearch = getattr(container, "elasticsearch", None)
     repositories = getattr(container, "repositories", None)
     artifacts = getattr(container, "artifacts", None)
@@ -221,6 +221,7 @@ async def close_query_dependencies(dependencies: QueryGraphDependencies) -> None
 
 __all__ = [
     "QueryCompositionError",
+    "build_query_snapshot",
     "build_query_dependencies",
     "close_query_dependencies",
 ]
