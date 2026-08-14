@@ -2,7 +2,7 @@
 
 > 快照日期：2026-08-14
 >
-> 当前状态：Phase 1–4 已完成并通过独立审查；Phase 5 Task 1–4 已完成并通过独立审查。当前实现位于独立 worktree，尚未合并到 `main`。
+> 当前状态：Phase 1–5 已完成并通过独立审查。当前实现位于独立 worktree，尚未合并到 `main`。
 >
 > 本文档是恢复开发时的首要状态入口；详细设计、接口约束和任务拆分以文末权威文档为准。
 
@@ -34,9 +34,9 @@ git log -5 --oneline
 | Phase 2：Document Ingestion | 完成 | 6/6 | 安全上传、Docling AST、Parent/Child、Embedding、发布/对账、可恢复 Worker |
 | Phase 3：Retrieval and Evidence | 完成 | 6/6 | Dense/BM25、RRF/Rerank、Parent 聚合、降级检索图、EvidenceBuilder |
 | Phase 4：Query and Agent Runtime | 完成 | 9/9 | ModelGateway、Memory、Fast/Research、Subagent、审计、QueryGraph、Worker、API |
-| Phase 5：Evaluation and Operations | 进行中 | 4/5 | Trace/在线指标、确定性评测、离线可恢复报告、对抗/负载/恢复演练已完成；备份恢复和最终验收待完成 |
+| Phase 5：Evaluation and Operations | 完成 | 5/5 | Trace/在线指标、确定性评测、离线报告、对抗/负载/恢复演练、备份恢复/就绪检查/最终验收 |
 
-**总体完成：`31/32` 个路线图任务，约 `96.9%`。**
+**总体完成：`32/32` 个路线图任务，`100%`。**
 
 ## 3. 已实现能力
 
@@ -107,12 +107,20 @@ Task 4（`2e99e00..1947806`，基线实现 `2e99e00`）已完成并通过独立�
 - 新增 `scripts/run_recovery_drill.py`：七个固定故障场景使用隔离 in-memory fakes 和现有 `AgentEvent`、`UserScope`、`MemoryServiceImpl`、`LocalArtifactStore` 边界；覆盖 SSE 重连、Query/Ingestion 重放、Outbox Redis 故障、ES 激活中断、Artifact quarantine、Mem0 scope/outage。报告包含 scenario invariants、replay/duplicate/leak/quarantine 计数，使用 fsync+replace 原子写入，失败或泄漏时返回非零。
 - Task 4 最终验证：E2E 10 passed；全量 importlib 测试 530 passed、38 skipped；Ruff、scoped mypy、diff-check 通过；直接脚本与 module CLI 均返回 0，报告确定性且无临时文件残留。
 
+Task 5（Backup/Restore/Readiness/Final Acceptance）已完成：
+
+- `scripts/backup_local.py` 对 SQLite checkpoint、Artifact、可选 MySQL dump、Elasticsearch generation/alias/template/document 做内容寻址清单、SHA-256 完整性校验和原子发布；默认不触碰生产服务数据。
+- `scripts/restore_local.py` 在验证 manifest、路径和每个文件 hash 后，仅恢复到不存在的目标；服务恢复要求显式空 MySQL 数据库和新 Elasticsearch generation，并在导入后执行 Alembic、文档计数、mapping/alias 校验。
+- `scripts/run_api.py` 提供有限优雅退出；`ReadinessChecks.require_ready()` 对依赖不可用 fail-closed；`scripts/verify_acceptance.py` 严格要求泄漏为 0、citation coverage 为 1.0、无未审计答案、恢复演练和备份恢复均通过。
+- 真实本地服务验证使用隔离资源：MySQL schema/API 15+4 项、Redis Streams 3 项、Elasticsearch 检索 1 项、备份恢复 E2E 11 项均通过；不修改默认 `agentic_rag` 数据库、Redis 默认数据或现有 ES generation。真实 DeepSeek/Qwen 模型 smoke 1 项通过（Qwen embedding 1024 维）。
+- 最终 baseline 24 cases 离线评测产生 `user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`、两个恢复 gate 均为 true；`verify_acceptance.py` 返回 `ACCEPTANCE PASSED`。
+
 ## 4. 最近验证证据
 
-验证基于实现分支最终提交 `1947806`，使用 `conda` 环境 `agentic-rag`：
+验证基于实现分支 Task 5 工作树，使用 `conda` 环境 `agentic-rag`：
 
 ```text
-full importlib test suite: 530 passed, 38 skipped
+non-service importlib suite: 486 passed, 96 deselected
 Task 1 focused observability/graph/worker/model suite: 70 passed
 Task 2 focused evaluation suite: 23 passed
 Task 3 focused runner/evaluation suite: 50 passed
@@ -120,6 +128,13 @@ Task 3 related eval/query/runtime/observability subset: 168 passed
 full unit suite after Task 3: 459 passed
 Task 4 focused E2E suite: 10 passed
 Recovery drill CLI: direct/module invocation exit 0; duplicates=0, leaks=0
+Task 5 backup/restore E2E with disposable MySQL/Redis/Elasticsearch: 11 passed
+MySQL schema integration with module-scoped event loop: 15 passed
+MySQL document API integration with module-scoped event loop: 4 passed
+Redis Streams integration: 3 passed
+Elasticsearch retrieval integration: 1 passed
+Live DeepSeek/Qwen smoke: 1 passed
+baseline evaluation: 24 cases; acceptance verifier: ACCEPTANCE PASSED
 ruff check src tests: All checks passed
 mypy Task 1 changed source: no issues found
 git diff --check b83b716..8729171: clean
@@ -153,23 +168,22 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 
 ## 6. 尚未实现与上线前注意事项
 
-- Phase 5 仍缺少一项交付：备份恢复、就绪检查和最终验收。
+- 生产上线前仍需执行一次分支级发布审查，并把实现 worktree 合并到 `main`；本地最终验收不等同于生产鉴权/RBAC 审批。
 - 当前 V1 只有 `user_id` 命名空间隔离，没有完整鉴权、RBAC 或用户身份解析；生产入口不能继续依赖 `default_user`。
 - Memory 的真实 Mem0 provider 由部署注入；未配置时服务会 fail-closed，不应把 no-op 结果当作生产记忆。
-- Elasticsearch、MySQL、Redis、Mem0 的真实联调尚未在本环境执行；上线前必须使用独立测试资源完成门禁。
+- 本地 Elasticsearch、MySQL、Redis 已用隔离测试资源完成联调；Mem0 真实 provider 仍由部署注入，当前安全回归使用注入 fake/边界测试，不能把 Mem0 fake 结果当生产可用性证明。
 - 当前实现仍在 `sdd-agentic-rag-implementation`，合并到 `main` 前需进行一次分支级回归和发布审查。
 
 ## 7. 下一次开发的准确起点
 
-下一任务是 **Phase 5 Task 5：Backup, Restore, Readiness and Final Acceptance**。
+Phase 5 Task 5 已完成；下一步是分支级发布审查和合并，不应重新实现 Phase 1–5。
 
 恢复步骤：
 
-1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净、HEAD 为 `1947806` 或其后续 docs-only 提交。
-2. 运行 Phase 4、Task 1–4 回归门禁，确认 Query Worker/API/审计/遥测/评测以及安全/恢复测试没有回归。
-3. 完整阅读 Phase 5 计划与全局约束，为 Task 5 编写 RED 测试和独立 brief。
-4. 为备份/恢复演练配置可丢弃的 MySQL/Redis/Elasticsearch/Artifact 测试命名空间；真实 Mem0 provider 仍只在显式 opt-in 时启用。
-5. 按 TDD、实现报告、独立 reviewer、fix/re-review 流程推进，并以最终验收清单收口，不跳过评测可重复性、恢复安全和真实服务门禁。
+1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净。
+2. 运行 `docs/local-operations.md` 中的静态、真实服务和最终验收命令。
+3. 请求独立 reviewer 对 Task 5 提交范围复审；若通过，执行分支级 diff、迁移和发布审查。
+4. 将实现分支合并到 `main` 前，重新确认 `.env.local`、备份目录和隔离测试数据库未被纳入提交。
 
 Phase 5 顺序：
 
@@ -178,7 +192,7 @@ Trace Recorder + Online Metrics (complete)
   -> Deterministic Retrieval/AgentLoop Evaluation (complete)
   -> Offline Ragas Reports (complete)
   -> Adversarial/Load/Recovery Suites (complete)
-  -> Backup/Restore/Readiness/Final Acceptance (next)
+  -> Backup/Restore/Readiness/Final Acceptance (complete)
 ```
 
 ## 8. 权威文档索引

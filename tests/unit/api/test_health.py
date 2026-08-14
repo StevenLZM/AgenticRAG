@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
 import agentic_rag.api.app as app_module
@@ -156,6 +157,17 @@ async def test_readiness_is_ready_only_when_every_dependency_is_available(
     assert response.json()["dependencies"] == {
         name: "available" for name in sorted(DEPENDENCY_NAMES)
     }
+
+
+async def test_readiness_require_ready_fails_closed_with_dependency_names() -> None:
+    checks = ReadinessChecks({"mysql": _ok, "elasticsearch": _fails})
+
+    with pytest.raises(RuntimeError, match="elasticsearch"):
+        await checks.require_ready()
+
+
+async def _fails() -> None:
+    raise OSError("unavailable")
 
 
 async def test_configuration_check_requires_credentials_without_calling_models(

@@ -48,6 +48,8 @@ class FakeQueryClient:
             "events_ref": f"artifact://events/{case.case_id}",
             "runtime_config_snapshot_id": self.snapshot or case.runtime_config_snapshot_id,
             "events": [],
+            "citation_coverage": 1.0,
+            "audited": True,
         }
 
 
@@ -138,6 +140,48 @@ def test_report_rejects_mixed_runtime_snapshots() -> None:
 
     with pytest.raises(ValueError, match="named baseline"):
         build_summary([one, two], baseline_ids=["snapshot-a", "snapshot-b"])
+
+
+def test_summary_emits_only_verified_acceptance_gate_values() -> None:
+    row = EvalCaseResult(
+        case_id="case-acceptance",
+        runtime_config_snapshot_id="snapshot-v1",
+        answer="audited answer",
+        evidence_parent_ids=("parent-1",),
+        route="fast_rag",
+        events_ref="fixture://events/case-acceptance",
+        deterministic_metrics={"leakage": 0},
+        ragas_metrics={"status": "unavailable"},
+        citation_coverage=1.0,
+        audited=True,
+    )
+
+    summary = build_summary(
+        [row], recovery_drill_passed=True, backup_restore_passed=True
+    )
+
+    assert summary["user_leak_count"] == 0
+    assert summary["citation_coverage"] == 1.0
+    assert summary["unaudited_answer_count"] == 0
+    assert summary["recovery_drill_passed"] is True
+    assert summary["backup_restore_passed"] is True
+
+
+def test_summary_citation_gate_uses_worst_verified_case() -> None:
+    common = {
+        "runtime_config_snapshot_id": "snapshot-v1",
+        "answer": "audited answer",
+        "evidence_parent_ids": ("parent-1",),
+        "route": "fast_rag",
+        "events_ref": "fixture://events/coverage",
+        "deterministic_metrics": {"leakage": 0},
+        "ragas_metrics": {"status": "unavailable"},
+        "audited": True,
+    }
+    strong = EvalCaseResult(case_id="coverage-strong", citation_coverage=1.0, **common)
+    weak = EvalCaseResult(case_id="coverage-weak", citation_coverage=0.5, **common)
+
+    assert build_summary([strong, weak])["citation_coverage"] == 0.5
 
 
 @pytest.mark.parametrize(

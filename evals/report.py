@@ -21,6 +21,8 @@ def build_summary(
     results: Iterable[EvalCaseResult],
     *,
     baseline_ids: Mapping[str, str] | None = None,
+    recovery_drill_passed: bool = False,
+    backup_restore_passed: bool = False,
 ) -> dict[str, object]:
     """Aggregate immutable case rows without exposing prompts or raw payloads.
 
@@ -48,12 +50,36 @@ def build_summary(
         "runtime_config_snapshot_ids": snapshots,
         "metrics": metrics,
         "ragas": ragas,
+        "user_leak_count": _sum_integer_metric(rows, "leakage"),
+        "citation_coverage": _citation_coverage(rows),
+        "unaudited_answer_count": sum(not row.audited for row in rows),
+        "recovery_drill_passed": recovery_drill_passed,
+        "backup_restore_passed": backup_restore_passed,
     }
     if allowed:
         summary["baseline_ids"] = dict(sorted(allowed.items()))
     if len(snapshots) > 1:
         summary["comparisons"] = _comparison_summaries(rows, allowed)
     return summary
+
+
+def _sum_integer_metric(rows: Sequence[EvalCaseResult], name: str) -> int:
+    total = 0
+    for row in rows:
+        value = row.deterministic_metrics.get(name, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 1
+        total += value
+    return total
+
+
+def _citation_coverage(rows: Sequence[EvalCaseResult]) -> float:
+    if not rows or any(not row.audited for row in rows):
+        return 0.0
+    # Acceptance is a hard per-case gate: averaging would allow a low-quality
+    # answer to be hidden by other fully-cited cases.  Keep the worst verified
+    # case as the run-level projection so ``== 1.0`` means every case passed.
+    return min(row.citation_coverage for row in rows)
 
 
 def write_summary(path: str | Path, summary: Mapping[str, object]) -> None:

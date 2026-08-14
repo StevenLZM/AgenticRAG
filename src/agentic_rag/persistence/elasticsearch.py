@@ -336,7 +336,9 @@ def _mapping_differences(
     changed = sorted(
         field
         for field in set(actual_properties) & set(expected_properties)
-        if actual_properties[field] != expected_properties[field]
+        if not _mapping_field_matches(
+            actual_properties[field], expected_properties[field]
+        )
     )
     if missing:
         differences.append("missing properties: " + ", ".join(missing))
@@ -345,3 +347,19 @@ def _mapping_differences(
     if changed:
         differences.append("changed properties: " + ", ".join(changed))
     return differences
+
+
+def _mapping_field_matches(actual: object, expected: object) -> bool:
+    """Compare reviewed mapping keys while tolerating ES server defaults.
+
+    Elasticsearch adds an ``index_options`` object to dense-vector mappings
+    when the HNSW index is created.  It is a server-owned representation of
+    the requested ``index``/``similarity`` contract, not a schema change.  All
+    application-owned dense-vector keys remain strict below.
+    """
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        return actual == expected
+    if expected.get("type") != "dense_vector":
+        return actual == expected
+    required = ("type", "dims", "index", "similarity")
+    return all(actual.get(key) == expected.get(key) for key in required)

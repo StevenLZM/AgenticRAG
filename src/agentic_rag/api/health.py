@@ -47,6 +47,23 @@ class ReadinessChecks:
         )
         return dict(zip(names, states, strict=True))
 
+    async def require_ready(self) -> dict[str, DependencyStatus]:
+        """Return readiness results or fail closed for operational scripts.
+
+        The API deliberately exposes only availability booleans.  Local restore
+        tooling needs the same sanitized result plus a machine-actionable error
+        rather than continuing after a partial dependency failure.
+        """
+        dependencies = await self.run()
+        unavailable = sorted(
+            name for name, state in dependencies.items() if state != "available"
+        )
+        if unavailable:
+            raise RuntimeError(
+                "readiness checks failed: " + ", ".join(unavailable)
+            )
+        return dependencies
+
     async def _run_one(self, check: HealthCheck) -> DependencyStatus:
         try:
             await asyncio.wait_for(check(), timeout=self._timeout_seconds)

@@ -36,6 +36,7 @@ eval = ["datasets", "ragas"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--import-mode=importlib"
 pythonpath = ["src", "."]
 markers = [
   "integration: requires local infrastructure",

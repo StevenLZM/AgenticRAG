@@ -5,4 +5,4 @@ from agentic_rag.config import Settings
 
 def migration_database_url() -> str:
     """Return the configured application MySQL DSN for command-line Alembic."""
-    return Settings().mysql_dsn
+    return Settings().mysql_dsn  # type: ignore[call-arg]

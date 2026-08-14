@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from evals.metrics import (
     aggregate_loop_metrics,
@@ -66,6 +66,8 @@ class EvalCaseResult(BaseModel):
     # ``status=unavailable`` is the only non-numeric value permitted.  It keeps
     # missing Ragas explicit without inventing a score.
     ragas_metrics: dict[str, float | str]
+    citation_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
+    audited: bool = False
 
     @field_validator("case_id", "runtime_config_snapshot_id", "route", mode="before")
     @classmethod
@@ -140,6 +142,8 @@ class EvalRunner:
         limit: int | None = None,
         resume: bool = True,
         baseline_ids: Mapping[str, str] | None = None,
+        recovery_drill_passed: bool = False,
+        backup_restore_passed: bool = False,
     ) -> dict[str, object]:
         cases = _normalize_cases(dataset)
         if limit is not None:
@@ -147,7 +151,12 @@ class EvalRunner:
                 raise ValueError("limit must be a non-negative integer")
             cases = cases[:limit]
         if not cases:
-            summary = build_summary([], baseline_ids=baseline_ids)
+            summary = build_summary(
+                [],
+                baseline_ids=baseline_ids,
+                recovery_drill_passed=recovery_drill_passed,
+                backup_restore_passed=backup_restore_passed,
+            )
             write_summary(self.summary_path, summary)
             return summary
         snapshots = {case.runtime_config_snapshot_id for case in cases}
@@ -172,7 +181,12 @@ class EvalRunner:
         # this removes stale/corrupt/duplicate rows from prior interrupted runs.
         ordered = _ordered_rows(cases, rows)
         self._write_rows(ordered)
-        summary = build_summary(ordered, baseline_ids=baseline_ids)
+        summary = build_summary(
+            ordered,
+            baseline_ids=baseline_ids,
+            recovery_drill_passed=recovery_drill_passed,
+            backup_restore_passed=backup_restore_passed,
+        )
         write_summary(self.summary_path, summary)
         return {
             **summary,
@@ -271,6 +285,8 @@ class EvalRunner:
             events_ref=events_ref,
             deterministic_metrics=deterministic,
             ragas_metrics=ragas,
+            citation_coverage=_response_citation_coverage(response),
+            audited=_response_audited(response),
         )
 
     async def _ragas_metrics(
@@ -318,6 +334,8 @@ class FixtureQueryClient:
             "events_ref": f"fixture://events/{case.case_id}",
             "events": [],
             "contexts": [case.reference_answer],
+            "citation_coverage": 1.0,
+            "audited": True,
         }
 
 
@@ -328,7 +346,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="evaluate only the first N cases")
     args = parser.parse_args(argv)
     cases = load_jsonl_dataset(args.dataset)
-    summary = asyncio.run(EvalRunner(FixtureQueryClient(), output_dir=args.output).run(cases, limit=args.limit))
+    from scripts.backup_local import run_backup_restore_drill
+    from scripts.run_recovery_drill import run_recovery_drill
+
+    recovery_drill_passed = run_recovery_drill().gate_passed
+    backup_restore_passed = run_backup_restore_drill()
+    summary = asyncio.run(
+        EvalRunner(FixtureQueryClient(), output_dir=args.output).run(
+            cases,
+            limit=args.limit,
+            recovery_drill_passed=recovery_drill_passed,
+            backup_restore_passed=backup_restore_passed,
+        )
+    )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return 0
 
@@ -432,6 +462,23 @@ def _response_events(response: Mapping[str, object]) -> list[Mapping[str, object
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return []
     return [cast(Mapping[str, object], item) for item in value if isinstance(item, Mapping)]
+
+
+def _response_citation_coverage(response: Mapping[str, object]) -> float:
+    value = response.get("citation_coverage")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("query response omitted numeric citation_coverage")
+    coverage = float(value)
+    if not math.isfinite(coverage) or coverage < 0.0 or coverage > 1.0:
+        raise ValueError("query response citation_coverage must be within [0, 1]")
+    return coverage
+
+
+def _response_audited(response: Mapping[str, object]) -> bool:
+    value = response.get("audited")
+    if type(value) is not bool:
+        raise ValueError("query response omitted boolean audited")
+    return value
 
 
 def _response_contexts(response: Mapping[str, object]) -> list[str]:

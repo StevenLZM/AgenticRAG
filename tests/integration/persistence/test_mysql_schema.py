@@ -301,7 +301,9 @@ async def test_migration_creates_exact_schema_with_required_keys(
 async def test_concurrent_reconciliation_claims_are_disjoint_and_release_locks(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    suffix = uuid4().hex
+    # Keep generated identifiers within the production VARCHAR(36) contract;
+    # SQLite does not enforce this length, while real MySQL correctly does.
+    suffix = uuid4().hex[:20]
     ids = (f"outbox-claim-a-{suffix}", f"outbox-claim-b-{suffix}")
     now = datetime.now(UTC)
     async with session_factory.begin() as transaction:
@@ -425,7 +427,10 @@ async def test_database_rejects_status_active_slot_mismatch(
     active_slot: int | None,
 ) -> None:
     """MySQL itself protects the exclusivity invariant in both directions."""
-    with pytest.raises(IntegrityError):
+    # MySQL/asyncmy surfaces CHECK-constraint violations as OperationalError,
+    # whereas SQLite and some drivers expose IntegrityError.  The portable
+    # contract is that the database rejects the write.
+    with pytest.raises(SQLAlchemyError):
         async with session_factory.begin() as transaction:
             await transaction.execute(
                 insert(agent_runs).values(
@@ -844,6 +849,10 @@ async def test_outbox_claim_lease_excludes_an_independent_session(
     outbox_id = str(uuid4())
     initial_attempt = datetime(2000, 1, 1, tzinfo=UTC)
     async with session_factory.begin() as transaction:
+        # Earlier contract tests intentionally create outbox rows.  Isolate
+        # this lock test so the second batch claim cannot update unrelated
+        # rows while the first transaction holds the selected row lock.
+        await transaction.execute(delete(task_outbox))
         await transaction.execute(
             insert(task_outbox).values(
                 id=outbox_id,
@@ -896,3 +905,7 @@ async def test_outbox_claim_lease_excludes_an_independent_session(
             await second_session.rollback()
         await first_session.close()
         await second_session.close()
+        async with session_factory.begin() as transaction:
+            await transaction.execute(
+                delete(task_outbox).where(task_outbox.c.id == outbox_id)
+            )
