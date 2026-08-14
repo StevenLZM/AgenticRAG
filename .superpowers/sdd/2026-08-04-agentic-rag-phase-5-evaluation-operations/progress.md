@@ -14,4 +14,4 @@
 - Task 4: complete at 2bb7f25 — Graph/API evaluation modes, provenance, resume safety and real-client acceptance gate
 - Task 5: complete at 67d492a — explicit degradation/circuit/retry/DLQ warning and durable telemetry with safe redaction
 - Task 6: complete at 8729171 — Query lifecycle metrics, run latency, queue replay dedupe and explicit unavailable cost semantics
-- Task 7: in progress — release gate, real-service evidence documentation and branch-level final review
+- Task 7: complete at 3f0c4cd — opt-in real Query release gate, explicit SSE degradation notices, real-service runbook and final verification ledger
