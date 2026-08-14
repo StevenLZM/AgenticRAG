@@ -1,8 +1,9 @@
 # Production Agentic RAG Implementation Roadmap
 
-> **Current implementation status:** Phase 1 and Phase 2 are complete on
-> `sdd-agentic-rag-implementation`; Phase 3 has not started. Read the
-> [development progress snapshot](../../development-progress.md) before resuming.
+> **Current implementation status:** Phase 1–5 and the Query Runtime/Mem0/real
+> evaluation follow-up are complete on `sdd-agentic-rag-implementation`.
+> Read the [development progress snapshot](../../development-progress.md) before
+> resuming; only branch merge and production identity/RBAC approval remain.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -58,7 +59,7 @@
 | 2 | Text PDF, scanned PDF, text and Excel fixtures produce valid Canonical AST, Parent/Child records and a recoverable active version. |
 | 3 | Hybrid retrieval integration tests pass with zero user leakage; deterministic Recall@6, NDCG@10 and MRR fixtures produce expected values. |
 | 4 | Fast RAG, multi-hop loop, Subagent, audit, cancellation, checkpoint recovery and SSE reconnection tests pass. |
-| 5 | Full unit/integration/e2e/eval suite passes; backup restoration and worker interruption drills pass; hard quality gates remain zero violations. |
+| 5 | Full unit/integration/e2e/eval suite passes; isolated MySQL/Redis/Elasticsearch backup restoration and worker interruption drills pass; Graph/API evaluation provenance and hard quality gates remain zero violations. |
 
 ## Design Coverage Map
 
@@ -71,20 +72,30 @@
 | Working/long-term memory, Mem0 lifecycle and deletion | Phase 1 Task 5; Phase 4 Task 2 |
 | Evidence, Faithfulness and citation gates | Phase 4 Tasks 6–7 |
 | Safety boundaries for upload, retrieved context, Memory and Tool input | Phase 2 Tasks 1–2; Phase 3 Tasks 1 and 6; Phase 4 Tasks 2, 4 and 6 |
-| Runtime versioning, tracing, online metrics and three-layer evaluation | Phase 1 Task 2; Phase 5 Tasks 1–3 |
-| Retry/degradation, load/backpressure, recovery and local operations | Phase 3 Tasks 3 and 5; Phase 4 Task 8; Phase 5 Tasks 4–5 |
+| Runtime versioning, tracing, online metrics and three-layer evaluation | Phase 1 Task 2; Phase 5 Tasks 1–3; Query Runtime follow-up Tasks 5–6 |
+| Retry/degradation, load/backpressure, recovery and local operations | Phase 3 Tasks 3 and 5; Phase 4 Task 8; Phase 5 Tasks 4–5; Query Runtime follow-up Tasks 1–4, 6–7 |
 
 ## Final Verification Commands
 
 ```bash
-ruff check src tests evals
-mypy src
-pytest -m "not integration and not e2e and not live_model" -q
-pytest -m integration -q
-pytest -m e2e -q
-pytest -m live_model tests/smoke -q
-python -m evals.run --dataset evals/datasets/baseline.jsonl --output artifacts/evals/final
-python scripts/verify_acceptance.py --report artifacts/evals/final/summary.json
+conda run -n agentic-rag ruff check src tests evals scripts
+conda run -n agentic-rag mypy src
+conda run -n agentic-rag python -m pytest --import-mode=importlib \
+  -m "not integration and not e2e and not live_model" -q
+conda run -n agentic-rag python -m pytest --import-mode=importlib -m integration -q
+conda run -n agentic-rag python -m pytest --import-mode=importlib -m e2e -q
+conda run -n agentic-rag python -m pytest --import-mode=importlib -m live_model tests/smoke -q
+# Fixture is smoke only; final acceptance must use graph or api provenance.
+conda run -n agentic-rag python -m evals.run --mode fixture \
+  --dataset evals/datasets/baseline.jsonl --output artifacts/evals/fixture
+conda run -n agentic-rag python -m evals.run --mode graph \
+  --dataset var/artifacts/evals/runtime-baseline.jsonl --output artifacts/evals/graph
+conda run -n agentic-rag python scripts/verify_acceptance.py \
+  --report artifacts/evals/graph/summary.json
 ```
 
-The final verifier must exit non-zero if `user_leak_count != 0`, citation coverage is below 100%, an unaudited answer was returned, a required service is unhealthy, or the recovery drill did not complete.
+The final verifier must exit non-zero if `user_leak_count != 0`, citation coverage
+is below 100%, an unaudited answer was returned, the report is fixture-only,
+real query provenance is absent, a required service is unhealthy, or the recovery
+drill did not complete.  API mode uses the same runtime-snapshot-matched dataset
+and sets `AGENTIC_RAG_EVAL_SNAPSHOT_ID` explicitly.

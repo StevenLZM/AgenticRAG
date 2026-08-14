@@ -20,6 +20,26 @@ conda run -n agentic-rag python scripts/run_ingestion_worker.py
 
 The API is live at `/health/live`; use `/health/ready` only after all dependencies report `available`. For an upgrade, stop workers first, let the current graph node reach its SQLite checkpoint, apply the migration, and restart in the same order.
 
+## Query Outbox and Query Worker
+
+`POST /v1/query-runs` writes the durable Run and its `query_run` Outbox row in
+one MySQL transaction. The Query Worker dispatches only `query_run` rows to the
+Query Redis Stream, claims/reclaims deliveries with a lease, heartbeats while a
+graph is running, and ACKs only after the audited answer (or a terminal business
+refusal) is persisted. Redis publication failures remain retryable; repeated
+failures enter the bounded retry/DLQ path. This prevents a committed request
+from disappearing between MySQL and Redis and lets a restarted worker resume
+without creating a second Run.
+
+Every fallback boundary is observable. The process logger emits a bounded
+warning and the event repository receives a safe durable event such as
+`RETRIEVAL_DEGRADED`, `CIRCUIT_OPEN`, `COMPONENT_DEGRADED`, `OUTBOX_RETRY` or
+`WORKER_DLQ`; events contain only allowlisted component/reason/outcome/attempt
+fields. SSE exposes the same operational event names, while raw prompts,
+memory text, hidden reasoning, tool payloads and provider responses are always
+redacted. A circuit-open or degraded response also keeps the API's
+`retryable`/`degraded_components` fields explicit.
+
 ## Mem0 long-term memory
 
 Mem0 is disabled by default so a local Query API can start without the optional
@@ -173,6 +193,21 @@ conda run -n agentic-rag python -m evals.run --mode api \
   --output var/artifacts/evals/api
 conda run -n agentic-rag python scripts/verify_acceptance.py \
   --report var/artifacts/evals/graph/summary.json
+```
+
+The release gate additionally requires evidence that the worker started, a
+real Graph/API query completed, Mem0 was available, and at least one safe
+degradation/circuit event was observed. Supply paths from the isolated release
+run; leave the command unselected during ordinary local tests:
+
+```sh
+export AGENTIC_RAG_RELEASE_WORKER_STARTED=1
+export AGENTIC_RAG_RELEASE_QUERY_E2E=1
+export AGENTIC_RAG_RELEASE_MEM0_AVAILABLE=1
+export AGENTIC_RAG_RELEASE_SUMMARY=var/artifacts/evals/graph/summary.json
+export AGENTIC_RAG_RELEASE_TELEMETRY=var/artifacts/observability/release.jsonl
+conda run -n agentic-rag python -m pytest --import-mode=importlib \
+  tests/e2e/test_release_query_gate.py -q
 ```
 
 The default `fixture` mode is an offline smoke test only and prints `SMOKE

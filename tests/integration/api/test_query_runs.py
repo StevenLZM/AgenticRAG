@@ -285,6 +285,30 @@ async def test_sse_unknown_event_does_not_forward_raw_summary() -> None:
 
 
 @pytest.mark.integration
+async def test_sse_exposes_safe_degradation_event_notice() -> None:
+    event = AgentEvent(
+        id=1,
+        event_key="retrieval-degraded",
+        trace_id="trace-1",
+        run_id="run-1",
+        user_id=SCOPE.user_id,
+        event_type="RETRIEVAL_DEGRADED",
+        summary="degraded",
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        created_at=datetime.now(UTC),
+    )
+    runs = FakeRunManager(runs={"run-1": _run(status=RunStatus.COMPLETED)})
+    app, _, _, _ = _app(runs, FakeEvents(events=[event]))
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/query-runs/run-1/events")
+
+    assert response.status_code == 200
+    assert '"event_type":"RETRIEVAL_DEGRADED"' in response.text
+    assert '"summary":"degraded"' in response.text
+
+
+@pytest.mark.integration
 async def test_unconfigured_memory_list_fails_closed() -> None:
     class UnavailableMemory(FakeMemory):
         async def list(self, scope: UserScope) -> list[MemoryRecord]:
