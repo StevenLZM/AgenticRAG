@@ -8,18 +8,18 @@ RED was recorded before implementation:
 conda run -n agentic-rag python -m pytest -m e2e tests/e2e/test_backup_restore.py -q
 ```
 
-It failed during collection with `ModuleNotFoundError: No module named 'scripts.backup_local'`. The new local backup/restore test then passed after the deterministic signed-manifest implementation:
+It failed during collection with `ModuleNotFoundError: No module named 'scripts.backup_local'`. The new local backup/restore test then passed after the deterministic hash-verified manifest implementation:
 
 ```sh
 conda run -n agentic-rag python -m pytest --import-mode=importlib tests/e2e/test_backup_restore.py -q
-# 10 passed, 1 skipped (before explicit real-service variables)
+# 14 passed, 1 skipped (before explicit real-service variables)
 ```
 
 The readiness RED test failed with `AttributeError: 'ReadinessChecks' object has no attribute 'require_ready'`; it is green after adding fail-closed `require_ready()`:
 
 ```sh
 conda run -n agentic-rag python -m pytest tests/unit/api/test_health.py -q
-# 11 passed
+# 13 passed
 ```
 
 The live-model RED test failed with `ModuleNotFoundError: No module named 'scripts.live_model_smoke'`; the selected provider gate is green:
@@ -33,8 +33,8 @@ The test made actual DeepSeek `deepseek-v4-flash` structured routing and `deepse
 
 ## Implementation
 
-- `backup_local.py` writes a new directory atomically, SQLite-backups checkpoint files after WAL checkpointing, copies Artifact files without symlink traversal, records app/schema/index generations, hashes a sorted file inventory, and signs the canonical manifest.
-- Service backup is explicit: MySQL uses a consistent `mysqldump --single-transaction`; Elasticsearch exports the controlled generation plus aliases/templates and all documents in stable ID order.
+- `backup_local.py` writes a new directory atomically, SQLite-backups checkpoint files after WAL checkpointing, copies Artifact files without symlink traversal, records app/schema/index generations, and hashes a sorted file inventory. `manifest.sha256` is an integrity hash, not a cryptographic signature.
+- Service backup is explicit: MySQL uses a consistent `mysqldump --single-transaction`; Elasticsearch exports the controlled generation plus aliases/templates and all documents in stable ID order; Redis exports only an explicit safe key prefix with DUMP/TTL data and supports source-to-target prefix remapping on restore.
 - `restore_local.py` validates the manifest and every hash before creating a target, rejects existing targets, uses a staging directory and atomic publish, validates Artifact paths, and requires explicit service targets when a service export is present. MySQL restores only to a verified-empty database, imports the dump, and runs Alembic. Elasticsearch creates a fresh generation, restores documents/template/alias, and checks index count/mapping/aliases.
 - `run_api.py` provides a Uvicorn launcher with bounded SIGTERM/SIGINT draining. Existing workers already use `stop_event` signal handling and durable SQLite checkpoints.
 - `verify_acceptance.py` is strict: any missing, wrong-typed, or non-passing hard gate fails.
@@ -47,7 +47,7 @@ conda run -n agentic-rag python scripts/check_local_dependencies.py
 # configuration/mysql/redis/elasticsearch/artifacts/checkpoints/reranker: available
 ```
 
-The isolated MySQL/Redis/Elasticsearch restore drill is opt-in and only uses generated `agentic_rag_backup_*` and `agentic_rag_restore_*` databases, a generated `agenticrag-children-e2e-*` index and one generated Redis prefix. It never connects to or deletes the configured `agentic_rag` application data.
+The isolated MySQL/Redis/Elasticsearch restore drill is opt-in and only uses generated `agentic_rag_backup_*` and `agentic_rag_restore_*` databases, a generated `agenticrag-children-e2e-*` index and two generated Redis prefixes for source-to-target remapping. It never connects to or deletes the configured `agentic_rag` application data.
 
 ```sh
 AGENTIC_RAG_RUN_REAL_BACKUP_RESTORE=1 \
@@ -56,12 +56,13 @@ AGENTIC_RAG_TEST_REDIS_DSN='redis://127.0.0.1:6379/15' \
 AGENTIC_RAG_TEST_ELASTICSEARCH_URL='http://127.0.0.1:9200' \
   conda run -n agentic-rag python -m pytest --import-mode=importlib \
   tests/e2e/test_backup_restore.py -q -s
-# 11 passed
+# 15 passed (4 prefix-safety checks + isolated MySQL/ES/Redis restore)
 ```
 
 The real run created random disposable MySQL source/restore databases, applied
 Alembic head, inserted and read a marker row, exported/restored one ES index
-and alias with one document, and round-tripped one Redis key prefix. Cleanup
+and alias with one document, and round-tripped one Redis key from a source
+prefix into a distinct restore prefix. Cleanup
 removed the generated databases, indices, and key. The configured
 `agentic_rag` database and default Redis/ES namespaces were not touched.
 
@@ -77,6 +78,9 @@ conda run -n agentic-rag mypy src
 conda run -n agentic-rag python -m pytest --import-mode=importlib \
   -m "not integration and not e2e and not live_model" -q
 # 486 passed, 96 deselected
+
+The final full importlib suite (including opt-in skips) passed 553 tests with
+39 skipped tests and 18 expected provider/parser warnings.
 conda run -n agentic-rag python -m pytest --import-mode=importlib \
   -o asyncio_default_fixture_loop_scope=module \
   -o asyncio_default_test_loop_scope=module \

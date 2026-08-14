@@ -109,10 +109,10 @@ Task 4（`2e99e00..1947806`，基线实现 `2e99e00`）已完成并通过独立�
 
 Task 5（Backup/Restore/Readiness/Final Acceptance）已完成：
 
-- `scripts/backup_local.py` 对 SQLite checkpoint、Artifact、可选 MySQL dump、Elasticsearch generation/alias/template/document 做内容寻址清单、SHA-256 完整性校验和原子发布；默认不触碰生产服务数据。
-- `scripts/restore_local.py` 在验证 manifest、路径和每个文件 hash 后，仅恢复到不存在的目标；服务恢复要求显式空 MySQL 数据库和新 Elasticsearch generation，并在导入后执行 Alembic、文档计数、mapping/alias 校验。
+- `scripts/backup_local.py` 对 SQLite checkpoint、Artifact、可选 MySQL dump、Elasticsearch generation/alias/template/document 以及显式 Redis key prefix 做内容寻址清单、SHA-256 完整性校验和原子发布；默认不触碰生产服务数据。
+- `scripts/restore_local.py` 在验证 manifest、路径和每个文件 hash 后，仅恢复到不存在的目标；服务恢复要求显式空 MySQL 数据库、新 Elasticsearch generation 和空 Redis target prefix，并在导入后执行 Alembic、文档计数、mapping/alias/Redis payload 校验与 readiness。
 - `scripts/run_api.py` 提供有限优雅退出；`ReadinessChecks.require_ready()` 对依赖不可用 fail-closed；`scripts/verify_acceptance.py` 严格要求泄漏为 0、citation coverage 为 1.0、无未审计答案、恢复演练和备份恢复均通过。
-- 真实本地服务验证使用隔离资源：MySQL schema/API 15+4 项、Redis Streams 3 项、Elasticsearch 检索 1 项、备份恢复 E2E 11 项均通过；不修改默认 `agentic_rag` 数据库、Redis 默认数据或现有 ES generation。真实 DeepSeek/Qwen 模型 smoke 1 项通过（Qwen embedding 1024 维）。
+- 真实本地服务验证使用隔离资源：MySQL schema/API 15+4 项、Redis Streams 3 项、Elasticsearch 检索 1 项、备份恢复 E2E 15 项均通过；不修改默认 `agentic_rag` 数据库、Redis 默认数据或现有 ES generation。真实 DeepSeek/Qwen 模型 smoke 1 项通过（Qwen embedding 1024 维）。
 - 最终 baseline 24 cases 离线评测产生 `user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`、两个恢复 gate 均为 true；`verify_acceptance.py` 返回 `ACCEPTANCE PASSED`。
 
 ## 4. 最近验证证据
@@ -128,7 +128,7 @@ Task 3 related eval/query/runtime/observability subset: 168 passed
 full unit suite after Task 3: 459 passed
 Task 4 focused E2E suite: 10 passed
 Recovery drill CLI: direct/module invocation exit 0; duplicates=0, leaks=0
-Task 5 backup/restore E2E with disposable MySQL/Redis/Elasticsearch: 11 passed
+Task 5 backup/restore E2E with disposable MySQL/Redis/Elasticsearch: 15 passed
 MySQL schema integration with module-scoped event loop: 15 passed
 MySQL document API integration with module-scoped event loop: 4 passed
 Redis Streams integration: 3 passed

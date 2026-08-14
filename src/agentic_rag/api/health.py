@@ -55,6 +55,8 @@ class ReadinessChecks:
         rather than continuing after a partial dependency failure.
         """
         dependencies = await self.run()
+        if not dependencies:
+            raise RuntimeError("readiness checks are empty")
         unavailable = sorted(
             name for name, state in dependencies.items() if state != "available"
         )
@@ -82,9 +84,15 @@ async def check_configuration(settings: Settings) -> None:
         settings.qwen_embedding_base_url,
     )
     credentials = (settings.deepseek_api_key, settings.qwen_api_key)
-    if not all(value.strip() for value in configured_values) or not all(
-        secret is not None and secret.get_secret_value().strip()
-        for secret in credentials
+    if (
+        not all(value.strip() for value in configured_values)
+        or any(value.strip().startswith("replace-with-") for value in configured_values)
+        or not all(
+            secret is not None
+            and secret.get_secret_value().strip()
+            and not secret.get_secret_value().strip().startswith("replace-with-")
+            for secret in credentials
+        )
     ):
         raise RuntimeError("required model credentials are not configured")
 
@@ -173,7 +181,12 @@ async def live() -> HealthResponse:
 async def ready(request: Request, response: Response) -> HealthResponse:
     """Report whether all required configured dependencies are available."""
     dependencies = await request.app.state.container.readiness_checks.run()
-    is_ready = all(value == "available" for value in dependencies.values())
+    # An empty check set is a wiring/configuration failure, never proof that
+    # the service is ready.  Keep this boundary fail-closed just like
+    # ``ReadinessChecks.require_ready`` used by restore tooling.
+    is_ready = bool(dependencies) and all(
+        value == "available" for value in dependencies.values()
+    )
     if not is_ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return HealthResponse(

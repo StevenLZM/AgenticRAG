@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -51,6 +53,8 @@ class BackupSpec:
     index_generation: str
     mysql_dsn: str | None = None
     elasticsearch_url: str | None = None
+    redis_dsn: str | None = None
+    redis_key_prefix: str | None = None
     mysqldump_command: str = "mysqldump"
 
 
@@ -63,8 +67,18 @@ def create_backup(spec: BackupSpec) -> Path:
         raise BackupError("app_version and schema_generation must be non-empty")
     validate_index_generation(spec.index_generation)
     output.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.backup-", dir=output.parent))
     try:
+        # Reserve the destination before doing slow service exports.  The
+        # empty directory is replaced atomically at publish time, so a second
+        # operator cannot race the initial exists-check and cause an existing
+        # backup to be overwritten.
+        output.mkdir()
+    except FileExistsError as error:
+        raise BackupError(f"backup output already exists: {output}") from error
+    reserved_output = True
+    staging: Path | None = None
+    try:
+        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.backup-", dir=output.parent))
         _copy_artifacts(Path(spec.artifact_root), staging / "artifacts")
         _backup_checkpoints(spec.checkpoint_paths, staging / "checkpoints")
         service_metadata: dict[str, object] = {}
@@ -74,6 +88,18 @@ def create_backup(spec: BackupSpec) -> Path:
         if spec.elasticsearch_url is not None:
             service_metadata["elasticsearch"] = asyncio.run(
                 _export_elasticsearch(spec.elasticsearch_url, spec.index_generation, staging / "elasticsearch" / "export.json")
+            )
+        if spec.redis_dsn is not None or spec.redis_key_prefix is not None:
+            if not spec.redis_dsn or not spec.redis_key_prefix:
+                raise BackupError(
+                    "Redis backup requires both an explicit DSN and key prefix"
+                )
+            service_metadata["redis"] = asyncio.run(
+                _export_redis(
+                    spec.redis_dsn,
+                    spec.redis_key_prefix,
+                    staging / "redis" / "export.json",
+                )
             )
         manifest = {
             "format_version": BACKUP_FORMAT_VERSION,
@@ -88,12 +114,16 @@ def create_backup(spec: BackupSpec) -> Path:
             _sha256(staging / "manifest.json") + "\n", encoding="ascii"
         )
         _fsync_tree(staging)
+        assert staging is not None
         os.replace(staging, output)
+        reserved_output = False
         _fsync_directory(output.parent)
         return output
     except Exception as error:
-        if staging.exists():
+        if staging is not None and staging.exists():
             shutil.rmtree(staging)
+        if reserved_output:
+            _remove_empty_directory(output)
         if isinstance(error, BackupError):
             raise
         raise BackupError(f"backup failed: {error}") from error
@@ -142,6 +172,7 @@ def _dump_mysql(dsn: str, target: Path, command: str) -> None:
     url = make_url(dsn)
     if url.drivername != "mysql+asyncmy" or not url.database:
         raise BackupError("MySQL backup requires a mysql+asyncmy DSN with a database")
+    _validate_mysql_database_name(url.database)
     target.parent.mkdir(parents=True, exist_ok=True)
     args = [
         command,
@@ -170,7 +201,7 @@ async def _export_elasticsearch(
     endpoint: str, index_generation: str, target: Path
 ) -> dict[str, object]:
     """Export the controlled indices plus aliases/templates in canonical order."""
-    from elasticsearch import AsyncElasticsearch
+    from elasticsearch import AsyncElasticsearch, NotFoundError
 
     client = AsyncElasticsearch(endpoint)
     index = f"agenticrag-children-{index_generation}"
@@ -186,8 +217,12 @@ async def _export_elasticsearch(
             templates = _response_body(
                 await client.indices.get_index_template(name="agenticrag-*")
             )
-        except Exception:
+        except NotFoundError:
             templates = {"index_templates": []}
+        if index not in index_data or not isinstance(index_data[index], Mapping):
+            raise BackupError("controlled Elasticsearch index is missing")
+        if not isinstance(index_data[index].get("mappings"), Mapping):
+            raise BackupError("controlled Elasticsearch mapping is missing")
         documents: list[dict[str, object]] = []
         if index in index_data:
             documents = await _export_documents(client, index)
@@ -203,6 +238,60 @@ async def _export_elasticsearch(
         return {"included": True, "index": index, "document_count": len(documents)}
     finally:
         await client.close()
+
+
+async def _export_redis(endpoint: str, key_prefix: str, target: Path) -> dict[str, object]:
+    """Export one explicitly named Redis namespace without storing credentials."""
+    _validate_redis_key_prefix(key_prefix)
+    from redis.asyncio import Redis
+
+    client = Redis.from_url(endpoint, decode_responses=False)
+    rows: list[dict[str, object]] = []
+    try:
+        await client.ping()
+        async for raw_key in client.scan_iter(match=f"{key_prefix}*"):
+            key = raw_key if isinstance(raw_key, bytes) else str(raw_key).encode()
+            payload = await client.dump(key)
+            raw_ttl = await client.pttl(key)
+            if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, int):
+                raise BackupError("Redis returned a non-integer key TTL")
+            ttl_ms = raw_ttl
+            if payload is None or ttl_ms == -2:
+                raise BackupError("Redis key disappeared during namespace export")
+            if ttl_ms < -1:
+                raise BackupError("Redis returned an invalid key TTL")
+            rows.append(
+                {
+                    "key_b64": base64.b64encode(key).decode("ascii"),
+                    "payload_b64": base64.b64encode(payload).decode("ascii"),
+                    "ttl_ms": ttl_ms,
+                }
+            )
+    except BackupError:
+        raise
+    except Exception as error:
+        raise BackupError("Redis namespace export failed") from error
+    finally:
+        await client.aclose()
+    rows.sort(key=lambda row: str(row["key_b64"]))
+    _write_canonical_json(
+        target,
+        {"key_prefix": key_prefix, "keys": rows},
+    )
+    return {"included": True, "key_prefix": key_prefix, "key_count": len(rows)}
+
+
+def _validate_redis_key_prefix(value: object) -> None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9:_-]{1,256}", value) is None
+    ):
+        raise BackupError("Redis key prefix must be a non-empty safe string")
+
+
+def _validate_mysql_database_name(value: object) -> None:
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_]{1,64}", value) is None:
+        raise BackupError("MySQL database name contains unsafe characters")
 
 
 async def _export_documents(client: Any, index: str) -> list[dict[str, object]]:
@@ -307,7 +396,21 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _default_spec(output: Path, settings: Settings, include_services: bool) -> BackupSpec:
+def _remove_empty_directory(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        # If another process wrote into the reserved directory, never delete
+        # its contents while handling our failed operation.
+        pass
+
+
+def _default_spec(
+    output: Path,
+    settings: Settings,
+    include_services: bool,
+    redis_key_prefix: str | None = None,
+) -> BackupSpec:
     from alembic.script import ScriptDirectory
     from alembic.config import Config
     return BackupSpec(
@@ -319,11 +422,13 @@ def _default_spec(output: Path, settings: Settings, include_services: bool) -> B
         index_generation=settings.index_generation,
         mysql_dsn=settings.mysql_dsn if include_services else None,
         elasticsearch_url=settings.elasticsearch_url if include_services else None,
+        redis_dsn=settings.redis_url if include_services and redis_key_prefix else None,
+        redis_key_prefix=redis_key_prefix if include_services else None,
     )
 
 
 def run_backup_restore_drill() -> bool:
-    """Exercise the signed local-state restore path in an isolated temp root."""
+    """Exercise the hash-verified local-state restore path in an isolated temp root."""
     from scripts.restore_local import RestoreError, restore_backup
 
     try:
@@ -363,10 +468,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--include-services", action="store_true")
+    parser.add_argument(
+        "--redis-key-prefix",
+        help="explicit Redis key namespace to include with --include-services",
+    )
     args = parser.parse_args(argv)
+    if args.redis_key_prefix and not args.include_services:
+        parser.error("--redis-key-prefix requires --include-services")
     try:
         backup = create_backup(
-            _default_spec(args.output, Settings(), args.include_services)  # type: ignore[call-arg]
+            _default_spec(
+                args.output,
+                Settings(),  # type: ignore[call-arg]
+                args.include_services,
+                args.redis_key_prefix,
+            )
         )
     except BackupError as error:
         parser.error(str(error))

@@ -159,11 +159,27 @@ async def test_readiness_is_ready_only_when_every_dependency_is_available(
     }
 
 
+async def test_readiness_rejects_empty_dependency_wiring(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    app = _app_with_checks(monkeypatch, tmp_path, ReadinessChecks({}))
+
+    response = await _get(app, "/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "unready", "dependencies": {}}
+
+
 async def test_readiness_require_ready_fails_closed_with_dependency_names() -> None:
     checks = ReadinessChecks({"mysql": _ok, "elasticsearch": _fails})
 
     with pytest.raises(RuntimeError, match="elasticsearch"):
         await checks.require_ready()
+
+
+async def test_readiness_require_ready_rejects_empty_checks() -> None:
+    with pytest.raises(RuntimeError, match="empty"):
+        await ReadinessChecks({}).require_ready()
 
 
 async def _fails() -> None:

@@ -34,7 +34,7 @@ Inspect the Redis dead stream and retry only a failed Run/Job after its cause is
 
 ## Backup
 
-Stop API and workers cleanly before taking a backup. The default command backs up only local SQLite checkpoints and Artifacts; it refuses an existing output path, checkpoints SQLite WAL state through SQLite's backup API, records app/schema/index generations, signs a canonical file manifest, and verifies every file hash.
+Stop API and workers cleanly before taking a backup. The default command backs up only local SQLite checkpoints and Artifacts; it refuses an existing output path, checkpoints SQLite WAL state through SQLite's backup API, records app/schema/index generations, writes a canonical hash manifest, and verifies every file hash. The manifest is integrity-hashed, not a cryptographic signature; store backups on trusted/permissioned media.
 
 ```sh
 conda run -n agentic-rag python scripts/backup_local.py --output var/backups/backup-001
@@ -46,11 +46,20 @@ To include the configured MySQL database and active Elasticsearch generation, us
 conda run -n agentic-rag python scripts/backup_local.py --output var/backups/backup-001 --include-services
 ```
 
+To include Redis, supply one explicit key namespace. The backup never scans
+the whole configured Redis database:
+
+```sh
+conda run -n agentic-rag python scripts/backup_local.py \
+  --output var/backups/backup-001 --include-services \
+  --redis-key-prefix 'agentic-rag:backup:'
+```
+
 Keep at least three verified backups on separate local media. Test each backup with a restore drill before deleting an older backup. The backup directory is immutable operational evidence: never edit its manifest, hash file, dump, or exports.
 
 ## Restore and Elasticsearch rollback
 
-Restore only into a path that does not yet exist. The restore verifies the signed manifest and every content hash before it creates the target and publishes the target atomically. It never replaces an existing directory.
+Restore only into a path that does not yet exist. The restore verifies the hash manifest and every content hash before it creates the target and publishes the target atomically. It never replaces an existing directory.
 
 ```sh
 conda run -n agentic-rag python scripts/restore_local.py \
@@ -63,8 +72,14 @@ A backup that includes service state requires deliberately supplied, empty servi
 conda run -n agentic-rag python scripts/restore_local.py \
   --backup var/backups/backup-001 --target var/restore-drill/backup-001 \
   --mysql-dsn 'mysql+asyncmy://.../agentic_rag_restore_001' \
-  --elasticsearch-url http://127.0.0.1:9200 --index-generation restore-001
+  --elasticsearch-url http://127.0.0.1:9200 --index-generation restore-001 \
+  --redis-dsn 'redis://127.0.0.1:6379/15' \
+  --redis-key-prefix 'agentic-rag:restore:'
 ```
+
+When Redis is present in the backup, restore requires a distinct explicit
+target prefix. Keys are restored by remapping the source prefix to that target;
+the target namespace must be empty and is scanned before any write.
 
 To roll back search, point the controlled active alias to the previous verified generation only after checking that generation's mapping and document count. Do not delete the current index until the rollback has passed readiness and a query smoke test.
 
@@ -87,9 +102,10 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
 ```
 
 The fixture generates random `agentic_rag_backup_*` and
-`agentic_rag_restore_*` databases, one generation/alias, and one Redis key
-prefix, then removes them in `finally`. If any explicit variable is missing,
-the real test skips rather than touching an inferred service target.
+`agentic_rag_restore_*` databases, one generation/alias, and two Redis key
+prefixes for source-to-target remapping, then removes them in `finally`. If any
+explicit variable is missing, the real test skips rather than touching an
+inferred service target.
 
 ## Final gate
 

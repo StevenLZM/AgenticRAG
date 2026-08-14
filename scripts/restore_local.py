@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,6 +43,8 @@ class ServiceRestoreSpec:
     mysql_dsn: str | None = None
     elasticsearch_url: str | None = None
     index_generation: str | None = None
+    redis_dsn: str | None = None
+    redis_key_prefix: str | None = None
     mysql_command: str = "mysql"
 
 
@@ -62,8 +66,17 @@ def restore_backup(
         raise RestoreError(f"restore target must not exist: {target}")
     manifest = _verify_backup(backup)
     target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.restore-", dir=target.parent))
     try:
+        # Keep the no-overwrite guarantee across the slow copy/service phase.
+        # ``os.replace`` below replaces this reserved empty directory with the
+        # fully verified staging tree in one filesystem operation.
+        target.mkdir()
+    except FileExistsError as error:
+        raise RestoreError(f"restore target must not exist: {target}") from error
+    reserved_target = True
+    staging: Path | None = None
+    try:
+        staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.restore-", dir=target.parent))
         for entry in manifest["files"]:
             relative = _safe_relative(entry["path"])
             destination = staging / relative
@@ -71,15 +84,22 @@ def restore_backup(
             shutil.copyfile(backup / relative, destination, follow_symlinks=False)
         _validate_restored_artifacts(staging / "artifacts")
         _restore_services(staging, manifest, services)
-        if readiness_check is not None:
-            _run_readiness(readiness_check)
+        _run_readiness(
+            readiness_check
+            if readiness_check is not None
+            else _default_readiness_check(staging, services)
+        )
         _fsync_tree(staging)
+        assert staging is not None
         os.replace(staging, target)
+        reserved_target = False
         _fsync_directory(target.parent)
         return target
     except Exception as error:
-        if staging.exists():
+        if staging is not None and staging.exists():
             shutil.rmtree(staging)
+        if reserved_target:
+            _remove_empty_directory(target)
         if isinstance(error, RestoreError):
             raise
         raise RestoreError(f"restore failed: {error}") from error
@@ -103,7 +123,23 @@ def _restore_services(
             )
         _run_async(
             _restore_elasticsearch(
-                es_export, services.elasticsearch_url, services.index_generation
+                es_export,
+                services.elasticsearch_url,
+                services.index_generation,
+                str(manifest["index_generation"]),
+            )
+        )
+    redis_export = staging / "redis" / "export.json"
+    if redis_export.exists():
+        if services is None or not services.redis_dsn or not services.redis_key_prefix:
+            raise RestoreError(
+                "backup contains Redis state; an explicit target DSN and key prefix are required"
+            )
+        _run_async(
+            _restore_redis(
+                redis_export,
+                services.redis_dsn,
+                services.redis_key_prefix,
             )
         )
 
@@ -187,7 +223,7 @@ def _mysql_command(url: Any, command: str) -> list[str]:
 
 
 def _assert_mysql_database_name(value: object) -> None:
-    if not isinstance(value, str) or not value or not value.replace("_", "").isalnum():
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_]{1,64}", value) is None:
         raise RestoreError("MySQL database name contains unsafe characters")
 
 
@@ -228,7 +264,10 @@ def _run_awaitable(value: Any) -> Any:
 
 
 async def _restore_elasticsearch(
-    export_path: Path, endpoint: str, target_generation: str
+    export_path: Path,
+    endpoint: str,
+    target_generation: str,
+    source_generation: str,
 ) -> None:
     from elasticsearch import AsyncElasticsearch
 
@@ -236,14 +275,20 @@ async def _restore_elasticsearch(
 
     try:
         payload = json.loads(export_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise RestoreError("Elasticsearch export is invalid") from error
     if not isinstance(payload, Mapping):
         raise RestoreError("Elasticsearch export is invalid")
     source_index = payload.get("index")
     definition = payload.get("index_definition")
     documents = payload.get("documents")
-    if not isinstance(source_index, str) or not isinstance(definition, Mapping) or not isinstance(documents, list):
+    expected_source_index = f"agenticrag-children-{source_generation}"
+    if (
+        not isinstance(source_index, str)
+        or source_index != expected_source_index
+        or not isinstance(definition, Mapping)
+        or not isinstance(documents, list)
+    ):
         raise RestoreError("Elasticsearch export is incomplete")
     # ``backup_local`` stores the single controlled index definition directly;
     # accept the raw Elasticsearch response shape as well for older backups.
@@ -286,6 +331,94 @@ async def _restore_elasticsearch(
             raise RestoreError("Elasticsearch restored index mapping is unavailable")
     finally:
         await client.close()
+
+
+async def _restore_redis(export_path: Path, endpoint: str, target_prefix: str) -> None:
+    """Restore only into an explicitly named, empty Redis namespace."""
+    _validate_redis_key_prefix(target_prefix)
+    try:
+        payload = json.loads(export_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RestoreError("Redis export is invalid") from error
+    if not isinstance(payload, Mapping):
+        raise RestoreError("Redis export is invalid")
+    source_prefix = payload.get("key_prefix")
+    rows = payload.get("keys")
+    if (
+        not isinstance(source_prefix, str)
+        or re.fullmatch(r"[A-Za-z0-9:_-]{1,256}", source_prefix) is None
+        or not isinstance(rows, list)
+    ):
+        raise RestoreError("Redis export prefix or key inventory is invalid")
+    if source_prefix == target_prefix:
+        raise RestoreError("Redis restore target prefix must differ from the source prefix")
+    from redis.asyncio import Redis
+
+    client = Redis.from_url(endpoint, decode_responses=False)
+    decoded: list[tuple[bytes, bytes, int]] = []
+    written_keys: list[bytes] = []
+    try:
+        await client.ping()
+        existing_keys = [
+            key
+            async for key in client.scan_iter(match=f"{target_prefix}*")
+        ]
+        if existing_keys:
+            raise RestoreError("Redis restore target namespace is not empty")
+        source_prefix_bytes = source_prefix.encode()
+        target_prefix_bytes = target_prefix.encode()
+        seen_keys: set[bytes] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise RestoreError("Redis export contains an invalid key row")
+            raw_key = row.get("key_b64")
+            raw_value = row.get("payload_b64")
+            raw_ttl = row.get("ttl_ms")
+            if (
+                not isinstance(raw_key, str)
+                or not isinstance(raw_value, str)
+                or isinstance(raw_ttl, bool)
+                or not isinstance(raw_ttl, int)
+            ):
+                raise RestoreError("Redis export contains invalid encoded data")
+            try:
+                key = base64.b64decode(raw_key, validate=True)
+                value = base64.b64decode(raw_value, validate=True)
+                ttl_ms = raw_ttl
+            except (TypeError, ValueError) as error:
+                raise RestoreError("Redis export contains invalid encoded data") from error
+            if not key.startswith(source_prefix_bytes) or ttl_ms < -1:
+                raise RestoreError("Redis export contains an unsafe key or TTL")
+            target_key = target_prefix_bytes + key[len(source_prefix_bytes) :]
+            if target_key in seen_keys:
+                raise RestoreError("Redis export contains duplicate keys")
+            seen_keys.add(target_key)
+            decoded.append((target_key, value, ttl_ms))
+        for key, value, ttl_ms in decoded:
+            await client.restore(key, max(ttl_ms, 0), value, replace=False)
+            written_keys.append(key)
+        for key, value, _ttl_ms in decoded:
+            if not await client.exists(key) or await client.dump(key) != value:
+                raise RestoreError("Redis restored key did not verify")
+    except Exception as error:
+        if written_keys:
+            try:
+                await client.delete(*written_keys)
+            except Exception:
+                pass
+        if isinstance(error, RestoreError):
+            raise
+        raise RestoreError("Redis namespace restore failed") from error
+    finally:
+        await client.aclose()
+
+
+def _validate_redis_key_prefix(value: object) -> None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9:_-]{1,256}", value) is None
+    ):
+        raise RestoreError("Redis key prefix must be a non-empty safe string")
 
 
 async def _restore_templates(client: Any, raw_templates: object) -> None:
@@ -334,17 +467,39 @@ def _verify_backup(backup: Path) -> dict[str, Any]:
         raise RestoreError("backup must be a real directory")
     manifest_path = backup / "manifest.json"
     digest_path = backup / "manifest.sha256"
-    if not manifest_path.is_file() or not digest_path.is_file():
+    if (
+        not manifest_path.is_file()
+        or manifest_path.is_symlink()
+        or not digest_path.is_file()
+        or digest_path.is_symlink()
+    ):
         raise RestoreError("backup manifest is missing")
-    expected_digest = digest_path.read_text(encoding="ascii").strip()
+    try:
+        expected_digest = digest_path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise RestoreError("backup manifest digest is invalid") from error
     if len(expected_digest) != 64 or _sha256(manifest_path) != expected_digest:
         raise RestoreError("backup manifest integrity check failed")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise RestoreError("backup manifest is invalid") from error
-    if not isinstance(manifest, dict) or manifest.get("format_version") != 1:
+    if (
+        not isinstance(manifest, dict)
+        or type(manifest.get("format_version")) is not int
+        or manifest.get("format_version") != 1
+    ):
         raise RestoreError("backup format is unsupported")
+    for field in ("app_version", "schema_generation", "index_generation"):
+        value = manifest.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RestoreError(f"backup manifest field {field} is invalid")
+    from agentic_rag.models.indexing import validate_index_generation
+
+    try:
+        validate_index_generation(manifest["index_generation"])
+    except ValueError as error:
+        raise RestoreError("backup manifest index_generation is invalid") from error
     files = manifest.get("files")
     if not isinstance(files, list):
         raise RestoreError("backup manifest has no file inventory")
@@ -359,17 +514,29 @@ def _verify_backup(backup: Path) -> dict[str, Any]:
         source = backup / path
         if not source.is_file() or source.is_symlink():
             raise RestoreError(f"backup file is missing: {path}")
-        if entry.get("sha256") != _sha256(source) or entry.get("size_bytes") != source.stat().st_size:
+        if (
+            type(entry.get("sha256")) is not str
+            or len(entry["sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in entry["sha256"])
+            or type(entry.get("size_bytes")) is not int
+            or entry["size_bytes"] < 0
+            or entry["sha256"] != _sha256(source)
+            or entry["size_bytes"] != source.stat().st_size
+        ):
             raise RestoreError(f"backup integrity check failed: {path}")
-    actual_paths = {
-        path.relative_to(backup).as_posix()
-        for path in backup.rglob("*")
-        if path.is_file()
-        and path.relative_to(backup).as_posix()
-        not in {"manifest.json", "manifest.sha256"}
-    }
+    actual_paths: set[str] = set()
+    for path in backup.rglob("*"):
+        relative = path.relative_to(backup).as_posix()
+        if relative in {"manifest.json", "manifest.sha256"}:
+            continue
+        if path.is_symlink():
+            raise RestoreError("backup contains an unsafe symlink")
+        if path.is_file():
+            actual_paths.add(relative)
+        elif not path.is_dir():
+            raise RestoreError("backup contains an unsupported filesystem entry")
     if actual_paths != expected_paths:
-        raise RestoreError("backup contains files outside its signed inventory")
+        raise RestoreError("backup contains files outside its hash-verified inventory")
     return manifest
 
 
@@ -386,12 +553,79 @@ def _run_readiness(check: ReadinessCheck) -> None:
     result = check()
     if inspect.isawaitable(result):
         result = _run_async(_await_readiness(result))
-    if not isinstance(result, Mapping) or any(value != "available" for value in result.values()):
+    if (
+        not isinstance(result, Mapping)
+        or not result
+        or any(value != "available" for value in result.values())
+    ):
         raise RestoreError("readiness checks did not all pass")
 
 
 async def _await_readiness(value: Awaitable[Mapping[str, str]]) -> Mapping[str, str]:
     return await value
+
+
+def _default_readiness_check(
+    staging: Path, services: ServiceRestoreSpec | None
+) -> ReadinessCheck:
+    """Probe the restored target before publishing it.
+
+    Service endpoints are always deployment-supplied.  When a backup contains
+    no external service state, the local tree probe still prevents an empty
+    readiness mapping from being treated as success.
+    """
+
+    async def check() -> Mapping[str, str]:
+        from agentic_rag.api.health import (
+            ReadinessChecks,
+            check_elasticsearch,
+            check_mysql,
+            check_redis,
+        )
+
+        engines: list[Any] = []
+        redis_clients: list[Any] = []
+        elasticsearch_clients: list[Any] = []
+        checks: dict[str, Any] = {
+            "restore_target": lambda: _check_restore_tree(staging)
+        }
+        try:
+            if services is not None and services.mysql_dsn:
+                from agentic_rag.persistence.mysql import create_mysql_engine
+
+                engine = create_mysql_engine(services.mysql_dsn, pool_pre_ping=True)
+                engines.append(engine)
+                checks["mysql"] = lambda engine=engine: check_mysql(engine)
+            if services is not None and services.redis_dsn:
+                from redis.asyncio import Redis
+
+                client = Redis.from_url(services.redis_dsn)
+                redis_clients.append(client)
+                checks["redis"] = lambda client=client: check_redis(client)
+            if services is not None and services.elasticsearch_url:
+                from elasticsearch import AsyncElasticsearch
+
+                client = AsyncElasticsearch(services.elasticsearch_url)
+                elasticsearch_clients.append(client)
+                checks["elasticsearch"] = lambda client=client: check_elasticsearch(client)
+            return await ReadinessChecks(checks).require_ready()
+        finally:
+            for client in redis_clients:
+                await client.aclose()
+            for client in elasticsearch_clients:
+                await client.close()
+            for engine in engines:
+                await engine.dispose()
+
+    return check
+
+
+async def _check_restore_tree(staging: Path) -> None:
+    if not staging.is_dir() or staging.is_symlink():
+        raise RuntimeError("restored staging tree is unavailable")
+    for path in staging.rglob("*"):
+        if path.is_symlink():
+            raise RuntimeError("restored staging tree contains a symlink")
 
 
 def _safe_relative(value: object) -> Path:
@@ -434,6 +668,15 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _remove_empty_directory(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        # Never delete data another process may have placed in the reserved
+        # path while this restore was running.
+        pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backup", type=Path, required=True)
@@ -441,12 +684,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--mysql-dsn")
     parser.add_argument("--elasticsearch-url")
     parser.add_argument("--index-generation")
+    parser.add_argument("--redis-dsn")
+    parser.add_argument("--redis-key-prefix")
     args = parser.parse_args(argv)
     try:
         services = ServiceRestoreSpec(
             mysql_dsn=args.mysql_dsn,
             elasticsearch_url=args.elasticsearch_url,
             index_generation=args.index_generation,
+            redis_dsn=args.redis_dsn,
+            redis_key_prefix=args.redis_key_prefix,
         )
         restored = restore_backup(args.backup, args.target, services=services)
     except RestoreError as error:

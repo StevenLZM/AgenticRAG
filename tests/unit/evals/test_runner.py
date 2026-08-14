@@ -84,6 +84,29 @@ async def test_corrupt_result_row_is_ignored_and_recomputed(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_legacy_result_without_acceptance_fields_is_recomputed(tmp_path: Path) -> None:
+    legacy = {
+        "case_id": "case-1",
+        "runtime_config_snapshot_id": "snapshot-v1",
+        "answer": "Parent one is relevant.",
+        "evidence_parent_ids": ["parent-1"],
+        "route": "fast_rag",
+        "events_ref": "fixture://events/case-1",
+        "deterministic_metrics": {"parent_recall_at_6": 1.0},
+        "ragas_metrics": {"status": "unavailable"},
+    }
+    (tmp_path / "results.jsonl").write_text(
+        json.dumps(legacy) + "\n", encoding="utf-8"
+    )
+    client = FakeQueryClient()
+
+    summary = await EvalRunner(client, output_dir=tmp_path).run([_case()])
+
+    assert client.call_count == 1
+    assert summary["quarantined_rows"] == 1
+
+
+@pytest.mark.asyncio
 async def test_duplicate_valid_result_rows_are_quarantined_and_recomputed(tmp_path: Path) -> None:
     first_client = FakeQueryClient()
     await EvalRunner(first_client, output_dir=tmp_path).run([_case()])
@@ -132,6 +155,8 @@ def test_report_rejects_mixed_runtime_snapshots() -> None:
         events_ref="artifact://one",
         deterministic_metrics={"parent_recall_at_6": 1.0},
         ragas_metrics={"status": "unavailable"},
+        citation_coverage=1.0,
+        audited=True,
     )
     two = one.model_copy(update={"case_id": "case-2", "runtime_config_snapshot_id": "snapshot-b"})
 
@@ -335,6 +360,30 @@ def test_eval_case_result_rejects_unknown_or_malformed_fields() -> None:
                 "unexpected": True,
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("citation_coverage", True), ("audited", 1)]
+)
+def test_eval_case_result_rejects_coerced_acceptance_fields(
+    field: str, value: object
+) -> None:
+    row = {
+        "case_id": "case-1",
+        "runtime_config_snapshot_id": "snapshot-v1",
+        "answer": "answer",
+        "evidence_parent_ids": ["parent-1"],
+        "route": "fast_rag",
+        "events_ref": "artifact://events",
+        "deterministic_metrics": {"parent_recall_at_6": 0.0},
+        "ragas_metrics": {"status": "unavailable"},
+        "citation_coverage": 1.0,
+        "audited": True,
+    }
+    row[field] = value
+
+    with pytest.raises(ValueError):
+        EvalCaseResult.model_validate(row)
 
 
 @pytest.mark.parametrize(

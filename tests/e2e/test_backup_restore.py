@@ -20,7 +20,12 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.engine import make_url
 
 from agentic_rag.persistence.mysql import create_mysql_engine
-from scripts.backup_local import BackupSpec, create_backup
+from scripts.backup_local import (
+    BackupError,
+    BackupSpec,
+    _validate_redis_key_prefix,
+    create_backup,
+)
 from scripts.restore_local import RestoreError, ServiceRestoreSpec, restore_backup
 from scripts.verify_acceptance import verify_acceptance
 import scripts.restore_local as restore_module
@@ -28,6 +33,12 @@ from agentic_rag.persistence.artifacts import LocalArtifactStore
 
 
 pytestmark = pytest.mark.e2e
+
+
+@pytest.mark.parametrize("prefix", ["agentic:*", "agentic?", "agentic[0]", "agentic\\"])
+def test_redis_backup_prefix_cannot_expand_scan_namespace(prefix: str) -> None:
+    with pytest.raises(BackupError):
+        _validate_redis_key_prefix(prefix)
 
 
 def _seed_state(root: Path) -> tuple[Path, Path, Path]:
@@ -186,6 +197,7 @@ async def test_opt_in_real_services_restore_only_disposable_database_index_and_r
     restored_index = f"agenticrag-children-{restored_generation}"
     alias = f"agenticrag-active-{suffix}"
     redis_prefix = f"agentic-rag:e2e-backup:{suffix}"
+    restored_redis_prefix = f"agentic-rag:e2e-restore:{suffix}"
     redis = Redis.from_url(redis_dsn)
     from elasticsearch import AsyncElasticsearch
 
@@ -226,12 +238,15 @@ async def test_opt_in_real_services_restore_only_disposable_database_index_and_r
                 index_generation=source_generation,
                 mysql_dsn=source_dsn,
                 elasticsearch_url=elasticsearch_url,
+                redis_dsn=redis_dsn,
+                redis_key_prefix=redis_prefix,
             ),
         )
 
         _mysql_admin(admin_dsn, f"DROP DATABASE `{source_database}`")
         source_exists = False
         await elasticsearch.indices.delete(index=source_index)
+        await redis.delete(f"{redis_prefix}:probe")
 
         await asyncio.to_thread(
             restore_backup,
@@ -241,6 +256,8 @@ async def test_opt_in_real_services_restore_only_disposable_database_index_and_r
                 mysql_dsn=restored_dsn,
                 elasticsearch_url=elasticsearch_url,
                 index_generation=restored_generation,
+                redis_dsn=redis_dsn,
+                redis_key_prefix=restored_redis_prefix,
             ),
         )
         restored_engine = create_mysql_engine(restored_dsn)
@@ -251,11 +268,12 @@ async def test_opt_in_real_services_restore_only_disposable_database_index_and_r
             await restored_engine.dispose()
         assert (await elasticsearch.count(index=restored_index, query={"match_all": {}})).body["count"] == 1
         assert restored_index in (await elasticsearch.indices.get_alias(name=alias)).body
-        assert await redis.get(f"{redis_prefix}:probe") == b"isolated"
+        assert await redis.get(f"{restored_redis_prefix}:probe") == b"isolated"
     finally:
         await elasticsearch.indices.delete(index=source_index, ignore_unavailable=True)
         await elasticsearch.indices.delete(index=restored_index, ignore_unavailable=True)
         await redis.delete(f"{redis_prefix}:probe")
+        await redis.delete(f"{restored_redis_prefix}:probe")
         if source_exists:
             _mysql_admin(admin_dsn, f"DROP DATABASE `{source_database}`")
         if restored_exists:

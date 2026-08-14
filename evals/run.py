@@ -66,8 +66,10 @@ class EvalCaseResult(BaseModel):
     # ``status=unavailable`` is the only non-numeric value permitted.  It keeps
     # missing Ragas explicit without inventing a score.
     ragas_metrics: dict[str, float | str]
-    citation_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
-    audited: bool = False
+    # These are required durable fields.  A pre-Task5/partial row must not be
+    # treated as a resumable completed answer and must be recomputed.
+    citation_coverage: float = Field(..., ge=0.0, le=1.0)
+    audited: bool
 
     @field_validator("case_id", "runtime_config_snapshot_id", "route", mode="before")
     @classmethod
@@ -75,6 +77,20 @@ class EvalCaseResult(BaseModel):
         if type(value) is not str or _IDENTIFIER.fullmatch(value.strip()) is None:
             raise ValueError("identifier must be a non-empty safe string")
         return value.strip()
+
+    @field_validator("citation_coverage", mode="before")
+    @classmethod
+    def _strict_citation_coverage(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("citation_coverage must be numeric")
+        return value
+
+    @field_validator("audited", mode="before")
+    @classmethod
+    def _strict_audited(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("audited must be boolean")
+        return value
 
     @field_validator("answer", mode="before")
     @classmethod

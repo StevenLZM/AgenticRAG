@@ -361,5 +361,9 @@ def _mapping_field_matches(actual: object, expected: object) -> bool:
         return actual == expected
     if expected.get("type") != "dense_vector":
         return actual == expected
-    required = ("type", "dims", "index", "similarity")
-    return all(actual.get(key) == expected.get(key) for key in required)
+    # ``index_options`` is server-owned for HNSW vectors; every other field,
+    # including ``element_type`` when configured, remains application-owned.
+    normalized_actual = {
+        key: value for key, value in actual.items() if key != "index_options"
+    }
+    return normalized_actual == dict(expected)
