@@ -11,12 +11,25 @@ from agentic_rag.persistence.repositories import OutboxRecord, OutboxRepository
 class OutboxDispatcher:
     """Publishes rows claimed by the caller-owned transaction, then records dispatch."""
 
-    def __init__(self, outbox: OutboxRepository, broker: StreamBroker) -> None:
+    def __init__(
+        self,
+        outbox: OutboxRepository,
+        broker: StreamBroker,
+        *,
+        aggregate_type: str | None = None,
+    ) -> None:
         self._outbox = outbox
         self._broker = broker
+        self._aggregate_type = aggregate_type
 
     async def dispatch_once(self, limit: int = 100) -> int:
-        rows = await self._outbox.claim_pending(limit=limit)
+        if self._aggregate_type is None:
+            # Keep deployment-owned lightweight outbox ports source-compatible.
+            rows = await self._outbox.claim_pending(limit=limit)
+        else:
+            rows = await self._outbox.claim_pending(
+                limit=limit, aggregate_type=self._aggregate_type
+            )
         dispatched = 0
         for row in rows:
             try:

@@ -605,9 +605,13 @@ class EventRepository(Protocol):
 
 @runtime_checkable
 class OutboxRepository(Protocol):
-    async def list_pending(self, limit: int) -> list[OutboxRecord]: ...
+    async def list_pending(
+        self, limit: int, *, aggregate_type: str | None = None
+    ) -> list[OutboxRecord]: ...
 
-    async def claim_pending(self, limit: int) -> list[OutboxRecord]: ...
+    async def claim_pending(
+        self, limit: int, *, aggregate_type: str | None = None
+    ) -> list[OutboxRecord]: ...
 
     async def mark_dispatched(self, outbox_id: str) -> None: ...
 
@@ -1300,17 +1304,22 @@ class SqlAlchemyEventRepository(_SqlAlchemyRepository):
 
 
 class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
-    async def list_pending(self, limit: int) -> list[OutboxRecord]:
+    async def list_pending(
+        self, limit: int, *, aggregate_type: str | None = None
+    ) -> list[OutboxRecord]:
         if limit <= 0:
             return []
+        predicates = [
+            task_outbox.c.status == "pending",
+            task_outbox.c.next_attempt_at <= _now(),
+        ]
+        if aggregate_type is not None:
+            predicates.append(task_outbox.c.aggregate_type == aggregate_type)
         rows = (
             (
                 await self._session().execute(
                     select(task_outbox)
-                    .where(
-                        task_outbox.c.status == "pending",
-                        task_outbox.c.next_attempt_at <= _now(),
-                    )
+                    .where(*predicates)
                     .order_by(task_outbox.c.next_attempt_at, task_outbox.c.id)
                     .limit(limit)
                 )
@@ -1320,19 +1329,24 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
         )
         return _outbox_records(rows)
 
-    async def claim_pending(self, limit: int) -> list[OutboxRecord]:
+    async def claim_pending(
+        self, limit: int, *, aggregate_type: str | None = None
+    ) -> list[OutboxRecord]:
         if limit <= 0:
             return []
         now = _now()
         session = self._session()
+        predicates = [
+            task_outbox.c.status == "pending",
+            task_outbox.c.next_attempt_at <= now,
+        ]
+        if aggregate_type is not None:
+            predicates.append(task_outbox.c.aggregate_type == aggregate_type)
         rows = (
             (
                 await session.execute(
                     select(task_outbox)
-                    .where(
-                        task_outbox.c.status == "pending",
-                        task_outbox.c.next_attempt_at <= now,
-                    )
+                    .where(*predicates)
                     .order_by(task_outbox.c.next_attempt_at, task_outbox.c.id)
                     .limit(limit)
                     .with_for_update(skip_locked=True)

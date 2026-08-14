@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -18,6 +19,7 @@ from agentic_rag.observability.logging import (
     stable_event_key,
 )
 from agentic_rag.observability.tracing import TraceRecorder
+from agentic_rag.persistence.outbox import OutboxDispatcher
 from agentic_rag.persistence.redis_queue import StreamBroker, StreamMessage
 from agentic_rag.persistence.repositories import LeaseLost, QueryRun, RunRepository
 from agentic_rag.query.state import new_query_state
@@ -28,6 +30,7 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 QUERY_STREAM = "agenticrag:jobs:query"
 QUERY_GROUP = "agenticrag-query-workers"
 QUERY_DEAD_STREAM = "agenticrag:jobs:query:dead"
+logger = logging.getLogger(__name__)
 TERMINAL_RUN_STATUSES = {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED}
 BUSINESS_TERMINAL_REASONS = frozenset(
     {
@@ -93,6 +96,8 @@ class QueryWorker:
         max_attempts: int = 3,
         trace_recorder: TraceRecorder | None = None,
         event_emitter: AgentEventEmitter | None = None,
+        outbox_dispatcher: OutboxDispatcher | None = None,
+        outbox_interval_seconds: float = 1.0,
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must not be blank")
@@ -104,6 +109,8 @@ class QueryWorker:
             raise ValueError("worker timeouts must be bounded")
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
+        if outbox_interval_seconds <= 0:
+            raise ValueError("outbox interval must be positive")
         self._runs = runs
         self._broker = broker
         self._graph_factory = graph_factory
@@ -117,6 +124,8 @@ class QueryWorker:
         self._max_attempts = max_attempts
         self._trace_recorder = trace_recorder
         self._event_emitter = event_emitter
+        self._outbox_dispatcher = outbox_dispatcher
+        self._outbox_interval = outbox_interval_seconds
 
     async def run_one(self) -> bool:
         """Drain one Redis delivery batch, preferring reclaimed messages first."""
@@ -322,8 +331,13 @@ class QueryWorker:
     async def run_forever(self, *, stop_event: asyncio.Event | None = None) -> None:
         stop = stop_event or asyncio.Event()
         current: asyncio.Task[bool] | None = None
+        dispatcher_task: asyncio.Task[None] | None = None
         failures = 0
         try:
+            if self._outbox_dispatcher is not None:
+                dispatcher_task = asyncio.create_task(
+                    self._dispatch_outbox_forever(stop)
+                )
             while not stop.is_set():
                 current = asyncio.create_task(self.run_one())
                 try:
@@ -343,6 +357,24 @@ class QueryWorker:
             if current is not None:
                 with suppress(asyncio.CancelledError):
                     await current
+            if dispatcher_task is not None:
+                dispatcher_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await dispatcher_task
+
+    async def _dispatch_outbox_forever(self, stop: asyncio.Event) -> None:
+        assert self._outbox_dispatcher is not None
+        while not stop.is_set():
+            try:
+                await self._outbox_dispatcher.dispatch_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("query_outbox_dispatch_failed")
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self._outbox_interval)
+            except asyncio.TimeoutError:
+                continue
 
     async def _invoke_with_heartbeat(self, claim: QueryRun) -> dict[str, object]:
         graph = self._graph_factory(checkpoint_thread_id=claim.checkpoint_thread_id)

@@ -90,13 +90,21 @@ class TransactionalOutboxAdapter:
     def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
         self._factory = factory
 
-    async def list_pending(self, limit: int) -> list[OutboxRecord]:
+    async def list_pending(
+        self, limit: int, *, aggregate_type: str | None = None
+    ) -> list[OutboxRecord]:
         async with self._factory() as session:
-            return await SqlAlchemyOutboxRepository(session).list_pending(limit)
+            return await SqlAlchemyOutboxRepository(session).list_pending(
+                limit, aggregate_type=aggregate_type
+            )
 
-    async def claim_pending(self, limit: int) -> list[OutboxRecord]:
+    async def claim_pending(
+        self, limit: int, *, aggregate_type: str | None = None
+    ) -> list[OutboxRecord]:
         async with self._factory.begin() as session:
-            return await SqlAlchemyOutboxRepository(session).claim_pending(limit)
+            return await SqlAlchemyOutboxRepository(session).claim_pending(
+                limit, aggregate_type=aggregate_type
+            )
 
     async def mark_dispatched(self, outbox_id: str) -> None:
         async with self._factory.begin() as session:
@@ -125,7 +133,9 @@ async def run(settings: Settings) -> None:
         repository=SqlAlchemyReconciliationRepository(factory),
         publisher=publisher,
         dispatcher=OutboxDispatcher(
-            TransactionalOutboxAdapter(factory), container.broker
+            TransactionalOutboxAdapter(factory),
+            container.broker,
+            aggregate_type="ingestion_job",
         ),
         parent_store=parent_store,
         child_store=child_store,
