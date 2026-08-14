@@ -1,8 +1,8 @@
 # Agentic RAG 开发进度快照
 
-> 快照日期：2026-08-13
+> 快照日期：2026-08-14
 >
-> 当前状态：Phase 1–4 已完成并通过独立审查；Phase 5 尚未开始。当前实现位于独立 worktree，尚未合并到 `main`。
+> 当前状态：Phase 1–4 已完成并通过独立审查；Phase 5 Task 1 已完成并通过四轮独立审查。当前实现位于独立 worktree，尚未合并到 `main`。
 >
 > 本文档是恢复开发时的首要状态入口；详细设计、接口约束和任务拆分以文末权威文档为准。
 
@@ -34,9 +34,9 @@ git log -5 --oneline
 | Phase 2：Document Ingestion | 完成 | 6/6 | 安全上传、Docling AST、Parent/Child、Embedding、发布/对账、可恢复 Worker |
 | Phase 3：Retrieval and Evidence | 完成 | 6/6 | Dense/BM25、RRF/Rerank、Parent 聚合、降级检索图、EvidenceBuilder |
 | Phase 4：Query and Agent Runtime | 完成 | 9/9 | ModelGateway、Memory、Fast/Research、Subagent、审计、QueryGraph、Worker、API |
-| Phase 5：Evaluation and Operations | 未开始 | 0/5 | 评测、负载/恢复、备份恢复、运行就绪和最终验收 |
+| Phase 5：Evaluation and Operations | 进行中 | 1/5 | 本地 Trace/在线指标已完成；评测、负载/恢复、备份恢复和最终验收待完成 |
 
-**总体完成：`27/32` 个路线图任务，约 `84.4%`。**
+**总体完成：`28/32` 个路线图任务，约 `87.5%`。**
 
 ## 3. 已实现能力
 
@@ -79,16 +79,25 @@ Phase 4 当前具备的关键边界：
 - 终止原因 `clarify`、`refuse`、`cannot_answer`、`audit_failed`、`research_round_limit`、`research_action_invalid` 等映射为结构化业务完成；未知或非字符串原因仍重试并最终进入失败/DLQ。
 - API 覆盖 `/v1/query-runs`、SSE 重连、取消、同步 `/v1/query`、`/v1/memories` 和 `/v1/feedback`；未知 SSE 事件摘要脱敏，未配置 Memory provider 时读写均 fail-closed。
 
+### 3.4 Phase 5：评测与运维（已完成 Task 1）
+
+- Task 1 最终提交为 `8729171`（基线实现 `053e8e4`，后续安全/接入修复至 `b83b716`、生命周期与成本语义修复 `ecf2274`、队列重领取去重 `8729171`）。
+- `TraceRecorder` 提供本地 OpenTelemetry-compatible 嵌套 span，绑定 `run_id`、快照和 parent/span 层级；取消、异常和跨 Run/Recorder 上下文均 fail-closed。
+- `AgentEventEmitter` 仅持久化严格 allowlist 的有限枚举/数值字段，拒绝 prompt、隐藏推理、原始 Tool payload、凭据和不安全标识；事件 payload 使用内容寻址 Artifact，并校验 URI/hash 完整性。
+- QueryGraph、QueryWorker、ModelGateway、Tool/Memory/Retrieval/Rerank/Audit 边界已接入共享快照遥测；Graph/Worker 生命周期事件使用稳定 event key，Redis 重领取不会重复队列指标，lease 丢失不会伪造终态事件。
+- `MetricsProjector` 支持 cursor/reducer 跨页累计 queue/run/node latency、retrieval、token/call、citation、repair、degraded、feedback、outbox/lease/reconciler 和业务终态指标。无可信定价来源时 `estimated_cost_status=unavailable`，不把零值伪装成成本估算；只有带安全成本字段的观察事件才标记 `observed`。
+
 ## 4. 最近验证证据
 
-验证基于实现分支最终提交 `c3cf053`，使用 `conda` 环境 `agentic-rag`：
+验证基于实现分支最终提交 `8729171`，使用 `conda` 环境 `agentic-rag`：
 
 ```text
-unit tests: 391 passed
-runtime/api/memory integration: 27 passed, 5 skipped
-ruff check src tests scripts: All checks passed
-mypy src: no issues found in 80 source files
-git diff --check c0d1305..HEAD: clean
+full importlib test suite: 470 passed, 38 skipped
+Task 1 focused observability/graph/worker/model suite: 70 passed
+Task 1 related runtime/query/observability/persistence subset: 161 passed
+ruff check src tests: All checks passed
+mypy Task 1 changed source: no issues found
+git diff --check b83b716..8729171: clean
 ```
 
 外部服务集成测试的 skip 是显式配置结果，未提供以下独立测试资源时不会伪造通过：
@@ -118,7 +127,7 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 
 ## 6. 尚未实现与上线前注意事项
 
-- Phase 5 尚未开始，仍缺少五项评测与运维交付：在线 Trace/指标、确定性检索与 AgentLoop 评测、Ragas 离线报告、对抗/负载/恢复测试、备份恢复/就绪检查/最终验收。
+- Phase 5 仍缺少四项交付：确定性检索与 AgentLoop 评测、Ragas 离线报告、对抗/负载/恢复测试、备份恢复/就绪检查/最终验收。
 - 当前 V1 只有 `user_id` 命名空间隔离，没有完整鉴权、RBAC 或用户身份解析；生产入口不能继续依赖 `default_user`。
 - Memory 的真实 Mem0 provider 由部署注入；未配置时服务会 fail-closed，不应把 no-op 结果当作生产记忆。
 - Elasticsearch、MySQL、Redis、Mem0 的真实联调尚未在本环境执行；上线前必须使用独立测试资源完成门禁。
@@ -126,21 +135,21 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 
 ## 7. 下一次开发的准确起点
 
-下一任务是 **Phase 5 Task 1：Trace Recorder and Online Metrics Projection**。
+下一任务是 **Phase 5 Task 2：Deterministic Retrieval and AgentLoop Evaluation**。
 
 恢复步骤：
 
-1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净、HEAD 为 `c3cf053` 或其后续 docs-only 提交。
-2. 运行 Phase 4 回归门禁，确认 Query Worker/API/审计没有回归。
-3. 完整阅读 Phase 5 计划与全局约束，先为 Task 1 编写 RED 测试和独立 brief。
+1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净、HEAD 为 `8729171` 或其后续 docs-only 提交。
+2. 运行 Phase 4 与 Task 1 回归门禁，确认 Query Worker/API/审计/遥测没有回归。
+3. 完整阅读 Phase 5 计划与全局约束，为 Task 2 编写 RED 测试和独立 brief。
 4. 配置可丢弃的 MySQL/Redis/Elasticsearch 测试资源；有 Mem0 provider 时再启用真实 Memory 集成。
 5. 按 TDD、实现报告、独立 reviewer、fix/re-review 流程推进，不跳过评测的可重复性和运行时指标契约。
 
 Phase 5 顺序：
 
 ```text
-Trace Recorder + Online Metrics
-  -> Deterministic Retrieval/AgentLoop Evaluation
+Trace Recorder + Online Metrics (complete)
+  -> Deterministic Retrieval/AgentLoop Evaluation (next)
   -> Offline Ragas Reports
   -> Adversarial/Load/Recovery Suites
   -> Backup/Restore/Readiness/Final Acceptance
