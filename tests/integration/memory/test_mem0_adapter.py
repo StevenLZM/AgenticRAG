@@ -118,5 +118,7 @@ async def _run_real_mem0_contract() -> None:
         await engine.dispose()
 
 
+@pytest.mark.integration
+@pytest.mark.e2e
 async def test_local_mem0_and_elasticsearch_contract_is_opt_in() -> None:
     await _run_real_mem0_contract()
