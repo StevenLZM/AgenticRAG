@@ -31,6 +31,11 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _URI = re.compile(r"^[^\x00-\x1f\x7f]{1,1024}$")
 _EVENT_REF_SCHEME = re.compile(r"^(?:artifact|fixture|inline)://")
 _EVENT_REF_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_EVENT_REF_UNSAFE = re.compile(
+    r"(?:prompt|tool|authorization|secret|password|api[_-]?key|chain[-_ ]of[- ]thought|"
+    r"hidden[-_ ]reasoning)",
+    re.IGNORECASE,
+)
 _SECRET_TEXT = re.compile(
     r"(?:api[_ -]?key|authorization:\s*bearer|password\s*=|sk-[A-Za-z0-9_-]{8,}|"
     r"chain[- ]of[- ]thought|hidden reasoning|provider[_ -]?secret)",
@@ -479,7 +484,7 @@ def _safe_events_ref(value: object) -> str:
     if type(value) is not str or _URI.fullmatch(value.strip()) is None:
         raise ValueError("events_ref must be a bounded URI")
     reference = value.strip()
-    if _SECRET_TEXT.search(reference) or not _EVENT_REF_SCHEME.match(reference):
+    if _SECRET_TEXT.search(reference) or _EVENT_REF_UNSAFE.search(reference) or not _EVENT_REF_SCHEME.match(reference):
         raise ValueError("events_ref must use an approved artifact, fixture or inline URI")
     remainder = reference.split("://", 1)[1]
     segments = remainder.split("/")

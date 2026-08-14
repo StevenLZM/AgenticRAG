@@ -147,6 +147,8 @@ def test_report_rejects_mixed_runtime_snapshots() -> None:
         "artifact://../secret",
         "artifact://events with spaces",
         "artifact://authorization: bearer secret",
+        "artifact://tool-output/1",
+        "artifact://events/secret",
         "prompt text without a URI",
         "artifact://events\nnext",
     ],
@@ -224,6 +226,7 @@ async def test_leakage_comes_only_from_scoped_security_events(tmp_path: Path) ->
         {"status": "available", "metrics": {"faithfulness": "not-a-score"}},
         {"status": "available", "metrics": {"faithfulness": float("nan")}},
         {"status": "unavailable", "metrics": {"faithfulness": 0.2}},
+        {"status": "available", "metrics": {"faithfulness": 0.2}, "raw": "payload"},
     ],
 )
 async def test_runner_rejects_malformed_injected_ragas_results(

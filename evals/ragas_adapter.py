@@ -97,6 +97,10 @@ def normalize_ragas_result(value: object) -> RagasEvaluation:
     if not isinstance(value, Mapping):
         raise TypeError("offline Ragas backend must return a mapping")
     raw_metrics = value.get("metrics", value)
+    if "metrics" in value:
+        unknown = set(value) - {"status", "metrics", "reason"}
+        if unknown:
+            raise ValueError(f"unknown Ragas result fields: {sorted(unknown)!r}")
     status = value.get("status", "available" if raw_metrics else "unavailable")
     if not isinstance(status, str) or status not in {"available", "unavailable"}:
         raise ValueError("Ragas status must be available or unavailable")
