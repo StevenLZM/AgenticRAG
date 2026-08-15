@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -20,6 +20,17 @@ from agentic_rag.api.query_runs import query_runs_router
 from agentic_rag.api.runtime_summary import runtime_summary_router
 from agentic_rag.bootstrap import build_container
 from agentic_rag.config import Settings
+
+
+class ConsoleStaticFiles(StaticFiles):
+    """Serve only the console assets, never the HTML source through ``/static``."""
+
+    _allowed_assets = frozenset({"app.css", "app.js"})
+
+    async def get_response(self, path: str, scope: Any):
+        if path not in self._allowed_assets:
+            raise HTTPException(status_code=404)
+        return await super().get_response(path, scope)
 
 
 def create_app(settings: Settings, *, container: Any | None = None) -> FastAPI:
@@ -45,7 +56,7 @@ def create_app(settings: Settings, *, container: Any | None = None) -> FastAPI:
     static_dir = Path(__file__).with_name("static")
     app = FastAPI(title="Agentic RAG", version="0.1.0", lifespan=lifespan)
     app.state.container = container
-    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+    app.mount("/static", ConsoleStaticFiles(directory=static_dir), name="static")
 
     @app.get("/", include_in_schema=False)
     async def console() -> FileResponse:

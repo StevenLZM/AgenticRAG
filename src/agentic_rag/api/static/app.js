@@ -22,9 +22,20 @@
     research_action_invalid: "研究动作不符合安全约束，系统未继续执行。",
     audit_failed: "回答未通过审计，系统不会展示未审计结果。",
     research_round_limit: "已达到全局研究轮次上限，系统停止继续研究。",
+    cannot_answer: "现有证据不足以安全回答，系统未展示草稿。",
+    refuse: "该请求已被安全拒绝，系统未继续生成回答。",
+    clarify: "需要补充问题或上下文后才能继续检索。",
     "subagents unavailable": "子 Agent 当前不可用，系统将显示已降级的处理状态。",
     todo_creation_empty: "未生成可执行的 Todo，任务拆分没有继续。"
   };
+  const EVENT_NOTICE_CODES = {
+    AUDIT_REFUSED: "audit_failed",
+    QUERY_REFUSED: "refuse"
+  };
+  const TERMINAL_NOTICE_CODES = new Set([
+    "research_action_invalid", "research_round_limit", "audit_failed",
+    "cannot_answer", "refuse", "clarify"
+  ]);
 
   const elements = {};
   let activeRunId = null;
@@ -62,6 +73,73 @@
     }
   }
 
+  function buildQueryPayload(question) {
+    const query = String(question || "").trim();
+    return query ? { query, wait_seconds: 30 } : null;
+  }
+
+  function buildSseHeaders(cursor) {
+    const headers = { Accept: "text/event-stream" };
+    if (Number.isInteger(cursor) && cursor > 0) {
+      headers["Last-Event-ID"] = String(cursor);
+    }
+    return headers;
+  }
+
+  function noticeCodeForEvent(eventType) {
+    if (EVENT_NOTICE_CODES[eventType]) return EVENT_NOTICE_CODES[eventType];
+    return Object.prototype.hasOwnProperty.call(NOTICES, eventType) ? eventType : null;
+  }
+
+  function eventPresentation(event) {
+    const known = PUBLIC_EVENT_TYPES.has(event.event_type);
+    return {
+      label: known ? event.event_type : "进度更新",
+      summary: known ? (event.summary || "执行中") : "进度更新",
+      noticeCode: noticeCodeForEvent(event.event_type)
+    };
+  }
+
+  function terminalNoticeCode(run) {
+    const answer = run && run.answer;
+    const details = answer && typeof answer === "object" ? answer : {};
+    const candidates = [details.status, run && run.error_code];
+    return candidates.find((candidate) => (
+      typeof candidate === "string" && TERMINAL_NOTICE_CODES.has(candidate)
+    )) || null;
+  }
+
+  function memoryErrorPresentation(detail) {
+    return {
+      className: "error-card",
+      message: `Mem0 不可用：${detail || "请检查 provider 状态。"}`
+    };
+  }
+
+  function provenanceFor(details, run) {
+    const provenance = {};
+    if (details.evidence_parent_ids !== undefined) {
+      provenance.evidence_parent_ids = details.evidence_parent_ids;
+    }
+    if (details.parent_ids !== undefined) provenance.parent_ids = details.parent_ids;
+    if (details.parentIds !== undefined) provenance.parent_ids = details.parentIds;
+    if (details.route !== undefined) provenance.route = details.route;
+    if (details.runtime_config_snapshot_id !== undefined) {
+      provenance.runtime_config_snapshot_id = details.runtime_config_snapshot_id;
+    } else if (run.runtime_config_snapshot_id !== undefined) {
+      provenance.runtime_config_snapshot_id = run.runtime_config_snapshot_id;
+    }
+    if (details.client_provenance !== undefined) {
+      provenance.client_provenance = details.client_provenance;
+    }
+    return provenance;
+  }
+
+  function renderSafeTerminalNotice(code) {
+    showNotice(code);
+    setText(elements.answer, NOTICES[code]);
+  }
+
   async function responseJson(response) {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -74,16 +152,21 @@
   }
 
   function appendTimeline(event) {
-    const known = PUBLIC_EVENT_TYPES.has(event.event_type);
+    const presentation = eventPresentation(event);
     const item = document.createElement("li");
-    const label = known ? event.event_type : "进度更新";
-    item.textContent = `${label}：${known ? (event.summary || "执行中") : "进度更新"}`;
+    item.textContent = `${presentation.label}：${presentation.summary}`;
     const time = document.createElement("time");
     time.dateTime = event.created_at || "";
     time.textContent = event.created_at || "";
     item.appendChild(time);
     elements.timeline.appendChild(item);
-    if (event.event_type in NOTICES) showNotice(event.event_type);
+    if (presentation.noticeCode) {
+      if (TERMINAL_NOTICE_CODES.has(presentation.noticeCode)) {
+        renderSafeTerminalNotice(presentation.noticeCode);
+      } else {
+        showNotice(presentation.noticeCode);
+      }
+    }
   }
 
   function renderObject(target, value, fallback) {
@@ -97,11 +180,13 @@
   function displayAnswer(run) {
     const answer = run.answer;
     const details = answer && typeof answer === "object" ? answer : run;
-    if (answer !== null && answer !== undefined) {
+    const termination = terminalNoticeCode(run);
+    if (termination) {
+      renderSafeTerminalNotice(termination);
+    } else if (answer !== null && answer !== undefined) {
       renderObject(elements.answer, answer, "未返回可展示的回答。");
     } else if (run.error_code) {
-      setText(elements.answer, `任务未完成：${run.error_code}`);
-      showNotice(run.error_code);
+      setText(elements.answer, "任务未完成，请查看执行状态。");
     }
     renderObject(
       elements.evidence,
@@ -113,13 +198,7 @@
     if (details.citation_coverage !== undefined) audit.citation_coverage = details.citation_coverage;
     if (details.audit !== undefined) audit.audit = details.audit;
     renderObject(elements.audit, Object.keys(audit).length ? audit : null, "服务端响应中暂无审计信息。");
-    const provenance = {};
-    if (details.parent_ids !== undefined) provenance.parent_ids = details.parent_ids;
-    if (details.parentIds !== undefined) provenance.parent_ids = details.parentIds;
-    if (details.route !== undefined) provenance.route = details.route;
-    if (details.runtime_config_snapshot_id !== undefined) provenance.runtime_config_snapshot_id = details.runtime_config_snapshot_id;
-    else if (run.runtime_config_snapshot_id !== undefined) provenance.runtime_config_snapshot_id = run.runtime_config_snapshot_id;
-    if (details.client_provenance !== undefined) provenance.client_provenance = details.client_provenance;
+    const provenance = provenanceFor(details, run);
     renderObject(elements.provenance, Object.keys(provenance).length ? provenance : null, "服务端响应中暂无溯源信息。");
   }
 
@@ -158,8 +237,8 @@
   }
 
   async function submitQuery(question) {
-    const trimmed = String(question || "").trim();
-    if (!trimmed) {
+    const payload = buildQueryPayload(question);
+    if (!payload) {
       setText(elements["run-status"], "请输入问题后再提交。");
       return null;
     }
@@ -172,7 +251,7 @@
       const run = await responseJson(await fetch("/v1/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: trimmed, wait_seconds: 30 })
+        body: JSON.stringify(payload)
       }));
       activeRunId = run.run_id;
       setText(elements["run-status"], `任务 ${run.status}`);
@@ -180,9 +259,10 @@
       displayAnswer(run);
       if (run.status === "completed" || run.status === "failed" || run.status === "cancelled") {
         elements["cancel-run"].disabled = true;
-      } else {
-        void streamRun(run.run_id);
       }
+      // Replaying the scoped event stream after a synchronous completion is
+      // required to surface safe audit-refusal/degradation notices.
+      void streamRun(run.run_id);
       return run;
     } catch (error) {
       setText(elements["run-status"], "创建任务失败");
@@ -205,8 +285,7 @@
     let retries = 0;
     while (!streamCancelled && activeRunId === runId && retries < 3) {
       try {
-        const headers = { Accept: "text/event-stream" };
-        if (lastEventId > 0) headers["Last-Event-ID"] = String(lastEventId);
+        const headers = buildSseHeaders(lastEventId);
         const response = await fetch(`/v1/query-runs/${encodeURIComponent(runId)}/events`, { headers });
         if (!response.ok || !response.body) throw new Error("无法连接任务事件流。");
         const reader = response.body.getReader();
@@ -330,8 +409,9 @@
       return payload.memories;
     } catch (error) {
       const item = document.createElement("li");
-      item.className = "error-card";
-      item.textContent = `Mem0 不可用：${error.message || "请检查 provider 状态。"}`;
+      const presentation = memoryErrorPresentation(error.message);
+      item.className = presentation.className;
+      item.textContent = presentation.message;
       elements["memory-list"].appendChild(item);
       showNotice("COMPONENT_DEGRADED");
       return null;
@@ -373,6 +453,14 @@
     void loadMemories();
   }
 
-  Object.assign(window, { loadRuntimeSummary, submitQuery, streamRun, loadRun, uploadDocument, loadMemories, deleteMemory });
+  Object.assign(window, {
+    loadRuntimeSummary, submitQuery, streamRun, loadRun, uploadDocument, loadMemories, deleteMemory,
+    AgenticRagConsole: {
+      contract: {
+        buildQueryPayload, buildSseHeaders, eventPresentation, noticeCodeForEvent,
+        terminalNoticeCode, memoryErrorPresentation, provenanceFor
+      }
+    }
+  });
   document.addEventListener("DOMContentLoaded", initialize);
 })();

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 from typing import cast
 
@@ -11,6 +14,28 @@ import pytest
 from agentic_rag.api.app import create_app
 from agentic_rag.api.health import ReadinessChecks
 from agentic_rag.config import Settings
+
+
+CONSOLE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "src/agentic_rag/api/static/app.js"
+)
+STABLE_DOM_IDS = {
+    "query-form",
+    "query-input",
+    "run-status",
+    "timeline",
+    "answer",
+    "evidence",
+    "audit",
+    "provenance",
+    "degradation-banner",
+    "document-upload",
+    "ingestion-status",
+    "memory-list",
+    "health-grid",
+    "snapshot-id",
+}
 
 
 async def _ok() -> None:
@@ -30,6 +55,34 @@ def _app_for_static_test():
     return create_app(cast(Settings, SimpleNamespace()), container=container)
 
 
+def _console_contract() -> dict[str, object]:
+    script = """
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const context = {window: {}, document: {addEventListener() {}}};
+vm.runInNewContext(source, context, {filename: process.argv[1]});
+const api = (context.window.AgenticRagConsole || {}).contract || {};
+const call = (name, ...args) => api[name] ? api[name](...args) : null;
+process.stdout.write(JSON.stringify({
+  query: call("buildQueryPayload", "  需要检索的问题  "),
+  headers: [call("buildSseHeaders", 0), call("buildSseHeaders", 17)],
+  unknown: call("eventPresentation", {event_type: "INTERNAL_TOOL_PAYLOAD", summary: "private"}),
+  notices: ["RETRIEVAL_DEGRADED", "CIRCUIT_OPEN", "MODEL_REPAIR_EXHAUSTED", "WORKER_DLQ", "AUDIT_REFUSED"].map((type) => call("noticeCodeForEvent", type)),
+  terminal: ["research_action_invalid", "research_round_limit", "audit_failed", "cannot_answer", "refuse", "clarify"].map((status) => call("terminalNoticeCode", {answer: {status}})),
+  memory: call("memoryErrorPresentation", "provider unavailable"),
+  provenance: call("provenanceFor", {evidence_parent_ids: ["parent-1"], route: "research", client_provenance: "api"}, {runtime_config_snapshot_id: "snapshot-1"})
+}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script, str(CONSOLE_PATH)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return cast(dict[str, object], json.loads(completed.stdout))
+
+
 @pytest.mark.integration
 async def test_console_serves_same_origin_html_and_static_assets() -> None:
     app = _app_for_static_test()
@@ -41,8 +94,75 @@ async def test_console_serves_same_origin_html_and_static_assets() -> None:
         style = await client.get("/static/app.css")
 
     assert page.status_code == script.status_code == style.status_code == 200
-    assert 'id="query-form"' in page.text
-    assert 'id="snapshot-id"' in page.text
-    assert "/v1/query" in script.text
-    assert "Last-Event-ID" in script.text
+    assert all(f'id="{element_id}"' in page.text for element_id in STABLE_DOM_IDS)
     assert "localStorage" not in script.text
+
+
+@pytest.mark.integration
+async def test_console_static_mount_rejects_non_asset_files() -> None:
+    app = _app_for_static_test()
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        index = await client.get("/static/index.html")
+        unknown = await client.get("/static/not-an-asset.txt")
+
+    assert index.status_code == unknown.status_code == 404
+
+
+def test_console_client_contract_preserves_scope_and_safe_terminal_states() -> None:
+    contract = _console_contract()
+
+    assert contract["query"] == {"query": "需要检索的问题", "wait_seconds": 30}
+    assert contract["headers"] == [
+        {"Accept": "text/event-stream"},
+        {"Accept": "text/event-stream", "Last-Event-ID": "17"},
+    ]
+    assert contract["unknown"] == {
+        "label": "进度更新",
+        "summary": "进度更新",
+        "noticeCode": None,
+    }
+    assert contract["notices"] == [
+        "RETRIEVAL_DEGRADED",
+        "CIRCUIT_OPEN",
+        "MODEL_REPAIR_EXHAUSTED",
+        "WORKER_DLQ",
+        "audit_failed",
+    ]
+    assert contract["terminal"] == [
+        "research_action_invalid",
+        "research_round_limit",
+        "audit_failed",
+        "cannot_answer",
+        "refuse",
+        "clarify",
+    ]
+    assert contract["memory"] == {
+        "className": "error-card",
+        "message": "Mem0 不可用：provider unavailable",
+    }
+    assert contract["provenance"] == {
+        "evidence_parent_ids": ["parent-1"],
+        "route": "research",
+        "runtime_config_snapshot_id": "snapshot-1",
+        "client_provenance": "api",
+    }
+
+
+@pytest.mark.integration
+async def test_console_mem0_provider_failure_is_not_an_empty_list() -> None:
+    class UnavailableMemory:
+        async def list(self, _scope: object) -> list[object]:
+            raise OSError("provider unavailable")
+
+    app = _app_for_static_test()
+    app.state.container.settings.default_user_id = "console-user"
+    app.state.container.memory_service = UnavailableMemory()
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/memories")
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "MEMORY_UNAVAILABLE"
