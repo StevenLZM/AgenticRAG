@@ -280,3 +280,17 @@ async def test_context_compacts_only_old_observations_and_completed_todo_details
     assert built["evidence_manifest"] == {"e1": {"document_id": "doc-1"}}
     assert built["compacted_history"] == "older work compacted"
     assert len(compactor.calls) == 1
+
+
+async def test_context_builder_preserves_bounded_evidence_text_for_research() -> None:
+    from agentic_rag.query.context import ContextBuilder
+
+    state = _state()
+    state["packed_context"] = {
+        "manifest": {"e1": {"document_id": "doc-1"}},
+        "rendered_context": "[e1] verified evidence text",
+    }
+
+    built = await ContextBuilder().build(state)
+
+    assert built["packed_context"] == "[e1] verified evidence text"

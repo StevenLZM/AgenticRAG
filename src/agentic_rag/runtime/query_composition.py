@@ -122,7 +122,12 @@ def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
     )
 
 
-async def build_query_dependencies(container: object, settings: Settings) -> QueryGraphDependencies:
+async def build_query_dependencies(
+    container: object,
+    settings: Settings,
+    *,
+    child_index: str | None = None,
+) -> QueryGraphDependencies:
     """Build all process-owned QueryGraph collaborators from one snapshot."""
     deepseek_key = _credential(settings.deepseek_api_key, "AGENTIC_RAG_DEEPSEEK_API_KEY")
     qwen_key = _credential(settings.qwen_api_key, "AGENTIC_RAG_QWEN_API_KEY")
@@ -160,10 +165,14 @@ async def build_query_dependencies(container: object, settings: Settings) -> Que
             RetrievalDependencies(
                 embedding=embedding,
                 vector=ElasticsearchVectorIndex(
-                    elasticsearch, index_generation=settings.index_generation
+                    elasticsearch,
+                    index_generation=settings.index_generation,
+                    index=child_index,
                 ),
                 lexical=ElasticsearchBm25Index(
-                    elasticsearch, index_generation=settings.index_generation
+                    elasticsearch,
+                    index_generation=settings.index_generation,
+                    index=child_index,
                 ),
                 reranker=reranker,
                 parent_fetcher=ParentFetcher(parents),

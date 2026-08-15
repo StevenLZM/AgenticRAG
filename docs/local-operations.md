@@ -60,6 +60,12 @@ AGENTIC_RAG_MEM0_HISTORY_DB_PATH=var/mem0/history.db
 
 本地 Elasticsearch（`localhost`、`127.0.0.1` 或 `::1`）可以不设置认证；远程 Elasticsearch 必须设置 API key 或用户名/密码。显式的 `AGENTIC_RAG_MEM0_EMBEDDING_BASE_URL` 和 `AGENTIC_RAG_MEM0_EMBEDDING_API_KEY` 会覆盖 Qwen fallback。若要临时关闭 Mem0 进行故障隔离，可设置 `AGENTIC_RAG_MEM0_ENABLED=0`；这会把记忆标记为 disabled，而不是伪装成可用。
 
+本地回环 Elasticsearch 的 `local-no-auth` 只是 mem0ai 2.0.12 的配置校验哨兵，不会作为 `Authorization` 头发送；远程端点不得使用该值。Mem0 可选的 PostHog 遥测在本地或 CI 中建议关闭：
+
+```sh
+export MEM0_TELEMETRY=0
+```
+
 如果要使用 Mem0 自己管理的 LLM（通常不需要，因为抽取由应用的 ModelGateway 完成），再设置 `AGENTIC_RAG_MEM0_LLM_ENABLED=1`，并同时设置 `AGENTIC_RAG_MEM0_LLM_MODEL`、`AGENTIC_RAG_MEM0_LLM_BASE_URL` 和 `AGENTIC_RAG_MEM0_LLM_API_KEY`。如果 Mem0 已启用但安装、配置或服务提供方构造失败，查询 API 仍可继续运行，但会明确进入 memory degraded 状态：`/health/ready` 报告 `memory=unavailable`，并写入包含 `component=mem0`、`reason`、`outcome=degraded`、`retryable` 的有界 `memory_provider_degraded` 日志。查询证据、审计和租户隔离不会因此放宽；`GET/DELETE /v1/memories` 会返回记忆服务不可用，而不是返回空的成功结果。
 
 真实服务提供方合约测试只能使用明确指定的临时命名空间。缺少变量时测试会跳过；已配置但服务提供方不健康时测试会失败：
@@ -165,6 +171,16 @@ AGENTIC_RAG_RUN_REAL_BACKUP_RESTORE=1 conda run -n agentic-rag python -m pytest 
 conda run -n agentic-rag python -m pytest -m live_model tests/smoke -q
 conda run -n agentic-rag python -m evals.run --mode fixture \
   --dataset evals/datasets/baseline.jsonl --output var/artifacts/evals/fixture
+# 真实 Graph/API + 当前 snapshot + 真实 client provenance；会启动生产 Worker/API，
+# 使用隔离 MySQL/Redis/Elasticsearch/Mem0 资源，并在结束时清理。
+set -a; source .env.local; set +a
+export HF_HOME=/tmp/agentic-rag-hf
+export MEM0_TELEMETRY=0
+export AGENTIC_RAG_RUN_REAL_QUERY_PROVIDER_E2E=1
+conda run -n agentic-rag python scripts/run_real_query_acceptance.py \
+  --output var/artifacts/evals/real-api-current
+conda run -n agentic-rag python scripts/verify_acceptance.py \
+  --report var/artifacts/evals/real-api-current/summary.json
 # 最终验收必须使用与运行时快照匹配的数据集和真实客户端：
 conda run -n agentic-rag python -m evals.run --mode graph \
   --dataset var/artifacts/evals/runtime-baseline.jsonl --output var/artifacts/evals/graph

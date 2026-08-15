@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -17,16 +18,25 @@ from agentic_rag.bootstrap import build_container
 from agentic_rag.config import Settings
 
 
-def create_app(settings: Settings) -> FastAPI:
-    """Build one explicit application instance and own its process resources."""
-    container = build_container(settings)
+def create_app(settings: Settings, *, container: Any | None = None) -> FastAPI:
+    """Build an app, optionally reusing a deployment-owned container.
+
+    The normal API process owns the container it constructs.  Worker/API
+    composition and in-process acceptance runners may inject the already
+    composed container so Mem0, event sinks and runtime snapshots are not
+    initialized twice with competing provider resources.
+    """
+    owns_container = container is None
+    if container is None:
+        container = build_container(settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            await container.close()
+            if owns_container:
+                await container.close()
 
     app = FastAPI(title="Agentic RAG", version="0.1.0", lifespan=lifespan)
     app.state.container = container

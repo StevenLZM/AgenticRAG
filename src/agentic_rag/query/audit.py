@@ -99,6 +99,11 @@ class EvidenceGrader:
         payload = {
             "question": question,
             "evidence_manifest": {key: value.model_dump(mode="json") for key, value in packed_evidence.manifest.items()},
+            # EvidenceBuilder has already applied the server-side token and
+            # tenant/provenance limits.  The grader needs the bounded text to
+            # decide sufficiency; it must still treat that text as untrusted
+            # data, never as instructions.
+            "packed_context": packed_evidence.rendered_context,
             "packed_evidence_metadata": {"item_count": len(packed_evidence.items), "index_generation": packed_evidence.index_generation},
             "user_scope": scope.model_dump(mode="json"),
         }

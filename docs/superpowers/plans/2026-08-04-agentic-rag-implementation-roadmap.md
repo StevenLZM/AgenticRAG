@@ -1,8 +1,8 @@
 # Agentic RAG 生产实现路线图
 
-> **当前实现状态：** 阶段 1–5 以及 Query Runtime/Mem0/真实评测后续加固均已在 `sdd-agentic-rag-implementation` 完成。继续工作前请阅读[开发进度快照](../../development-progress.md)；目前只剩分支合并和生产身份/RBAC 审批。
+> **当前实现状态：** 阶段 1–5 以及查询运行时、Mem0、真实评测后续加固均已在 `sdd-agentic-rag-implementation` 完成；真实 Graph/API 验收脚本也已通过当前快照门禁。继续工作前请阅读[开发进度快照](../../development-progress.md)；目前只剩分支合并、生产身份/RBAC 审批和检索分数标定。
 
-> **供 Agent 工作者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans` 子技能，按任务逐项执行本路线图。步骤使用复选框（`- [ ]`）跟踪。
+> **供开发代理工作者使用：** 必须使用 `superpowers:subagent-driven-development`（推荐）或 `superpowers:executing-plans` 子技能，按任务逐项执行本路线图。步骤使用复选框（`- [ ]`）跟踪。
 
 **目标：** 交付获批准的单主机生产级 Agentic RAG 系统，分为五个有序、可独立审查的实现阶段。
 
@@ -82,9 +82,18 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
 conda run -n agentic-rag python -m pytest --import-mode=importlib -m integration -q
 conda run -n agentic-rag python -m pytest --import-mode=importlib -m e2e -q
 conda run -n agentic-rag python -m pytest --import-mode=importlib -m live_model tests/smoke -q
-# fixture 仅用于冒烟测试；最终验收必须使用 graph 或 api 来源证明。
+# fixture 仅用于冒烟测试；最终验收必须使用 Graph 或 API 来源证明。
 conda run -n agentic-rag python -m evals.run --mode fixture \
   --dataset evals/datasets/baseline.jsonl --output artifacts/evals/fixture
+# 真实 API 验收（当前快照、真实 client provenance、Mem0 和隔离服务）：
+set -a; source .env.local; set +a
+export HF_HOME=/tmp/agentic-rag-hf MEM0_TELEMETRY=0
+export AGENTIC_RAG_RUN_REAL_QUERY_PROVIDER_E2E=1
+conda run -n agentic-rag python scripts/run_real_query_acceptance.py \
+  --output var/artifacts/evals/real-api-current
+conda run -n agentic-rag python scripts/verify_acceptance.py \
+  --report var/artifacts/evals/real-api-current/summary.json
+# 或对已部署 API 运行真实评测（数据集的 snapshot 必须与服务一致）：
 conda run -n agentic-rag python -m evals.run --mode graph \
   --dataset var/artifacts/evals/runtime-baseline.jsonl --output artifacts/evals/graph
 conda run -n agentic-rag python scripts/verify_acceptance.py \

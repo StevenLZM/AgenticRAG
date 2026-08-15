@@ -77,7 +77,9 @@ def test_mem0_config_falls_back_to_qwen_embedding_and_allows_loopback_without_au
 
     assert config["embedder"]["config"]["openai_base_url"] == "https://qwen.example/v1"
     assert config["embedder"]["config"]["api_key"] == "qwen-fallback-key"
-    assert "api_key" not in config["vector_store"]["config"]
+    # mem0ai 2.0.12 requires an auth-shaped field even for local Elasticsearch;
+    # its non-cloud adapter ignores api_key and performs an unauthenticated call.
+    assert config["vector_store"]["config"]["api_key"] == "local-no-auth"
     assert "user" not in config["vector_store"]["config"]
 
 
@@ -164,6 +166,7 @@ def test_mem0_adapter_uses_filter_namespace_and_disables_provider_inference() ->
 @pytest.mark.asyncio
 async def test_enabled_mem0_builds_provider_and_light_extractor(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     import mem0
 
@@ -185,6 +188,7 @@ async def test_enabled_mem0_builds_provider_and_light_extractor(
     settings = _settings(
         deepseek_base_url="https://deepseek.example/v1",
         deepseek_api_key="deepseek-key",
+        mem0_history_db_path=tmp_path / "nested" / "history.db",
     )
     container = SimpleNamespace(
         repositories=SimpleNamespace(session_factory=object())
@@ -195,3 +199,4 @@ async def test_enabled_mem0_builds_provider_and_light_extractor(
     assert getattr(service, "available") is True
     assert getattr(service, "_extractor") is not None
     assert getattr(service, "_mem0")._client.config["vector_store"]["config"]["host"] == "http://127.0.0.1"
+    assert (tmp_path / "nested").is_dir()

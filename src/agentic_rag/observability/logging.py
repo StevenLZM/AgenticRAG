@@ -415,8 +415,9 @@ async def emit_degradation(
     )
     if _EVENT_TYPE.fullmatch(resolved_event_type) is None:
         resolved_event_type = "COMPONENT_DEGRADED"
+    safe_attributes = sanitize_attributes(attributes)
     logger.warning(
-        "degradation component=%s reason=%s outcome=%s retryable=%s attempt=%s run_id=%s snapshot_id=%s",
+        "degradation component=%s reason=%s outcome=%s retryable=%s attempt=%s run_id=%s snapshot_id=%s attributes=%s",
         safe_component,
         safe_reason,
         safe_outcome,
@@ -424,6 +425,7 @@ async def emit_degradation(
         safe_attempt,
         safe_run or "none",
         safe_snapshot,
+        safe_attributes,
     )
     if scope is None or safe_run is None or safe_snapshot == "unknown":
         return
@@ -450,7 +452,7 @@ async def emit_degradation(
                 "reason": safe_reason,
                 "retryable": safe_retryable,
                 "outcome": safe_outcome,
-                **sanitize_attributes(attributes),
+                **safe_attributes,
             },
         )
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):

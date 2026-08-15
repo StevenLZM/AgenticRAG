@@ -101,6 +101,19 @@ class DualProtocolClient(FakeChatClient):
         self.responses = FakeResponsesApi(response_values)
 
 
+class JsonKeywordChatApi(FakeChatCompletionsApi):
+    async def create(self, **kwargs: object) -> object:
+        messages = kwargs.get("messages", ())
+        joined = " ".join(
+            str(item.get("content", ""))
+            for item in messages
+            if isinstance(item, dict)
+        )
+        if "json" not in joined.casefold():
+            raise ValueError("provider requires the prompt to mention JSON")
+        return await super().create(**kwargs)
+
+
 @dataclass
 class DiagnosticEmitter:
     runtime_config_snapshot_id: str
@@ -228,6 +241,22 @@ async def test_structured_chat_call_requests_json_object() -> None:
     )
 
     assert client.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
+
+
+async def test_structured_chat_adds_json_instruction_for_provider_json_mode() -> None:
+    client = FakeChatClient(
+        ['{"route":"fast_rag","normalized_query":"q","reason_code":"simple"}']
+    )
+    client.chat.completions = JsonKeywordChatApi(
+        ['{"route":"fast_rag","normalized_query":"q","reason_code":"simple"}']
+    )
+
+    result = await ModelGateway(client, sleep=lambda _: _no_sleep()).complete_structured(
+        ROUTE_CALL.model_copy(update={"protocol": "chat"}), RouteDecision
+    )
+
+    assert result.value.route == "fast_rag"
+    assert "json" in str(client.chat.completions.calls[0]["messages"]).casefold()
 
 
 async def test_structured_call_accepts_a_single_json_markdown_fence() -> None:

@@ -363,7 +363,9 @@ def _operational_errors() -> tuple[type[BaseException], ...]:
 async def _log_degraded(operation: str, error: BaseException) -> None:
     """Log only bounded provider metadata, never memory/provider content."""
     logger.warning(
-        "memory_provider_degraded",
+        "memory_provider_degraded component=mem0 operation=%s reason=%s outcome=degraded retryable=True",
+        operation,
+        type(error).__name__,
         extra={
             "component": "mem0",
             "operation": operation,

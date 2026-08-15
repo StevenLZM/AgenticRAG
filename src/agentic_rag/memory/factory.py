@@ -157,7 +157,12 @@ def build_mem0_config(settings: object) -> dict[str, object]:
     elif es_user and es_password:
         vector_config["user"] = es_user
         vector_config["password"] = es_password
-    elif not _is_loopback_host(parsed.hostname):
+    elif _is_loopback_host(parsed.hostname):
+        # mem0ai 2.0.12 validates an auth-shaped field even for local ES. Its
+        # non-cloud adapter ignores api_key and therefore still connects
+        # without an Authorization header; keep the sentinel non-secret.
+        vector_config["api_key"] = "local-no-auth"
+    else:
         raise MemoryCompositionError(
             "Mem0 Elasticsearch authentication is required (API key or user/password)"
         )
@@ -224,6 +229,14 @@ def _build_memory_service_sync(
         from mem0 import AsyncMemory  # type: ignore[import-untyped]
     except ImportError as error:
         raise MemoryCompositionError("mem0ai is not installed in the runtime environment") from error
+    history_path = str(getattr(settings, "mem0_history_db_path", "var/mem0/history.db"))
+    try:
+        from pathlib import Path
+
+        Path(history_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise MemoryCompositionError("Mem0 history database directory is unavailable") from error
+    config["history_db_path"] = history_path
     try:
         async_memory = AsyncMemory.from_config(config)
     except Exception as error:

@@ -106,6 +106,18 @@ async def test_application_shutdown_closes_the_container(
     assert container.closed is True
 
 
+async def test_application_can_reuse_deployment_owned_container(
+    tmp_path: Path,
+) -> None:
+    container = _container(ReadinessChecks({"configuration": _ok}))
+    app = create_app(_settings(tmp_path), container=container)
+
+    async with app.router.lifespan_context(app):
+        assert container.closed is False
+
+    assert container.closed is False
+
+
 async def test_readiness_reports_each_failed_dependency_without_provider_details(
     monkeypatch: Any, tmp_path: Path
 ) -> None:

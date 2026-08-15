@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 
 import pytest
@@ -313,6 +314,20 @@ async def test_evidence_grader_fails_closed_without_evidence() -> None:
 
     assert grade.decision == "insufficient"
     assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_grader_receives_bounded_rendered_evidence_context() -> None:
+    from agentic_rag.query.audit import EvidenceGrader
+
+    gateway = FakeGateway([{"decision": "sufficient", "gaps": []}])
+    await EvidenceGrader(gateway).grade(
+        "What is the term?", packed_evidence(), scope=SCOPE, snapshot=SNAPSHOT
+    )
+
+    call = gateway.calls[0]
+    payload = json.loads(call.messages[-1]["content"])
+    assert payload["packed_context"] == "evidence"
 
 
 @pytest.mark.asyncio

@@ -283,7 +283,9 @@ class ModelGateway:
         if protocol in {"auto", "chat"} and chat_available:
             kwargs: dict[str, object] = {
                 "model": call.requested_model,
-                "messages": list(call.messages),
+                "messages": list(
+                    _structured_messages(call.messages) if structured else call.messages
+                ),
             }
             if structured:
                 kwargs["response_format"] = {"type": "json_object"}
@@ -294,7 +296,9 @@ class ModelGateway:
         if protocol in {"auto", "responses"} and responses_available:
             kwargs = {
                 "model": call.requested_model,
-                "input": list(call.messages),
+                "input": list(
+                    _structured_messages(call.messages) if structured else call.messages
+                ),
             }
             if structured:
                 kwargs["text"] = {"format": {"type": "json_object"}}
@@ -362,6 +366,25 @@ def _normalize_structured_text(text: str) -> str:
             if language in {"", "json"}:
                 return candidate[first_newline + 1 : -3].strip()
     return candidate
+
+
+def _structured_messages(
+    messages: Sequence[dict[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Ensure provider JSON-mode preconditions without changing business prompts."""
+    if any(
+        isinstance(message.get("content"), str)
+        and "json" in message["content"].casefold()
+        for message in messages
+    ):
+        return tuple(messages)
+    return (
+        *messages,
+        {
+            "role": "system",
+            "content": "Return a valid JSON object only.",
+        },
+    )
 
 
 def _safe_schema_name(schema: object) -> str:

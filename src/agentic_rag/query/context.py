@@ -39,6 +39,10 @@ class ContextBuilder:
             "unresolved_todos": unfinished,
             "latest_observation": observations[-1] if observations else None,
             "evidence_manifest": packed.get("manifest", {}),
+            # EvidenceBuilder bounds and verifies this rendered text before it
+            # reaches the loop. Keep the trust-boundary instruction adjacent;
+            # the text remains data, never an executable model instruction.
+            "packed_context": packed.get("rendered_context", ""),
             "grader_gaps": research.get("gaps", []),
         }
         limit = self._max_tokens or snapshot.research_context_soft_limit_tokens
