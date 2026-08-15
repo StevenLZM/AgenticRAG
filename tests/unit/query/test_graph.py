@@ -262,6 +262,27 @@ async def test_real_query_graph_emits_safe_projection_attributes() -> None:
     assert by_type["ANSWER_FINALIZED"]["attributes"]["termination_reason"] == "completed"
 
 
+def test_research_projection_includes_global_budget_and_todo_count() -> None:
+    """Console metrics expose only finite counters from the checkpoint-safe state."""
+    from agentic_rag.query.graph import _event_attributes
+
+    state = _state()
+    state["research_attempt_count"] = 4
+    state["research"] = {
+        "todos": [
+            {"id": "todo-1", "title": "root", "owner": "supervisor", "status": "blocked"},
+            {"id": "todo-2", "title": "child", "owner": "supervisor", "status": "completed"},
+        ],
+    }
+
+    assert _event_attributes(state, "RESEARCH_LOOP_COMPLETED") == {
+        "retrieval_rounds": 0,
+        "candidate_count": 0,
+        "research_attempt_count": 4,
+        "todo_count": 2,
+    }
+
+
 async def test_real_graph_model_gateway_call_emits_usage_inside_graph_scope() -> None:
     """A graph-invoked gateway call inherits the LLM emitter scope."""
     from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway

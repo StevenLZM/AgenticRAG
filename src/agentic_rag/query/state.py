@@ -33,6 +33,7 @@ class QueryState(TypedDict):
     runtime_config_snapshot: dict[str, JsonValue]
     answer: NotRequired[dict[str, JsonValue]]
     audit_results: list[dict[str, JsonValue]]
+    research_attempt_count: int
     revision_count: int
     errors: list[dict[str, JsonValue]]
     termination_reason: str | None
@@ -64,6 +65,7 @@ def new_query_state(
             dict[str, JsonValue], json_safe(snapshot.model_dump(mode="json"))
         ),
         "audit_results": [],
+        "research_attempt_count": 0,
         "revision_count": 0,
         "errors": [],
         "termination_reason": None,

@@ -88,6 +88,95 @@ def _state() -> dict[str, object]:
     return new_query_state(run_id="run-1", question="What notice applies?", scope=SCOPE, snapshot=SNAPSHOT)
 
 
+def _state_without_research_todos() -> dict[str, object]:
+    state = _state()
+    state["research"] = {"todos": [], "observations": []}
+    return state
+
+
+def _state_with_research_attempt_count(value: int) -> dict[str, object]:
+    state = _state()
+    state["research_attempt_count"] = value
+    return state
+
+
+def _deps(
+    actions: list[dict[str, object]] | None = None,
+    *,
+    gateway: ScriptedGateway | None = None,
+    dispatcher: object | None = None,
+) -> object:
+    from agentic_rag.query.research_loop import ResearchLoopDependencies
+
+    return ResearchLoopDependencies(
+        gateway=gateway or ScriptedGateway(actions or []),
+        retrieval=FakeRetrieval(),
+        evidence_builder=EvidenceBuilder(),
+        subagents=dispatcher,  # type: ignore[arg-type]
+    )
+
+
+def _recording_dispatcher() -> object:
+    from agentic_rag.query.evidence_builder import EvidenceCoverageTarget
+    from agentic_rag.query.subagents import DelegationResult, SubagentResult
+
+    class RecordingDispatcher:
+        async def delegate(self, items: object, context: object, **_: object) -> DelegationResult:
+            selected = tuple(items)  # type: ignore[arg-type]
+            packed = EvidenceBuilder().build(
+                [_batch()],
+                [EvidenceCoverageTarget(target_id=selected[0].id, description=selected[0].title)],
+                context.scope,
+                context.snapshot,
+            )
+            return DelegationResult(
+                results=(SubagentResult(todo_id=selected[0].id, evidence=packed),),
+                blocked_todo_ids=(),
+                child_states=(),
+            )
+
+    return RecordingDispatcher()
+
+
+async def test_empty_research_state_creates_root_todo_and_can_delegate() -> None:
+    """The supervisor creates a root Todo before a model can append and delegate work."""
+    from agentic_rag.query.research_loop import ResearchAgentLoop
+
+    state = _state_without_research_todos()
+    loop = ResearchAgentLoop(_deps(
+        actions=[
+            {"action": "create_todos", "titles": ["Find notice period"]},
+            {"action": "delegate_research", "todo_ids": ["todo-2"]},
+            {"action": "submit_evidence"},
+        ],
+        dispatcher=_recording_dispatcher(),
+    ))  # type: ignore[arg-type]
+
+    result = await loop.ainvoke(state)  # type: ignore[arg-type]
+
+    assert [todo["id"] for todo in result["research"]["todos"]] == ["todo-1", "todo-2"]  # type: ignore[index]
+    assert result["research"]["observations"][0]["kind"] == "todo_created"  # type: ignore[index]
+    assert result["research"]["observations"][1]["kind"] == "todo_created"  # type: ignore[index]
+
+
+async def test_research_attempt_count_survives_reentry_and_stops_at_snapshot_limit() -> None:
+    """A second graph entry cannot give one run a fifth model action."""
+    from agentic_rag.query.research_loop import ResearchAgentLoop
+
+    first = _state_with_research_attempt_count(3)
+    update = await ResearchAgentLoop(_deps(actions=[
+        {"action": "calculator", "expression": "1+1"},
+    ])).ainvoke(first)  # type: ignore[arg-type]
+
+    assert update["research_attempt_count"] == 4
+    resumed = {**first, **update}
+    gateway = ScriptedGateway([])
+    limited = await ResearchAgentLoop(_deps(gateway=gateway)).ainvoke(resumed)  # type: ignore[arg-type]
+
+    assert limited["termination_reason"] == "research_round_limit"
+    assert gateway.calls == 0
+
+
 async def test_agent_reenters_after_retrieval_observation_and_submits_evidence() -> None:
     from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
 
@@ -103,7 +192,8 @@ async def test_agent_reenters_after_retrieval_observation_and_submits_evidence()
 
     assert gateway.calls == 2
     assert result["research"]["submitted"] is True
-    assert result["research"]["observations"][0]["kind"] == "retrieval"
+    assert result["research"]["observations"][0]["kind"] == "todo_created"
+    assert result["research"]["observations"][1]["kind"] == "retrieval"
     assert json.loads(json.dumps(result)) == result
 
 
@@ -151,7 +241,7 @@ async def test_loop_marks_unfinished_work_blocked_after_four_rounds() -> None:
     result = await loop.ainvoke(_state())
 
     assert result["termination_reason"] == "research_round_limit"
-    assert len(result["research"]["observations"]) == 4
+    assert len(result["research"]["observations"]) == 5
 
 
 async def test_delegate_with_empty_evidence_blocks_todo_instead_of_completing() -> None:

@@ -12,9 +12,20 @@ from pydantic import BaseModel, ConfigDict, Field, RootModel, TypeAdapter, Valid
 
 from agentic_rag.query.context import ContextBuilder
 from agentic_rag.query.evidence_builder import EvidenceBuilder
-from agentic_rag.query.state import QueryState, scope_from_state, snapshot_from_state
+from agentic_rag.query.state import (
+    QueryState,
+    question_from_state,
+    scope_from_state,
+    snapshot_from_state,
+)
 from agentic_rag.query.subagents import EvidenceReducer, SubagentDispatcher
-from agentic_rag.query.todos import InvalidTodoTransition, TodoItem, TodoReducer, TodoUpdate
+from agentic_rag.query.todos import (
+    SUPERVISOR_OWNER,
+    InvalidTodoTransition,
+    TodoItem,
+    TodoReducer,
+    TodoUpdate,
+)
 from agentic_rag.query.tools import ResearchContext, ResearchToolset, RetrievalPort
 from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway, StructuredOutputValidationError, load_prompt
 
@@ -23,6 +34,14 @@ class UpdateTodos(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     action: Literal["update_todos"]
     updates: tuple["TodoActionUpdate", ...] = ()
+
+
+class CreateTodos(BaseModel):
+    """Append titles only; the supervisor owns IDs, owners, and tenant scope."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    action: Literal["create_todos"]
+    titles: tuple[str, ...] = Field(min_length=1)
 
 
 class TodoActionUpdate(BaseModel):
@@ -65,7 +84,7 @@ class CannotAnswer(BaseModel):
 
 
 ResearchAction = Annotated[
-    UpdateTodos | RetrieveEvidence | DelegateResearch | CalculatorCall | SubmitEvidence | CannotAnswer,
+    CreateTodos | UpdateTodos | RetrieveEvidence | DelegateResearch | CalculatorCall | SubmitEvidence | CannotAnswer,
     Field(discriminator="action"),
 ]
 _RESEARCH_ACTION: TypeAdapter[Any] = TypeAdapter(ResearchAction)
@@ -103,20 +122,40 @@ class ResearchAgentLoop:
         observations = _observations(research.get("observations"))
         evidence = _evidence(state)
         retrieval_batches = _retrieval_batches(state)
-        for round_number in range(snapshot.max_research_rounds):
+        if not todos:
+            todos = TodoReducer.create([question_from_state(state)], owner=SUPERVISOR_OWNER)
+            observations.append({"kind": "todo_created", "todo_ids": [todo.id for todo in todos]})
+        attempt = int(state.get("research_attempt_count", 0))
+        while attempt < snapshot.max_research_rounds:
+            attempt += 1
             action = await self._next_action(state, research, todos, observations)
-            result = await self._execute(action, context, todos, observations, evidence, state, round_number)
+            result = await self._execute(
+                action,
+                context,
+                todos,
+                observations,
+                evidence,
+                state,
+                attempt - 1,
+            )
             todos, observations, evidence = result.todos, result.observations, result.evidence
             retrieval_batches.extend(result.retrieval_batches)
             research = {**research, "todos": _dump_todos(todos), "observations": observations}
             if result.submitted:
-                return _result(research, evidence, retrieval_batches=retrieval_batches, submitted=True)
+                return _result(
+                    research,
+                    evidence,
+                    retrieval_batches=retrieval_batches,
+                    submitted=True,
+                    research_attempt_count=attempt,
+                )
             if result.cannot_answer:
                 return _result(
                     {**research, "cannot_answer": True},
                     evidence,
                     retrieval_batches=retrieval_batches,
                     cannot_answer=True,
+                    research_attempt_count=attempt,
                     termination_reason=result.termination_reason or "cannot_answer",
                 )
         blocked = tuple(
@@ -129,6 +168,7 @@ class ResearchAgentLoop:
             {**research, "todos": _dump_todos(blocked), "observations": observations},
             evidence,
             retrieval_batches=retrieval_batches,
+            research_attempt_count=attempt,
             termination_reason="research_round_limit",
         )
 
@@ -175,6 +215,27 @@ class ResearchAgentLoop:
         state: QueryState,
         round_number: int,
     ) -> "_Step":
+        if isinstance(action, CreateTodos):
+            titles = [title.strip() for title in action.titles]
+            if not all(titles) or len({title.casefold() for title in titles}) != len(titles):
+                return _Step(
+                    todos,
+                    [*observations, {"kind": "todo_created", "ok": False, "error": "todo titles must be nonblank and unique"}],
+                    evidence,
+                )
+            try:
+                appended = TodoReducer.append(todos, titles, owner=SUPERVISOR_OWNER)
+            except (InvalidTodoTransition, ValueError):
+                return _Step(
+                    todos,
+                    [*observations, {"kind": "todo_created", "ok": False, "error": "todo creation rejected"}],
+                    evidence,
+                )
+            return _Step(
+                appended,
+                [*observations, {"kind": "todo_created", "ok": True, "todo_ids": [todo.id for todo in appended[len(todos):]]}],
+                evidence,
+            )
         if isinstance(action, UpdateTodos):
             try:
                 updated = TodoReducer.apply_many(
@@ -363,12 +424,14 @@ def _result(
     retrieval_batches: list[dict[str, object]] | None = None,
     submitted: bool = False,
     cannot_answer: bool = False,
+    research_attempt_count: int,
     termination_reason: str | None = None,
 ) -> dict[str, object]:
     return {
         "research": {**research, "submitted": submitted, "cannot_answer": cannot_answer},
         "evidence": evidence,
         "retrieval_batches": retrieval_batches or [],
+        "research_attempt_count": research_attempt_count,
         "next_node": "generate" if submitted else "end",
         "termination_reason": termination_reason,
     }

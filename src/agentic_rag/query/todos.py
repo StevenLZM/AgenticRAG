@@ -51,6 +51,26 @@ class TodoReducer:
             for position, title in enumerate(titles, start=1)
         )
 
+    @classmethod
+    def append(
+        cls,
+        todos: tuple[TodoItem, ...],
+        titles: list[str],
+        *,
+        owner: str,
+    ) -> tuple[TodoItem, ...]:
+        """Append supervisor-owned work with deterministic IDs."""
+        if not owner.strip():
+            raise ValueError("owner must not be blank")
+        cls.validate(todos)
+        additions = tuple(
+            TodoItem(id=f"todo-{position}", title=title, owner=owner)
+            for position, title in enumerate(titles, start=len(todos) + 1)
+        )
+        result = (*todos, *additions)
+        cls.validate(result)
+        return result
+
     @staticmethod
     def validate(todos: tuple[TodoItem, ...] | list[TodoItem]) -> None:
         seen: set[str] = set()

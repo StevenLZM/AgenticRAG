@@ -460,9 +460,21 @@ def _event_attributes(state: Mapping[str, object], event_type: str) -> dict[str,
         batches = state.get("retrieval_batches")
         if isinstance(batches, list):
             attributes["retrieval_rounds"] = len(batches)
+        elif event_type == "RESEARCH_LOOP_COMPLETED":
+            attributes["retrieval_rounds"] = 0
         evidence = state.get("evidence")
         if isinstance(evidence, list):
             attributes["candidate_count"] = len(evidence)
+        elif event_type == "RESEARCH_LOOP_COMPLETED":
+            attributes["candidate_count"] = 0
+    if event_type == "RESEARCH_LOOP_COMPLETED":
+        attempts = state.get("research_attempt_count")
+        attributes["research_attempt_count"] = (
+            attempts if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0 else 0
+        )
+        research = state.get("research")
+        todos = research.get("todos") if isinstance(research, Mapping) else None
+        attributes["todo_count"] = len(todos) if isinstance(todos, list) else 0
     if event_type == "CITATION_VALIDATED":
         answer = state.get("answer")
         segments = answer.get("segments") if isinstance(answer, Mapping) else None

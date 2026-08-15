@@ -75,3 +75,16 @@ def test_todo_order_and_ids_remain_deterministic() -> None:
         "Second research question",
         "First research question",
     ]
+
+
+def test_append_todos_uses_stable_non_colliding_ids() -> None:
+    """Appending model-proposed work must not replace an existing Todo."""
+    existing = TodoReducer.create(["root"], owner="supervisor")
+
+    result = TodoReducer.append(
+        existing,
+        ["retrieve policy", "check exception"],
+        owner="supervisor",
+    )
+
+    assert [item.id for item in result] == ["todo-1", "todo-2", "todo-3"]
