@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
 import pytest
 
 from agentic_rag.config import Settings
@@ -115,6 +118,60 @@ async def test_composed_child_worker_inherits_server_scope_and_current_snapshot(
     assert result.results[0].evidence.index_generation == "current-index"
     assert retrieval.requests[0][1].user_id == "server-owned-user"
     assert retrieval.requests[0][2] == SNAPSHOT
+
+
+async def test_worker_entrypoint_receives_the_composed_concurrency_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The entrypoint must not replace the graph's process-wide budget."""
+    import scripts.run_query_worker as worker_entrypoint
+
+    shared_concurrency = ConcurrencyManager()
+    dependencies = SimpleNamespace(
+        concurrency=shared_concurrency,
+        trace_recorder=None,
+        event_emitter=None,
+    )
+    recorded: dict[str, object] = {}
+
+    class RecordingWorker:
+        def __init__(self, **kwargs: object) -> None:
+            recorded.update(kwargs)
+
+        async def run_forever(self, *, stop_event: object) -> None:
+            del stop_event
+
+    class FakeCheckpoints:
+        @asynccontextmanager
+        async def open_query(self) -> object:
+            yield object()
+
+    class FakeContainer:
+        checkpoints = FakeCheckpoints()
+        broker = object()
+        repositories = SimpleNamespace(session_factory=object())
+
+        async def close(self) -> None:
+            return None
+
+    async def dependencies_factory(*_: object) -> object:
+        return dependencies
+
+    async def close_dependencies(*_: object) -> None:
+        return None
+
+    monkeypatch.setattr(worker_entrypoint, "build_container", lambda _: FakeContainer())
+    monkeypatch.setattr(worker_entrypoint, "build_graph_factory", lambda *_: object())
+    monkeypatch.setattr(worker_entrypoint, "TransactionalRunRepository", lambda _: object())
+    monkeypatch.setattr(
+        worker_entrypoint, "OutboxDispatcher", lambda *_, **__: object()
+    )
+    monkeypatch.setattr(worker_entrypoint, "QueryWorker", RecordingWorker)
+    monkeypatch.setattr(worker_entrypoint, "close_query_dependencies", close_dependencies)
+
+    await worker_entrypoint.run(_settings(), dependencies_factory=dependencies_factory)  # type: ignore[arg-type]
+
+    assert recorded["concurrency"] is shared_concurrency
 
 
 def _settings(**overrides: object) -> Settings:
