@@ -291,6 +291,50 @@ async def test_delegate_with_empty_evidence_blocks_todo_instead_of_completing() 
     assert result["research"]["todos"][0]["evidence_ids"] == []
 
 
+async def test_delegate_cannot_complete_a_blocked_todo_from_subagent_evidence() -> None:
+    """Only the reducer may transition Todo state after a delegated result arrives."""
+    from agentic_rag.query.subagents import DelegationResult, SubagentResult
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+
+    class UnexpectedResultDispatcher:
+        async def delegate(self, *args: object, **kwargs: object) -> DelegationResult:
+            del args, kwargs
+            packed = EvidenceBuilder().build(
+                [_batch()],
+                [],
+                SCOPE,
+                SNAPSHOT,
+            )
+            return DelegationResult(
+                results=(SubagentResult(todo_id="todo-1", evidence=packed),),
+                blocked_todo_ids=(),
+                child_states=(),
+            )
+
+    state = _state()
+    state["research"] = {
+        "todos": [{
+            "id": "todo-1", "title": "Find notice", "owner": "supervisor",
+            "status": "blocked", "dependencies": [], "evidence_ids": [],
+        }],
+        "observations": [],
+    }
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=ScriptedGateway([
+            {"action": "delegate_research", "todo_ids": ["todo-1"]},
+            {"action": "cannot_answer", "reason": "stop after invalid result"},
+        ]),
+        retrieval=FakeRetrieval(),
+        evidence_builder=EvidenceBuilder(),
+        subagents=UnexpectedResultDispatcher(),
+    ))
+
+    result = await loop.ainvoke(state)
+
+    assert result["research"]["todos"][0]["status"] == "blocked"
+    assert result["research"]["todos"][0]["evidence_ids"] == []
+
+
 async def test_delegate_with_all_children_timed_out_keeps_todos_blocked() -> None:
     from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
     from agentic_rag.query.subagents import DelegationResult

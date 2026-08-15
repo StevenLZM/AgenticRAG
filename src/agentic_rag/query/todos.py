@@ -63,10 +63,16 @@ class TodoReducer:
         if not owner.strip():
             raise ValueError("owner must not be blank")
         cls.validate(todos)
-        additions = tuple(
-            TodoItem(id=f"todo-{position}", title=title, owner=owner)
-            for position, title in enumerate(titles, start=len(todos) + 1)
-        )
+        used_ids = {todo.id for todo in todos}
+        next_position = 1
+        additions: list[TodoItem] = []
+        for title in titles:
+            while f"todo-{next_position}" in used_ids:
+                next_position += 1
+            todo_id = f"todo-{next_position}"
+            additions.append(TodoItem(id=todo_id, title=title, owner=owner))
+            used_ids.add(todo_id)
+            next_position += 1
         result = (*todos, *additions)
         cls.validate(result)
         return result

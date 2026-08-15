@@ -354,6 +354,34 @@ async def test_insufficient_fast_evidence_escalates_to_research_before_audits() 
     assert events.types.count("EVIDENCE_GRADED") == 2
 
 
+async def test_graph_reentry_preserves_research_budget_and_never_issues_fifth_action() -> None:
+    """An insufficient grade re-enters the real loop with its checkpointed action count."""
+    from agentic_rag.query.graph import build_query_graph
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+
+    gateway = FakeGateway(
+        RouteDecision(route="research", normalized_query="notice", reason_code="test"),
+        answer_values=[
+            {"action": "retrieve_evidence", "query": "notice"},
+            {"action": "retrieve_evidence", "query": "notice"},
+            {"action": "retrieve_evidence", "query": "notice"},
+            {"action": "submit_evidence"},
+        ],
+    )
+    deps, _memory, retrieval, _events = _deps(route="research", grades=["insufficient"])
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=gateway,
+        retrieval=retrieval,
+        evidence_builder=EvidenceBuilder(),
+    ))
+
+    result = await build_query_graph(replace(deps, gateway=gateway, research_loop=loop)).ainvoke(_state())
+
+    assert result["termination_reason"] == "research_round_limit"
+    assert result["research_attempt_count"] == 4
+    assert gateway.answer_values == []
+
+
 @pytest.mark.parametrize("decision", ["clarify", "refuse"])
 async def test_clarify_and_refuse_are_terminal_without_answer_audits(decision: str) -> None:
     from agentic_rag.query.graph import build_query_graph

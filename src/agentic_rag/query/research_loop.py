@@ -308,26 +308,71 @@ class ResearchAgentLoop:
                 # A full timeout has no evidence to reduce; keep parent evidence
                 # and let the dispatcher-provided blocked IDs drive Todo state.
                 merged = evidence
-            completed_ids = {
+            selected_ids = {todo.id for todo in selected}
+            completed_results = {
                 result.todo_id: result
                 for result in delegated.results
-                if result.evidence.items
+                if result.todo_id in selected_ids and result.evidence.items
             }
-            blocked_ids = set(delegated.blocked_todo_ids)
+            known_evidence_ids = {
+                str(item.get("evidence_id"))
+                for item in merged
+                if isinstance(item.get("evidence_id"), str)
+            }
+            completed_ids = {
+                todo_id: tuple(
+                    item.evidence_id
+                    for item in result.evidence.items
+                    if item.evidence_id in known_evidence_ids
+                )
+                for todo_id, result in completed_results.items()
+            }
+            completed_ids = {
+                todo_id: evidence_ids
+                for todo_id, evidence_ids in completed_ids.items()
+                if evidence_ids
+            }
+            blocked_ids = set(delegated.blocked_todo_ids) & selected_ids
             blocked_ids.update(
                 result.todo_id
                 for result in delegated.results
-                if not result.evidence.items
+                if result.todo_id in selected_ids and not result.evidence.items
             )
-            updated = tuple(
-                todo.model_copy(update={
-                    "status": "completed",
-                    "evidence_ids": tuple(item.evidence_id for item in completed_ids[todo.id].evidence.items),
-                }) if todo.id in completed_ids else (
-                    todo.model_copy(update={"status": "blocked"}) if todo.id in blocked_ids else todo
+            blocked_ids.update(set(completed_results) - set(completed_ids))
+            blocked_ids.difference_update(completed_ids)
+            try:
+                started = TodoReducer.apply_many(
+                    todos,
+                    tuple(
+                        (todo_id, TodoUpdate(status="in_progress"))
+                        for todo_id in sorted(completed_ids)
+                    ),
+                    actor=SUPERVISOR_OWNER,
                 )
-                for todo in todos
-            )
+                updated = TodoReducer.apply_many(
+                    started,
+                    tuple(
+                        [
+                            (
+                                todo_id,
+                                TodoUpdate(status="completed", evidence_ids=evidence_ids),
+                            )
+                            for todo_id, evidence_ids in sorted(completed_ids.items())
+                        ]
+                        + [
+                            (todo_id, TodoUpdate(status="blocked"))
+                            for todo_id in sorted(blocked_ids)
+                        ]
+                    ),
+                    actor=SUPERVISOR_OWNER,
+                )
+                TodoReducer.validate(updated)
+            except InvalidTodoTransition:
+                return _Step(
+                    _block_active(todos),
+                    [*observations, {"kind": "delegate", "ok": False, "error": "delegated todo transition rejected"}],
+                    evidence,
+                )
             return _Step(
                 updated,
                 [*observations, {

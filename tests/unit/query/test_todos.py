@@ -88,3 +88,15 @@ def test_append_todos_uses_stable_non_colliding_ids() -> None:
     )
 
     assert [item.id for item in result] == ["todo-1", "todo-2", "todo-3"]
+
+
+def test_append_todos_fills_sparse_ids_without_collision() -> None:
+    """Checkpoint recovery may retain a sparse but otherwise valid Todo collection."""
+    existing = (
+        _todo(id="todo-1"),
+        _todo(id="todo-3"),
+    )
+
+    result = TodoReducer.append(existing, ["fill gap", "continue"], owner="supervisor")
+
+    assert [item.id for item in result] == ["todo-1", "todo-3", "todo-2", "todo-4"]
