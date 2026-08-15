@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agentic_rag.config import Settings
+import agentic_rag.runtime.query_composition as query_composition
 from agentic_rag.runtime.query_composition import (
     QueryCompositionError,
     build_query_dependencies,
@@ -34,7 +35,15 @@ async def test_query_composition_fails_closed_without_model_credentials() -> Non
 
 
 @pytest.mark.asyncio
-async def test_query_composition_reports_missing_reranker_dependency() -> None:
+async def test_query_composition_reports_missing_reranker_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_dependency(name: str) -> object:
+        if name == "sentence_transformers":
+            raise ImportError("simulated missing sentence-transformers")
+        return query_composition.import_module(name)
+
+    monkeypatch.setattr(query_composition, "import_module", missing_dependency)
     with pytest.raises(QueryCompositionError, match="reranker"):
         await build_query_dependencies(
             object(),
