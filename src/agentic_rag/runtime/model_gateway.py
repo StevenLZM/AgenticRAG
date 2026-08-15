@@ -34,6 +34,7 @@ class ModelCall(BaseModel):
 
     messages: tuple[dict[str, Any], ...]
     model_role: Literal["main", "light"] = "main"
+    protocol: Literal["auto", "chat", "responses"] | None = None
     snapshot: RuntimeConfigSnapshot
     timeout_seconds: float | None = None
     temperature: float | None = None
@@ -49,6 +50,10 @@ class ModelCall(BaseModel):
     @property
     def effective_timeout_seconds(self) -> float:
         return self.timeout_seconds or float(self.snapshot.query_run_timeout_seconds)
+
+    @property
+    def effective_protocol(self) -> Literal["auto", "chat", "responses"]:
+        return self.protocol or self.snapshot.deepseek_protocol
 
 
 class ModelResponse(BaseModel, Generic[T]):
@@ -67,6 +72,10 @@ class ModelResponse(BaseModel, Generic[T]):
 
 class StructuredOutputValidationError(ValueError):
     """The model failed its one permitted schema-repair attempt."""
+
+
+class ModelProtocolError(TypeError):
+    """The injected provider client cannot satisfy the selected protocol."""
 
 
 class ModelGateway:
@@ -98,7 +107,7 @@ class ModelGateway:
     async def complete(self, call: ModelCall) -> ModelResponse[str]:
         """Return plain text, retrying only transient provider failures."""
         started = time.perf_counter()
-        response, attempts = await self._request_with_retries(call)
+        response, attempts = await self._request_with_retries(call, structured=False)
         result = ModelResponse[str](
             value=_extract_text(response),
             requested_model=call.requested_model,
@@ -121,7 +130,7 @@ class ModelGateway:
     ) -> ModelResponse[T]:
         """Parse an entire structured result or fail closed after one repair."""
         started = time.perf_counter()
-        response, attempts = await self._request_with_retries(call)
+        response, attempts = await self._request_with_retries(call, structured=True)
         input_tokens = _usage_value(response, "input_tokens", "prompt_tokens")
         output_tokens = _usage_value(response, "output_tokens", "completion_tokens")
         text = _extract_text(response)
@@ -131,7 +140,9 @@ class ModelGateway:
             repair_call = call.model_copy(
                 update={"messages": _repair_messages(call.messages, text, str(error))}
             )
-            repair_response, repair_attempts = await self._request_with_retries(repair_call)
+            repair_response, repair_attempts = await self._request_with_retries(
+                repair_call, structured=True
+            )
             attempts += repair_attempts
             response = repair_response
             input_tokens += _usage_value(response, "input_tokens", "prompt_tokens")
@@ -148,6 +159,18 @@ class ModelGateway:
                     retryable=False,
                     outcome="refused",
                     event_type="MODEL_REPAIR_EXHAUSTED",
+                    attributes={
+                        "schema_name": _safe_schema_name(schema),
+                        "protocol": call.effective_protocol,
+                        "requested_model": call.requested_model,
+                        "actual_model": _as_string(_get(response, "model"))
+                        or call.requested_model,
+                        "error_class": type(repair_error).__name__,
+                        "output_length": len(_extract_text(response)),
+                        "output_sha256": hashlib.sha256(
+                            _extract_text(response).encode("utf-8")
+                        ).hexdigest(),
+                    },
                 )
                 raise StructuredOutputValidationError(
                     "model output did not satisfy the requested schema after repair"
@@ -169,7 +192,9 @@ class ModelGateway:
         )
         return result
 
-    async def _request_with_retries(self, call: ModelCall) -> tuple[object, int]:
+    async def _request_with_retries(
+        self, call: ModelCall, *, structured: bool
+    ) -> tuple[object, int]:
         for attempt in range(1, self._max_retries + 2):
             if not self._circuit.allow_call():
                 await emit_degradation(
@@ -185,13 +210,26 @@ class ModelGateway:
                 raise CircuitOpenError("model provider circuit is open")
             try:
                 response = await asyncio.wait_for(
-                    self._create(call), timeout=call.effective_timeout_seconds
+                    self._create(call, structured=structured),
+                    timeout=call.effective_timeout_seconds,
                 )
                 self._circuit.record_success()
                 return response, attempt
             except CircuitOpenError:
                 raise
             except BaseException as error:
+                if isinstance(error, ModelProtocolError):
+                    await emit_degradation(
+                        component="llm",
+                        reason="protocol_error",
+                        run_id=None,
+                        snapshot_id=call.snapshot.snapshot_id,
+                        attempt=attempt,
+                        retryable=False,
+                        outcome="degraded",
+                        event_type="MODEL_PROTOCOL_ERROR",
+                    )
+                    raise
                 if not _is_transient(error) or attempt > self._max_retries:
                     if _is_transient(error) and attempt > self._max_retries:
                         self._circuit.record_failure()
@@ -234,25 +272,39 @@ class ModelGateway:
                 await self._sleep(delay * (0.5 + self._random()))
         raise AssertionError("retry loop must either return or raise")
 
-    async def _create(self, call: ModelCall) -> object:
+    async def _create(self, call: ModelCall, *, structured: bool = False) -> object:
         responses = _get(self._client, "responses")
-        if responses is not None and callable(_get(responses, "create")):
+        chat = _get(self._client, "chat")
+        completions = _get(chat, "completions") if chat is not None else None
+        chat_available = completions is not None and callable(_get(completions, "create"))
+        responses_available = responses is not None and callable(_get(responses, "create"))
+        protocol = call.effective_protocol
+
+        if protocol in {"auto", "chat"} and chat_available:
             kwargs: dict[str, object] = {
+                "model": call.requested_model,
+                "messages": list(call.messages),
+            }
+            if structured:
+                kwargs["response_format"] = {"type": "json_object"}
+            if call.temperature is not None:
+                kwargs["temperature"] = call.temperature
+            return await cast(Any, _get(completions, "create"))(**kwargs)
+
+        if protocol in {"auto", "responses"} and responses_available:
+            kwargs = {
                 "model": call.requested_model,
                 "input": list(call.messages),
             }
+            if structured:
+                kwargs["text"] = {"format": {"type": "json_object"}}
             if call.temperature is not None:
                 kwargs["temperature"] = call.temperature
             return await cast(Any, _get(responses, "create"))(**kwargs)
 
-        chat = _get(self._client, "chat")
-        completions = _get(chat, "completions") if chat is not None else None
-        if completions is not None and callable(_get(completions, "create")):
-            kwargs = {"model": call.requested_model, "messages": list(call.messages)}
-            if call.temperature is not None:
-                kwargs["temperature"] = call.temperature
-            return await cast(Any, _get(completions, "create"))(**kwargs)
-        raise TypeError("client must expose responses.create or chat.completions.create")
+        raise ModelProtocolError(
+            f"client cannot satisfy requested {protocol} model protocol"
+        )
 
 
 class PromptTemplate(BaseModel):
@@ -291,13 +343,30 @@ def prompt_hashes(names: Sequence[str]) -> dict[str, str]:
 
 
 def _validate_schema(schema: type[T], text: str) -> T:
-    parsed = json.loads(text)
+    parsed = json.loads(_normalize_structured_text(text))
     validator = _get(schema, "model_validate")
     if callable(validator):
         return cast(T, validator(parsed))
     if isinstance(parsed, schema):
         return cast(T, parsed)
     return cast(T, schema(**parsed))
+
+
+def _normalize_structured_text(text: str) -> str:
+    """Remove only a complete Markdown JSON fence; keep schema validation strict."""
+    candidate = text.strip()
+    if candidate.startswith("```") and candidate.endswith("```"):
+        first_newline = candidate.find("\n")
+        if first_newline > 0:
+            language = candidate[3:first_newline].strip().lower()
+            if language in {"", "json"}:
+                return candidate[first_newline + 1 : -3].strip()
+    return candidate
+
+
+def _safe_schema_name(schema: object) -> str:
+    name = getattr(schema, "__name__", "schema")
+    return name if isinstance(name, str) and name else "schema"
 
 
 def _repair_messages(

@@ -19,8 +19,21 @@ def test_settings_use_local_defaults(monkeypatch):
     assert settings.embedding_dimensions == 1024
     assert settings.query_worker_count == 1
     assert settings.ingestion_worker_count == 1
+    assert settings.mem0_enabled is True
     assert settings.max_upload_bytes == 50 * 1024 * 1024
     assert settings.index_generation == "index-v2"
+
+
+def test_mem0_can_be_explicitly_disabled_for_local_diagnostics(monkeypatch) -> None:
+    monkeypatch.setenv("AGENTIC_RAG_MYSQL_DSN", "mysql+asyncmy://rag:rag@127.0.0.1/rag")
+    monkeypatch.setenv("AGENTIC_RAG_DEEPSEEK_BASE_URL", "https://models.example.invalid/v1")
+    monkeypatch.setenv(
+        "AGENTIC_RAG_QWEN_EMBEDDING_BASE_URL",
+        "https://embeddings.example.invalid/v1",
+    )
+    monkeypatch.setenv("AGENTIC_RAG_MEM0_ENABLED", "0")
+
+    assert Settings().mem0_enabled is False
 
 
 def test_upload_size_limit_must_be_positive() -> None:

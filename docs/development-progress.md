@@ -187,7 +187,15 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 
 ## 6. 尚未实现与上线前注意事项
 
+- 2026-08-15：已确认 Mem0 默认启用；embedding 在未提供专用 Mem0 变量时复用 Qwen 配置，本地回环 Elasticsearch 允许无认证，远程 Elasticsearch 仍强制认证。Mem0 初始化失败时查询继续但 memory 降级、`/health/ready` 不通过，并输出 `memory_provider_degraded`。Task 1 单元回归：`13 passed`。
+- 2026-08-15：DeepSeek 结构化调用新增显式 `auto/chat/responses` 协议选择；`auto` 优先 Chat，结构化请求要求 JSON object，安全去除 JSON 围栏并保留严格 schema 校验。新增 `provider_outage`、`protocol_error`、`model_schema_invalid` 诊断字段（含 schema/model/attempt/hash，不含原始内容）。Task 2 focused 回归：`33 passed`。
 - 生产上线前仍需执行一次分支级发布审查，并把实现 worktree 合并到 `main`；本地最终验收不等同于生产鉴权/RBAC 审批。
+- 检索分数传播与相关性门禁仍需在发布前加固：
+  - 当前 `Reranker` 只按 CrossEncoder 预测分数重排，却没有把该分数写回结果；后续 Parent 聚合与 `EvidenceBuilder` 又把 Elasticsearch 原始 `_score` 当作 `rerank_score` 使用，可能反转 CrossEncoder 排序，而且 Dense/BM25 原始分数本身不可直接比较。
+  - 修复时应显式区分并传播 `retrieval_score`、`rrf_score` 与 `rerank_score`；Parent 以其最佳 Child 的真实 CrossEncoder 分数排序，同分时再用 CrossEncoder 顺序稳定破平。
+  - 采用“宽召回、后置门禁”：Dense/BM25 继续按 Top-K 召回，RRF 继续保留 Top-30，不对未经标定的各路原始分数设置统一硬阈值；CrossEncoder 对候选完整打分后应用版本化的 `min_rerank_score`，Parent 至少有一个 Child 达标才可进入 `EvidenceBuilder`。
+  - `min_rerank_score` 必须按 Reranker 模型及 revision、score activation、索引代际和评测切片离线标定，并纳入 `RuntimeConfigSnapshot`；全部候选被过滤时应升级 Research 或拒答，不得绕过 Evidence、Faithfulness 与 Citation 门禁。
+  - 验收至少覆盖真实分数传播、CrossEncoder 排序不反转、阈值边界、无候选路径，以及 Parent Recall@6、Precision@6、NDCG、可回答问题误拒率、无答案问题误接收率和引用覆盖率。
 - 当前 V1 只有 `user_id` 命名空间隔离，没有完整鉴权、RBAC 或用户身份解析；生产入口不能继续依赖 `default_user`。
 - Memory 的真实 Mem0 provider 由部署注入；未配置时服务会 fail-closed，不应把 no-op 结果当作生产记忆。
 - 本地 Elasticsearch、MySQL、Redis 已用隔离测试资源完成联调；Mem0 真实 provider 仍由部署注入，当前安全回归使用注入 fake/边界测试，不能把 Mem0 fake 结果当生产可用性证明。

@@ -28,9 +28,10 @@ class Settings(BaseSettings):
     elasticsearch_url: str = "http://localhost:9200"
     deepseek_base_url: str
     deepseek_api_key: SecretStr | None = None
+    deepseek_protocol: Literal["auto", "chat", "responses"] = "auto"
     qwen_embedding_base_url: str
     qwen_api_key: SecretStr | None = None
-    mem0_enabled: bool = False
+    mem0_enabled: bool = True
     mem0_collection: str = "agent_memories_v1"
     mem0_embedding_base_url: str | None = None
     mem0_embedding_api_key: SecretStr | None = None

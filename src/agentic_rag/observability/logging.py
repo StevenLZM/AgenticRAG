@@ -73,8 +73,20 @@ _NUMERIC_ATTRIBUTES = frozenset(
         "repair_count",
         "attempts",
         "latency_ms",
+        "output_length",
     }
 )
+_MODEL_TEXT_ATTRIBUTES = frozenset(
+    {
+        "schema_name",
+        "protocol",
+        "requested_model",
+        "actual_model",
+        "error_class",
+        "output_sha256",
+    }
+)
+_SAFE_MODEL_TEXT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 @dataclass(slots=True)
@@ -184,6 +196,12 @@ def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
             result[key] = value
         elif key == "degraded_components" and _safe_components(value):
             result[key] = list(value)
+        elif (
+            key in _MODEL_TEXT_ATTRIBUTES
+            and isinstance(value, str)
+            and _SAFE_MODEL_TEXT.fullmatch(value)
+        ):
+            result[key] = value
     return result
 
 
@@ -360,6 +378,7 @@ async def emit_degradation(
     retryable: bool,
     outcome: Literal["degraded", "refused", "dlq"],
     event_type: str | None = None,
+    attributes: Mapping[str, Any] | None = None,
 ) -> None:
     """Emit one bounded signal for a fallback, refusal, or circuit outcome.
 
@@ -431,6 +450,7 @@ async def emit_degradation(
                 "reason": safe_reason,
                 "retryable": safe_retryable,
                 "outcome": safe_outcome,
+                **sanitize_attributes(attributes),
             },
         )
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):

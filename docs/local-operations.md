@@ -30,9 +30,23 @@ Stream，通过租约领取/重新领取消息，在图运行期间发送心跳�
 `RETRIEVAL_DEGRADED`、`CIRCUIT_OPEN`、`COMPONENT_DEGRADED`、`OUTBOX_RETRY` 或
 `WORKER_DLQ`；事件只包含白名单中的 component/reason/outcome/attempt 字段。SSE 会暴露相同的运行事件名称，但始终脱敏原始 prompt、记忆文本、隐藏推理、工具载荷和服务提供方响应。熔断打开或服务降级时，API 也会明确保留 `retryable`/`degraded_components` 字段。
 
+## DeepSeek 结构化调用与故障诊断
+
+`ModelGateway` 是唯一的 DeepSeek 重试和 schema repair 边界。`AGENTIC_RAG_DEEPSEEK_PROTOCOL=auto` 时，如果客户端同时暴露两种接口，优先使用 Chat Completions；只有明确设置 `responses` 才使用 Responses API。结构化调用会请求 JSON object，但最终仍必须通过应用的 Pydantic schema；Markdown JSON 围栏只会被移除，不会放宽字段、枚举、证据 ID 或非空约束。
+
+常见信号含义如下：
+
+- `provider_outage`：超时、连接错误、429 或 5xx，网关按上限重试。
+- `model_unavailable`：瞬态故障耗尽重试次数，查询进入明确降级/拒答路径。
+- `protocol_error`：选择的 Chat/Responses 接口不可用或协议参数不被客户端支持，不会伪装成网络重试。
+- `model_schema_invalid`：供应商返回了内容，但一次 repair 后仍不符合节点 schema；系统 fail-closed。
+- `circuit_open`：连续失败触发熔断，后续调用在冷却窗口内快速失败。
+
+模型诊断事件只保留 schema 名、协议、请求/实际模型、attempt、错误类型、输出长度和输出 SHA-256，不保存 prompt、隐藏推理、原始工具载荷或原始模型响应。排查时先按 `snapshot_id`、`event_type` 和 `reason` 聚合，不要把 repair 内容复制到日志或工单。
+
 ## Mem0 长期记忆
 
-默认关闭 Mem0，使本地 Query API 在没有可选服务提供方时也能启动。只有在 `agentic-rag` Conda 环境中安装 `mem0ai==2.0.12` 并提供 Elasticsearch 认证方式后，才启用 Mem0。应用负责维护用户命名空间，调用 Mem0 时使用 `infer=False`，并在写入持久化事实前先执行轻量模型抽取：
+Mem0 默认启用。请在 `agentic-rag` Conda 环境中安装 `mem0ai==2.0.12`。应用负责维护用户命名空间，调用 Mem0 时使用 `infer=False`，并在写入持久化事实前先执行轻量模型抽取。Mem0 embedding 优先读取专用变量；没有专用变量时自动复用 Qwen embedding 的 URL 和密钥：
 
 ```dotenv
 AGENTIC_RAG_MEM0_ENABLED=1
@@ -44,7 +58,9 @@ AGENTIC_RAG_MEM0_ELASTICSEARCH_API_KEY=<es-api-key>
 AGENTIC_RAG_MEM0_HISTORY_DB_PATH=var/mem0/history.db
 ```
 
-如果要使用 Mem0 自己管理的 LLM（通常不需要，因为抽取由应用的 ModelGateway 完成），再设置 `AGENTIC_RAG_MEM0_LLM_ENABLED=1`，并同时设置 `AGENTIC_RAG_MEM0_LLM_MODEL`、`AGENTIC_RAG_MEM0_LLM_BASE_URL` 和 `AGENTIC_RAG_MEM0_LLM_API_KEY`。如果 Mem0 已启用但配置或服务提供方构造失败，API 会保持记忆降级，`/health/ready` 报告 `memory=unavailable`，并写入有界的 `memory_provider_degraded` 日志；查询证据和租户隔离不会因此放宽。
+本地 Elasticsearch（`localhost`、`127.0.0.1` 或 `::1`）可以不设置认证；远程 Elasticsearch 必须设置 API key 或用户名/密码。显式的 `AGENTIC_RAG_MEM0_EMBEDDING_BASE_URL` 和 `AGENTIC_RAG_MEM0_EMBEDDING_API_KEY` 会覆盖 Qwen fallback。若要临时关闭 Mem0 进行故障隔离，可设置 `AGENTIC_RAG_MEM0_ENABLED=0`；这会把记忆标记为 disabled，而不是伪装成可用。
+
+如果要使用 Mem0 自己管理的 LLM（通常不需要，因为抽取由应用的 ModelGateway 完成），再设置 `AGENTIC_RAG_MEM0_LLM_ENABLED=1`，并同时设置 `AGENTIC_RAG_MEM0_LLM_MODEL`、`AGENTIC_RAG_MEM0_LLM_BASE_URL` 和 `AGENTIC_RAG_MEM0_LLM_API_KEY`。如果 Mem0 已启用但安装、配置或服务提供方构造失败，查询 API 仍可继续运行，但会明确进入 memory degraded 状态：`/health/ready` 报告 `memory=unavailable`，并写入包含 `component=mem0`、`reason`、`outcome=degraded`、`retryable` 的有界 `memory_provider_degraded` 日志。查询证据、审计和租户隔离不会因此放宽；`GET/DELETE /v1/memories` 会返回记忆服务不可用，而不是返回空的成功结果。
 
 真实服务提供方合约测试只能使用明确指定的临时命名空间。缺少变量时测试会跳过；已配置但服务提供方不健康时测试会失败：
 

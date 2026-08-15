@@ -1,8 +1,8 @@
 """Production Mem0 composition and fail-closed memory fallback.
 
-The application imports Mem0 only when the setting explicitly enables it.  This
-keeps local/unit startup independent of the optional provider while making a
-misconfigured enabled provider visible through readiness and structured logs.
+Mem0 is enabled by default, while a missing optional provider or invalid
+configuration remains visible through readiness and structured logs. Query
+execution can continue with an explicitly degraded memory boundary.
 """
 
 from __future__ import annotations
@@ -117,10 +117,13 @@ def build_mem0_config(settings: object) -> dict[str, object]:
     except ValueError as error:
         raise MemoryCompositionError("elasticsearch_url has an invalid port") from error
 
-    embedder_base_url = _required_string(settings, "mem0_embedding_base_url")
-    embedder_api_key = _credential(
-        getattr(settings, "mem0_embedding_api_key", None),
-        "mem0_embedding_api_key",
+    embedder_base_url = _first_required_string(
+        settings, "mem0_embedding_base_url", "qwen_embedding_base_url"
+    )
+    embedder_api_key = _first_credential(
+        settings,
+        ("mem0_embedding_api_key", "qwen_api_key"),
+        "mem0_embedding_api_key or qwen_api_key",
     )
     embedding_model = _required_string(settings, "mem0_embedding_model")
     dimensions = getattr(settings, "embedding_dimensions", 1024)
@@ -154,7 +157,7 @@ def build_mem0_config(settings: object) -> dict[str, object]:
     elif es_user and es_password:
         vector_config["user"] = es_user
         vector_config["password"] = es_password
-    else:
+    elif not _is_loopback_host(parsed.hostname):
         raise MemoryCompositionError(
             "Mem0 Elasticsearch authentication is required (API key or user/password)"
         )
@@ -304,6 +307,22 @@ def _required_string(settings: object, name: str) -> str:
     return value
 
 
+def _first_required_string(settings: object, *names: str) -> str:
+    for name in names:
+        value = _optional_string(getattr(settings, name, None))
+        if value and not value.startswith("replace-with-"):
+            return value
+    raise MemoryCompositionError(" or ".join(names) + " is required")
+
+
+def _first_credential(settings: object, names: tuple[str, ...], label: str) -> str:
+    for name in names:
+        value = _credential(getattr(settings, name, None), name, required=False)
+        if value:
+            return value
+    raise MemoryCompositionError(f"{label} is required")
+
+
 def _credential(value: object, name: str, *, required: bool = True) -> str | None:
     if value is None:
         if required:
@@ -319,6 +338,14 @@ def _credential(value: object, name: str, *, required: bool = True) -> str | Non
 
 def _optional_string(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    return (hostname or "").strip().lower().strip("[]") in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
 
 
 def _close_sync(resource: object) -> None:

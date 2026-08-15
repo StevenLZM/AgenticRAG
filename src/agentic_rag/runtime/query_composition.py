@@ -106,6 +106,7 @@ def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
         prompt_hashes=tuple(sorted(hashes.items())),
         main_model_id=settings.main_model,
         light_model_id=settings.light_model,
+        deepseek_protocol=settings.deepseek_protocol,
         embedding_model=settings.embedding_model,
         embedding_dimensions=1024,
         reranker_version=settings.reranker_model,

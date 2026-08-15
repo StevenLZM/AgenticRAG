@@ -59,6 +59,42 @@ def test_mem0_config_contains_scoped_elasticsearch_and_qwen_embedding() -> None:
     assert "llm" not in config or config["llm"]["config"].get("api_key") is None
 
 
+def test_mem0_config_falls_back_to_qwen_embedding_and_allows_loopback_without_auth() -> None:
+    from agentic_rag.memory.factory import build_mem0_config
+
+    settings = _settings(
+        mem0_embedding_base_url=None,
+        mem0_embedding_api_key=None,
+        qwen_embedding_base_url="https://qwen.example/v1",
+        qwen_api_key="qwen-fallback-key",
+        mem0_elasticsearch_api_key=None,
+        mem0_elasticsearch_user=None,
+        mem0_elasticsearch_password=None,
+        elasticsearch_url="http://localhost:9200",
+    )
+
+    config = build_mem0_config(settings)
+
+    assert config["embedder"]["config"]["openai_base_url"] == "https://qwen.example/v1"
+    assert config["embedder"]["config"]["api_key"] == "qwen-fallback-key"
+    assert "api_key" not in config["vector_store"]["config"]
+    assert "user" not in config["vector_store"]["config"]
+
+
+def test_mem0_config_rejects_unauthenticated_remote_elasticsearch() -> None:
+    from agentic_rag.memory.factory import MemoryCompositionError, build_mem0_config
+
+    settings = _settings(
+        mem0_elasticsearch_api_key=None,
+        mem0_elasticsearch_user=None,
+        mem0_elasticsearch_password=None,
+        elasticsearch_url="https://search.example:9243",
+    )
+
+    with pytest.raises(MemoryCompositionError, match="authentication"):
+        build_mem0_config(settings)
+
+
 @pytest.mark.asyncio
 async def test_disabled_mem0_returns_degraded_service_without_provider_import() -> None:
     from agentic_rag.memory.factory import build_memory_service

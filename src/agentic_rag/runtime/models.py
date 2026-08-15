@@ -22,6 +22,7 @@ class RuntimeConfigSnapshot(BaseModel):
     prompt_hashes: PromptHashes = ()
     main_model_id: str
     light_model_id: str
+    deepseek_protocol: Literal["auto", "chat", "responses"] = "auto"
     embedding_model: str
     embedding_dimensions: Literal[1024]
     reranker_version: str

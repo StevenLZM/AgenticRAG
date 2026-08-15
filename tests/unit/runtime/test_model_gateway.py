@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 
 import pytest
@@ -11,6 +12,7 @@ from agentic_rag.models.schemas import RouteDecision
 from agentic_rag.runtime.model_gateway import (
     ModelCall,
     ModelGateway,
+    StructuredOutputValidationError,
     load_prompt,
     prompt_hashes,
 )
@@ -93,6 +95,22 @@ class FakeChatClient:
         )()
 
 
+class DualProtocolClient(FakeChatClient):
+    def __init__(self, chat_values: list[object], response_values: list[object]) -> None:
+        super().__init__(chat_values)
+        self.responses = FakeResponsesApi(response_values)
+
+
+@dataclass
+class DiagnosticEmitter:
+    runtime_config_snapshot_id: str
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def emit(self, **kwargs: object) -> int:
+        self.calls.append(dict(kwargs))
+        return len(self.calls)
+
+
 class APIConnectionError(Exception):
     """A transport-shaped SDK error that does not inherit ConnectionError."""
 
@@ -170,6 +188,81 @@ async def test_gateway_supports_an_injected_chat_completions_client() -> None:
 
     assert result.value == "chat response"
     assert result.actual_model == "chat-model"
+
+
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+async def test_gateway_explicit_protocol_selects_requested_api(protocol: str) -> None:
+    client = DualProtocolClient(
+        ["chat response"],
+        ["responses response"],
+    )
+    call = ROUTE_CALL.model_copy(update={"protocol": protocol})
+
+    result = await ModelGateway(client, sleep=lambda _: _no_sleep()).complete(call)
+
+    expected = "chat response" if protocol == "chat" else "responses response"
+    assert result.value == expected
+    assert len(client.chat.completions.calls) == (1 if protocol == "chat" else 0)
+    assert len(client.responses.calls) == (1 if protocol == "responses" else 0)
+
+
+async def test_gateway_auto_prefers_chat_when_both_protocols_are_available() -> None:
+    client = DualProtocolClient(["chat response"], ["responses response"])
+
+    result = await ModelGateway(client, sleep=lambda _: _no_sleep()).complete(ROUTE_CALL)
+
+    assert result.value == "chat response"
+    assert len(client.chat.completions.calls) == 1
+    assert len(client.responses.calls) == 0
+
+
+async def test_structured_chat_call_requests_json_object() -> None:
+    client = DualProtocolClient(
+        ['{"route":"fast_rag","normalized_query":"q","reason_code":"simple"}'],
+        ["unused"],
+    )
+    call = ROUTE_CALL.model_copy(update={"protocol": "chat"})
+
+    await ModelGateway(client, sleep=lambda _: _no_sleep()).complete_structured(
+        call, RouteDecision
+    )
+
+    assert client.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
+
+
+async def test_structured_call_accepts_a_single_json_markdown_fence() -> None:
+    client = FakeClient(
+        [
+            '```json\n{"route":"fast_rag","normalized_query":"q","reason_code":"simple"}\n```'
+        ]
+    )
+
+    result = await ModelGateway(client, sleep=lambda _: _no_sleep()).complete_structured(
+        ROUTE_CALL, RouteDecision
+    )
+
+    assert result.value.route == "fast_rag"
+    assert result.attempts == 1
+
+
+async def test_schema_exhaustion_diagnostic_contains_only_safe_metadata() -> None:
+    raw_output = "private prompt and hidden reasoning"
+    client = FakeClient([raw_output, raw_output])
+    emitter = DiagnosticEmitter(SNAPSHOT.snapshot_id)
+
+    from agentic_rag.observability.logging import event_emission_scope
+
+    with pytest.raises(StructuredOutputValidationError):
+        async with event_emission_scope(emitter, "run-1", "answer", user_id="user-1"):
+            await ModelGateway(client, sleep=lambda _: _no_sleep()).complete_structured(
+                ROUTE_CALL, RouteDecision
+            )
+
+    diagnostic = next(item for item in emitter.calls if item["event_type"] == "MODEL_REPAIR_EXHAUSTED")
+    assert diagnostic["attributes"]["schema_name"] == "RouteDecision"
+    assert diagnostic["attributes"]["output_length"] == len(raw_output)
+    assert diagnostic["attributes"]["output_sha256"]
+    assert raw_output not in json.dumps(diagnostic, ensure_ascii=False)
 
 
 @pytest.mark.parametrize(
