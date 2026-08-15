@@ -1,14 +1,14 @@
-# Local operations
+# 本地运行手册
 
-These procedures operate only on this local V1 installation. Load local configuration before every command:
+以下流程仅适用于本地 V1 部署。每次执行命令前先加载本地配置：
 
 ```sh
 set -a; source .env.local; set +a
 ```
 
-## Start and upgrade
+## 启动与升级
 
-Start dependencies in this order: Elasticsearch, MySQL, then Redis. Confirm all three are local endpoints, then apply migrations and start processes in the following order:
+按以下顺序启动依赖：Elasticsearch、MySQL、Redis。确认三者都指向本地端点后，再按以下顺序执行迁移并启动进程：
 
 ```sh
 conda run -n agentic-rag python scripts/check_local_dependencies.py
@@ -18,35 +18,21 @@ conda run -n agentic-rag python scripts/run_query_worker.py
 conda run -n agentic-rag python scripts/run_ingestion_worker.py
 ```
 
-The API is live at `/health/live`; use `/health/ready` only after all dependencies report `available`. For an upgrade, stop workers first, let the current graph node reach its SQLite checkpoint, apply the migration, and restart in the same order.
+API 启动后可访问 `/health/live`；只有在所有依赖都报告 `available` 后，才使用 `/health/ready`。升级时先停止 Worker，等待当前图节点到达 SQLite checkpoint，再执行迁移，并按相同顺序重新启动。
 
-## Query Outbox and Query Worker
+## Query Outbox 与 Query Worker
 
-`POST /v1/query-runs` writes the durable Run and its `query_run` Outbox row in
-one MySQL transaction. The Query Worker dispatches only `query_run` rows to the
-Query Redis Stream, claims/reclaims deliveries with a lease, heartbeats while a
-graph is running, and ACKs only after the audited answer (or a terminal business
-refusal) is persisted. Redis publication failures remain retryable; repeated
-failures enter the bounded retry/DLQ path. This prevents a committed request
-from disappearing between MySQL and Redis and lets a restarted worker resume
-without creating a second Run.
+`POST /v1/query-runs` 会在同一个 MySQL 事务中写入持久化 Run 和
+`query_run` Outbox 行。Query Worker 只把 `query_run` 行分发到 Query Redis
+Stream，通过租约领取/重新领取消息，在图运行期间发送心跳，并且只在审计后的答案（或终态业务拒答）持久化之后 ACK。Redis 发布失败会保留为可重试状态；连续失败后进入有界重试/DLQ 流程。这样可以避免请求已提交但任务在 MySQL 与 Redis 之间丢失，并允许重启后的 Worker 继续处理而不创建第二个 Run。
 
-Every fallback boundary is observable. The process logger emits a bounded
-warning and the event repository receives a safe durable event such as
-`RETRIEVAL_DEGRADED`, `CIRCUIT_OPEN`, `COMPONENT_DEGRADED`, `OUTBOX_RETRY` or
-`WORKER_DLQ`; events contain only allowlisted component/reason/outcome/attempt
-fields. SSE exposes the same operational event names, while raw prompts,
-memory text, hidden reasoning, tool payloads and provider responses are always
-redacted. A circuit-open or degraded response also keeps the API's
-`retryable`/`degraded_components` fields explicit.
+所有降级边界都会产生可观察信号。进程日志会写入有界警告，事件仓储会写入安全的持久化事件，例如
+`RETRIEVAL_DEGRADED`、`CIRCUIT_OPEN`、`COMPONENT_DEGRADED`、`OUTBOX_RETRY` 或
+`WORKER_DLQ`；事件只包含白名单中的 component/reason/outcome/attempt 字段。SSE 会暴露相同的运行事件名称，但始终脱敏原始 prompt、记忆文本、隐藏推理、工具载荷和服务提供方响应。熔断打开或服务降级时，API 也会明确保留 `retryable`/`degraded_components` 字段。
 
-## Mem0 long-term memory
+## Mem0 长期记忆
 
-Mem0 is disabled by default so a local Query API can start without the optional
-provider. Enable it only after installing `mem0ai==2.0.12` in the `agentic-rag`
-Conda environment and supplying an Elasticsearch authentication method. The
-application owns the user namespace, calls Mem0 with `infer=False`, and uses
-the light-model extractor before writing durable facts:
+默认关闭 Mem0，使本地 Query API 在没有可选服务提供方时也能启动。只有在 `agentic-rag` Conda 环境中安装 `mem0ai==2.0.12` 并提供 Elasticsearch 认证方式后，才启用 Mem0。应用负责维护用户命名空间，调用 Mem0 时使用 `infer=False`，并在写入持久化事实前先执行轻量模型抽取：
 
 ```dotenv
 AGENTIC_RAG_MEM0_ENABLED=1
@@ -58,17 +44,9 @@ AGENTIC_RAG_MEM0_ELASTICSEARCH_API_KEY=<es-api-key>
 AGENTIC_RAG_MEM0_HISTORY_DB_PATH=var/mem0/history.db
 ```
 
-For a Mem0-managed LLM (normally unnecessary because extraction remains an
-application ModelGateway call), set `AGENTIC_RAG_MEM0_LLM_ENABLED=1` together
-with `AGENTIC_RAG_MEM0_LLM_MODEL`, `AGENTIC_RAG_MEM0_LLM_BASE_URL`, and
-`AGENTIC_RAG_MEM0_LLM_API_KEY`. If Mem0 is enabled but its configuration or
-provider construction fails, the API keeps memory degraded, `/health/ready`
-reports `memory=unavailable`, and a bounded `memory_provider_degraded` log is
-emitted; query evidence and tenant isolation do not silently broaden.
+如果要使用 Mem0 自己管理的 LLM（通常不需要，因为抽取由应用的 ModelGateway 完成），再设置 `AGENTIC_RAG_MEM0_LLM_ENABLED=1`，并同时设置 `AGENTIC_RAG_MEM0_LLM_MODEL`、`AGENTIC_RAG_MEM0_LLM_BASE_URL` 和 `AGENTIC_RAG_MEM0_LLM_API_KEY`。如果 Mem0 已启用但配置或服务提供方构造失败，API 会保持记忆降级，`/health/ready` 报告 `memory=unavailable`，并写入有界的 `memory_provider_degraded` 日志；查询证据和租户隔离不会因此放宽。
 
-Run the real provider contract only with an explicit disposable namespace. It
-skips when variables are absent and fails when a configured provider is
-unhealthy:
+真实服务提供方合约测试只能使用明确指定的临时命名空间。缺少变量时测试会跳过；已配置但服务提供方不健康时测试会失败：
 
 ```sh
 export AGENTIC_RAG_TEST_MEM0_ENABLED=1
@@ -81,34 +59,33 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
   tests/e2e/test_mem0_real_services.py -q -s
 ```
 
-## Graceful stop and recovery work
+## 优雅停止与故障恢复
 
-Send `SIGTERM` to the API and workers. The API immediately refuses new work and allows in-flight HTTP work to drain for the configured grace period. Worker graph state is stored in the configured query and ingestion SQLite checkpoint files; restarting the one-worker processes resumes recoverable work. Do not kill or copy an open checkpoint database.
+向 API 和 Worker 发送 `SIGTERM`。API 会立即拒绝新任务，并在配置的优雅退出时间内等待正在执行的 HTTP 请求完成。Worker 的图状态保存在配置的 query 与 ingestion SQLite checkpoint 文件中；重启两个单 Worker 进程后会继续处理可恢复任务。不要强制杀死进程，也不要复制处于打开状态的 checkpoint 数据库。
 
-Review quarantined versions before any retry:
+任何重试前都要先检查隔离区中的版本：
 
 ```sh
 conda run -n agentic-rag python scripts/review_quarantined_version.py --help
 ```
 
-Inspect the Redis dead stream and retry only a failed Run/Job after its cause is fixed. Retries are idempotent: never manually acknowledge a pending message merely to clear it, and do not retry a completed Run/Job.
+检查 Redis dead stream（死信流）；只有在故障原因修复后，才重试失败的 Run/Job。重试具有幂等性：不要为了清空 pending 消息而手动 ACK，也不要重试已经完成的 Run/Job。
 
-## Backup
+## 备份
 
-Stop API and workers cleanly before taking a backup. The default command backs up only local SQLite checkpoints and Artifacts; it refuses an existing output path, checkpoints SQLite WAL state through SQLite's backup API, records app/schema/index generations, writes a canonical hash manifest, and verifies every file hash. The manifest is integrity-hashed, not a cryptographic signature; store backups on trusted/permissioned media.
+备份前先干净地停止 API 和 Worker。默认命令只备份本地 SQLite checkpoint 与 Artifact；如果输出路径已存在会拒绝执行，随后通过 SQLite backup API 固化 WAL 状态，记录应用/架构/索引代际，写入规范化哈希清单，并校验每个文件的哈希。清单使用完整性哈希而非加密签名；请把备份保存到受信任且权限受控的介质上。
 
 ```sh
 conda run -n agentic-rag python scripts/backup_local.py --output var/backups/backup-001
 ```
 
-To include the configured MySQL database and active Elasticsearch generation, use the explicit service flag. This performs a `mysqldump --single-transaction` and an Elasticsearch export of the controlled index, aliases, and templates.
+如需包含配置中的 MySQL 数据库和当前 Elasticsearch 代际，使用显式服务开关。该命令会执行 `mysqldump --single-transaction`，并导出受控索引、别名和模板：
 
 ```sh
 conda run -n agentic-rag python scripts/backup_local.py --output var/backups/backup-001 --include-services
 ```
 
-To include Redis, supply one explicit key namespace. The backup never scans
-the whole configured Redis database:
+如需包含 Redis，请提供一个明确的键命名空间。备份不会扫描配置 Redis 数据库中的全部键：
 
 ```sh
 conda run -n agentic-rag python scripts/backup_local.py \
@@ -116,18 +93,18 @@ conda run -n agentic-rag python scripts/backup_local.py \
   --redis-key-prefix 'agentic-rag:backup:'
 ```
 
-Keep at least three verified backups on separate local media. Test each backup with a restore drill before deleting an older backup. The backup directory is immutable operational evidence: never edit its manifest, hash file, dump, or exports.
+至少在不同本地介质上保留三份已验证的备份。删除旧备份前，先对每份备份执行恢复演练。备份目录属于不可变的运维证据：不要编辑 manifest、哈希文件、dump 或导出文件。
 
-## Restore and Elasticsearch rollback
+## 恢复与 Elasticsearch 回滚
 
-Restore only into a path that does not yet exist. The restore verifies the hash manifest and every content hash before it creates the target and publishes the target atomically. It never replaces an existing directory.
+只能恢复到不存在的路径。恢复流程会在创建目标并原子发布之前，校验哈希清单和每个内容哈希；不会替换已存在的目录。
 
 ```sh
 conda run -n agentic-rag python scripts/restore_local.py \
   --backup var/backups/backup-001 --target var/restore-drill/backup-001
 ```
 
-A backup that includes service state requires deliberately supplied, empty service targets. The MySQL target must be a separate empty database; Elasticsearch must use a fresh index generation. The command refuses a non-empty MySQL database or existing target index, imports the dump, runs Alembic migrations, restores and verifies the target index/template/alias, and leaves the active production generation unchanged.
+包含服务状态的备份必须显式提供空的服务目标。MySQL 目标必须是独立的空数据库；Elasticsearch 必须使用新的索引代际。命令会拒绝非空 MySQL 数据库或已存在的目标索引，导入 dump，执行 Alembic 迁移，恢复并校验目标索引/模板/别名，同时保持生产当前代际不变。
 
 ```sh
 conda run -n agentic-rag python scripts/restore_local.py \
@@ -138,19 +115,13 @@ conda run -n agentic-rag python scripts/restore_local.py \
   --redis-key-prefix 'agentic-rag:restore:'
 ```
 
-When Redis is present in the backup, restore requires a distinct explicit
-target prefix. Keys are restored by remapping the source prefix to that target;
-the target namespace must be empty and is scanned before any write.
+如果备份包含 Redis，恢复必须提供不同的明确目标前缀。恢复会把源前缀映射到目标前缀；写入前会扫描并确认目标命名空间为空。
 
-To roll back search, point the controlled active alias to the previous verified generation only after checking that generation's mapping and document count. Do not delete the current index until the rollback has passed readiness and a query smoke test.
+要回滚搜索，只有在检查目标代际的映射和文档数量后，才把受控活动别名指向此前已验证的代际。在回滚通过就绪检查和查询冒烟测试前，不要删除当前索引。
 
-### Disposable real-service restore drill
+### 临时真实服务恢复演练
 
-The real-service test never guesses an admin DSN and never uses the configured
-`agentic_rag` database. Set an explicit MySQL admin DSN (with permission to
-create/drop only disposable test databases), a local Redis database, and the
-local Elasticsearch endpoint. Do not put the admin password in shell history
-or commit it:
+真实服务测试不会猜测 admin DSN，也不会使用配置中的 `agentic_rag` 数据库。设置一个明确的 MySQL admin DSN（仅允许创建/删除临时测试数据库）、一个本地 Redis 数据库和本地 Elasticsearch 端点。不要把 admin 密码写入 shell 历史或提交到仓库：
 
 ```sh
 set -a; source .env.local; set +a
@@ -162,15 +133,11 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
   tests/e2e/test_backup_restore.py -q -s
 ```
 
-The fixture generates random `agentic_rag_backup_*` and
-`agentic_rag_restore_*` databases, one generation/alias, and two Redis key
-prefixes for source-to-target remapping, then removes them in `finally`. If any
-explicit variable is missing, the real test skips rather than touching an
-inferred service target.
+固定测试会随机生成 `agentic_rag_backup_*` 和 `agentic_rag_restore_*` 数据库、一个代际/别名以及两个用于源到目标映射的 Redis 键前缀，并在 `finally` 中清理。如果缺少任一显式变量，真实测试会跳过，不会触碰推断出的服务目标。
 
-## Final gate
+## 最终门禁
 
-Run the final acceptance sequence with explicit opt-in infrastructure/model tests. `live_model` has no credential skip: selecting it with missing credentials is a failure. The real backup test requires generated isolated targets and must be enabled separately.
+使用显式开关执行最终验收序列，包括基础设施和模型测试。`live_model` 没有凭据缺失跳过逻辑：选择该标记但未提供凭据时必须失败。真实备份测试需要生成隔离目标，必须单独启用。
 
 ```sh
 conda run -n agentic-rag ruff check src tests evals scripts
@@ -182,10 +149,10 @@ AGENTIC_RAG_RUN_REAL_BACKUP_RESTORE=1 conda run -n agentic-rag python -m pytest 
 conda run -n agentic-rag python -m pytest -m live_model tests/smoke -q
 conda run -n agentic-rag python -m evals.run --mode fixture \
   --dataset evals/datasets/baseline.jsonl --output var/artifacts/evals/fixture
-# Final acceptance must use a runtime-snapshot-matched dataset and a real client:
+# 最终验收必须使用与运行时快照匹配的数据集和真实客户端：
 conda run -n agentic-rag python -m evals.run --mode graph \
   --dataset var/artifacts/evals/runtime-baseline.jsonl --output var/artifacts/evals/graph
-# Or evaluate a deployed API (set the snapshot ID used by the dataset):
+# 或评估已部署的 API（设置数据集使用的快照 ID）：
 AGENTIC_RAG_EVAL_SNAPSHOT_ID='<runtime snapshot id>' \
 conda run -n agentic-rag python -m evals.run --mode api \
   --base-url http://127.0.0.1:8000 \
@@ -195,10 +162,7 @@ conda run -n agentic-rag python scripts/verify_acceptance.py \
   --report var/artifacts/evals/graph/summary.json
 ```
 
-The release gate additionally requires evidence that the worker started, a
-real Graph/API query completed, Mem0 was available, and at least one safe
-degradation/circuit event was observed. Supply paths from the isolated release
-run; leave the command unselected during ordinary local tests:
+发布门禁还要求提供以下证据：Worker 已启动、真实 Graph/API 查询已完成、Mem0 可用，并且观测到至少一个安全的降级/熔断事件。请使用隔离发布运行生成的文件路径；普通本地测试不要设置这些变量：
 
 ```sh
 export AGENTIC_RAG_RELEASE_WORKER_STARTED=1
@@ -210,14 +174,4 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
   tests/e2e/test_release_query_gate.py -q
 ```
 
-The default `fixture` mode is an offline smoke test only and prints `SMOKE
-ONLY`; it can never satisfy final acceptance. Graph/API mode persists the real
-client provenance and rejects a case whose runtime snapshot differs from the
-composed QueryGraph/API Run. Prepare `runtime-baseline.jsonl` from the seeded
-documents and the current `RuntimeConfigSnapshot` rather than changing a
-dataset's snapshot ID after the fact. Run `verify_acceptance.py` against the
-Graph/API summary (not the fixture summary). The verifier returns failure
-unless leakage is zero, citation coverage is exactly 1.0, unaudited answers
-are zero, recovery and backup/restore drills pass, and `real_query_count` is
-positive. Ragas remains explicitly `unavailable` when no backend is
-configured; it never fabricates a score.
+默认的 `fixture` 模式仅用于离线冒烟测试，并会打印 `SMOKE ONLY`；它永远不能满足最终验收。Graph/API 模式会持久化真实客户端来源证明，并拒绝运行时快照与组合出的 QueryGraph/API Run 不一致的案例。请基于已播种的文档和当前 `RuntimeConfigSnapshot` 准备 `runtime-baseline.jsonl`，不要事后修改数据集的 snapshot ID。`verify_acceptance.py` 必须针对 Graph/API 摘要（而不是 fixture 摘要）运行。只要泄漏不为零、引用覆盖率不等于 1.0、存在未审计答案、恢复或备份演练失败，或 `real_query_count` 不为正数，验证器就会失败。未配置 Ragas 后端时，Ragas 会明确保持 `unavailable`，不会伪造分数。
