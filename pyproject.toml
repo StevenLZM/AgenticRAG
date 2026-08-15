@@ -49,4 +49,5 @@ where = ["src", "."]
 include = ["agentic_rag*", "evals*", "scripts*"]
 
 [tool.setuptools.package-data]
+agentic_rag = ["api/static/*"]
 evals = ["datasets/*.jsonl"]

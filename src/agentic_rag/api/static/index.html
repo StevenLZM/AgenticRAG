@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agentic RAG 控制台</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">AGENTIC RAG</p>
+        <h1>知识检索控制台</h1>
+      </div>
+      <div class="runtime-meta" aria-label="运行时配置">
+        <span>运行快照</span>
+        <code id="snapshot-id">加载中…</code>
+      </div>
+    </header>
+
+    <main class="console-grid">
+      <aside class="sidebar" aria-label="辅助工具">
+        <section class="panel">
+          <h2>运行状态</h2>
+          <div id="health-grid" class="health-grid" aria-live="polite"></div>
+        </section>
+
+        <section class="panel">
+          <h2>文档入库</h2>
+          <form id="document-upload">
+            <label for="document-file">选择 PDF、文本或 Excel 文件</label>
+            <input id="document-file" name="file" type="file" required>
+            <button type="submit">上传并入库</button>
+          </form>
+          <p id="ingestion-status" class="muted" aria-live="polite">尚未上传文档</p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>Mem0 记忆</h2>
+            <button id="reload-memories" type="button" class="secondary">刷新</button>
+          </div>
+          <ul id="memory-list" class="record-list" aria-live="polite"></ul>
+        </section>
+      </aside>
+
+      <section class="workspace" aria-label="查询工作区">
+        <section id="degradation-banner" class="degradation-banner" hidden role="status"></section>
+        <section class="panel query-panel">
+          <h2>提问</h2>
+          <form id="query-form">
+            <label class="sr-only" for="query-input">问题</label>
+            <textarea id="query-input" rows="4" maxlength="32000" placeholder="请输入需要在知识库中检索的问题" required></textarea>
+            <div class="query-actions">
+              <button type="submit">开始检索</button>
+              <button id="cancel-run" type="button" class="secondary" disabled>取消当前任务</button>
+              <span id="run-status" class="muted" aria-live="polite">等待提问</span>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel">
+          <h2>执行时间线</h2>
+          <ol id="timeline" class="timeline" aria-live="polite"></ol>
+        </section>
+
+        <section class="panel">
+          <h2>回答</h2>
+          <div id="answer" class="answer" aria-live="polite">检索结果将在此显示。</div>
+        </section>
+      </section>
+
+      <aside class="details" aria-label="证据与审计信息">
+        <section class="panel">
+          <h2>证据</h2>
+          <div id="evidence" class="detail-content">等待可引用证据。</div>
+        </section>
+        <section class="panel">
+          <h2>审计</h2>
+          <div id="audit" class="detail-content">回答完成后展示审计状态。</div>
+        </section>
+        <section class="panel">
+          <h2>溯源</h2>
+          <div id="provenance" class="detail-content">仅展示服务端响应中提供的溯源信息。</div>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
