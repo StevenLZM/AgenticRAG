@@ -13,7 +13,7 @@
 - 实现分支：`sdd-agentic-rag-implementation`
 - 分支基线：`main@1e02fbb`
 - Phase 4 最终代码：`c3cf053 fix: preserve business terminal query outcomes`
-- 当前 follow-up 基线：`c1a501d feat: enable mem0 and harden deepseek structured calls`；本次真实验收脚本和边界修复尚未提交。
+- 当前 follow-up 最终提交：`8be939c feat: complete real query mem0 acceptance`；实现分支尚未合并到 `main`。
 - Conda 环境：`agentic-rag`
 
 `main` 尚未合并当前实现。继续开发前先进入实现 worktree，并确认工作树干净：
@@ -126,7 +126,7 @@ Task 5（Backup/Restore/Readiness/Final Acceptance）已完成：
 | 4 | `a4ececf` / `fa85aca` | Mem0 `AsyncMemory` 工厂、用户作用域/删除 tombstone、显式真实 provider 测试开关 |
 | 5 | `2bb7f25` | Graph/API 评测模式、真实 client provenance、严格断点续跑与 `verify_acceptance` 门禁 |
 | 6 | `67d492a` | 降级/熔断/重试/DLQ 的结构化 warning 与 durable event，安全字段 allowlist、指标去重 |
-| 7 | 本次提交 | 发布门禁测试、真实服务运行顺序、文档和最终验收快照 |
+| 7 | `8be939c` | 发布门禁测试、真实服务运行顺序、文档和最终验收快照 |
 
 这些 follow-up 共同回答了生产级系统的两个核心问题：Query Outbox 保证“数据库 Run 状态与待投递消息”在同一事务中可恢复；Query Worker 负责租约、重领取、心跳、重试/DLQ、取消和最终 ACK。任何降级、熔断或拒绝都会同时留下安全 warning 和可重放 durable event，API/SSE 只暴露有限枚举，不泄露 prompt、工具载荷、隐藏推理或服务提供方响应。
 
