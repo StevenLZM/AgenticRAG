@@ -17,10 +17,17 @@ from agentic_rag.query.audit import (
     FaithfulnessAuditor,
     ParentRepositoryAuthorizationResolver,
 )
-from agentic_rag.query.evidence_builder import EvidenceBuilder
+from agentic_rag.query.evidence_builder import EvidenceBuilder, PackedEvidence
 from agentic_rag.query.generation import AnswerGenerator
 from agentic_rag.query.graph import QueryGraphDependencies
 from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+from agentic_rag.query.subagents import (
+    ChildResearchState,
+    ChildWorker,
+    SubagentDispatcher,
+    SubagentTools,
+)
+from agentic_rag.query.tools import ResearchContext, ResearchToolset, RetrievalPort
 from agentic_rag.retrieval.adapters.elasticsearch import (
     ElasticsearchBm25Index,
     ElasticsearchVectorIndex,
@@ -29,7 +36,9 @@ from agentic_rag.retrieval.graph import RetrievalDependencies, RetrievalService
 from agentic_rag.retrieval.parents import ParentFetcher
 from agentic_rag.retrieval.reranker import Reranker
 from agentic_rag.runtime.model_gateway import ModelGateway, prompt_hashes
+from agentic_rag.runtime.concurrency import ConcurrencyManager
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
+from agentic_rag.domain.models import UserScope
 from agentic_rag.observability.logging import AgentEventEmitter
 from agentic_rag.observability.tracing import TraceRecorder
 
@@ -122,11 +131,43 @@ def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
     )
 
 
+def build_subagent_dispatcher(
+    *,
+    retrieval: RetrievalPort,
+    evidence_builder: EvidenceBuilder,
+    snapshot: RuntimeConfigSnapshot,
+    concurrency: ConcurrencyManager,
+) -> SubagentDispatcher:
+    """Compose bounded children that inherit only server-owned query context."""
+    tools = ResearchToolset(retrieval, evidence_builder)
+
+    async def child_worker(
+        child: ChildResearchState,
+        child_tools: SubagentTools,
+    ) -> PackedEvidence:
+        child_scope = UserScope.model_validate(dict(child.scope))
+        context = ResearchContext(scope=child_scope, snapshot=snapshot)
+        return await child_tools.retrieve_evidence(
+            query=child.question,
+            context=context,
+            target_id=child.todo_id,
+        )
+
+    return SubagentDispatcher(
+        tools=tools,
+        concurrency=concurrency,
+        worker=cast(ChildWorker, child_worker),
+        memory_summary="",
+        evidence_manifest={},
+    )
+
+
 async def build_query_dependencies(
     container: object,
     settings: Settings,
     *,
     child_index: str | None = None,
+    concurrency: ConcurrencyManager | None = None,
 ) -> QueryGraphDependencies:
     """Build all process-owned QueryGraph collaborators from one snapshot."""
     deepseek_key = _credential(settings.deepseek_api_key, "AGENTIC_RAG_DEEPSEEK_API_KEY")
@@ -139,6 +180,12 @@ async def build_query_dependencies(
         ) from error
 
     snapshot = build_query_snapshot(settings)
+    shared_concurrency = concurrency or ConcurrencyManager(
+        run_limit=settings.max_concurrent_query_runs,
+        llm_limit=settings.max_concurrent_llm_calls,
+        reranker_limit=settings.max_concurrent_reranks,
+        per_run_subagent_limit=snapshot.max_parallel_subagents_per_run,
+    )
     elasticsearch = getattr(container, "elasticsearch", None)
     repositories = getattr(container, "repositories", None)
     artifacts = getattr(container, "artifacts", None)
@@ -180,11 +227,18 @@ async def build_query_dependencies(
             )
         )
         evidence_builder = EvidenceBuilder()
+        subagents = build_subagent_dispatcher(
+            retrieval=retrieval,
+            evidence_builder=evidence_builder,
+            snapshot=snapshot,
+            concurrency=shared_concurrency,
+        )
         research_loop = ResearchAgentLoop(
             ResearchLoopDependencies(
                 gateway=gateway,
                 retrieval=retrieval,
                 evidence_builder=evidence_builder,
+                subagents=subagents,
             )
         )
         emitter = AgentEventEmitter(
@@ -206,6 +260,7 @@ async def build_query_dependencies(
             event_repository=event_repository,
             trace_recorder=TraceRecorder(runtime_config_snapshot_id=snapshot.snapshot_id),
             event_emitter=emitter,
+            concurrency=shared_concurrency,
             owned_resources=(deepseek, qwen, reranker),
         )
         return dependencies
@@ -232,6 +287,7 @@ async def close_query_dependencies(dependencies: QueryGraphDependencies) -> None
 __all__ = [
     "QueryCompositionError",
     "build_query_snapshot",
+    "build_subagent_dispatcher",
     "build_query_dependencies",
     "close_query_dependencies",
 ]

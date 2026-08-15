@@ -48,6 +48,7 @@ from agentic_rag.query.router import MemoryContextLoader, route_query
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.retrieval.graph import RetrievalService
 from agentic_rag.retrieval.models import EvidenceBatch
+from agentic_rag.runtime.concurrency import ConcurrencyManager
 from agentic_rag.runtime.model_gateway import ModelGateway
 
 
@@ -74,6 +75,7 @@ class QueryGraphDependencies:
     event_repository: EventRepository | QueryGraphEventRecorder | None = None
     trace_recorder: TraceRecorder | None = None
     event_emitter: AgentEventEmitter | None = None
+    concurrency: ConcurrencyManager | None = None
     owned_resources: tuple[object, ...] = ()
 
 

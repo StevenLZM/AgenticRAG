@@ -29,6 +29,7 @@ from agentic_rag.persistence.repositories import (  # noqa: E402
     SqlAlchemyOutboxRepository,
 )
 from agentic_rag.query.graph import QueryGraphDependencies  # noqa: E402
+from agentic_rag.runtime.concurrency import ConcurrencyManager  # noqa: E402
 from agentic_rag.runtime.query_worker import (  # noqa: E402
     QueryWorker,
     build_graph_factory,
@@ -84,12 +85,14 @@ async def run(
     dependencies: QueryGraphDependencies | None = None
     try:
         dependencies = await dependencies_factory(container, settings)
+        shared_concurrency = dependencies.concurrency or ConcurrencyManager()
         async with container.checkpoints.open_query() as checkpointer:
             worker = QueryWorker(
                 runs=TransactionalRunRepository(container.repositories.session_factory),
                 broker=container.broker,
                 graph_factory=build_graph_factory(dependencies, checkpointer),
                 worker_id=f"{socket.gethostname()}:{os.getpid()}",
+                concurrency=shared_concurrency,
                 trace_recorder=dependencies.trace_recorder,
                 event_emitter=dependencies.event_emitter,
                 outbox_dispatcher=OutboxDispatcher(
