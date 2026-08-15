@@ -211,18 +211,26 @@ Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/
 - 当前 V1 只有 `user_id` 命名空间隔离，没有完整鉴权、RBAC 或用户身份解析；生产入口不能继续依赖 `default_user`。
 - Mem0 默认启用；初始化或运行时 provider 故障只允许 memory 降级，并必须留下 `memory_provider_degraded` 日志/事件，`/health/ready` 保持不就绪，不能把 no-op 结果当作生产记忆。
 - 本地 Elasticsearch、MySQL、Redis 和 Mem0 已用隔离资源完成联调；真实 Graph/API 验收使用当前 snapshot 与真实 client provenance，fixture 结果仍不能替代生产验收。
-- 当前实现仍在 `sdd-agentic-rag-implementation`，合并到 `main` 前需进行一次分支级回归和发布审查。
+- 当前实现已合并到 `main`；后续功能开发必须先解决以下 Query Runtime 缺口，再把页面验收接入真实 Graph/API 门禁。
+
+### Query Runtime 待解决问题
+
+1. **子 Agent 尚未接入生产组合根。** `ResearchAgentLoop` 已定义 `delegate_research`，但生产依赖组合仍未注入 `SubagentDispatcher`（见 `src/agentic_rag/runtime/query_composition.py`）；因此委派动作只能记录不可用/待处理状态，不能真正启动子 Agent。
+2. **正常链路不会创建 Todo。** `update_todos` 只能更新已有 Todo，不能从研究计划或初始问题创建 Todo；当前查询无法稳定完成“任务拆分 → 子任务委派 → 汇总证据”的完整链路。
+3. **研究轮数不是 Query 全局上限。** 当前四轮限制只约束一次 `ResearchAgentLoop` 调用；Research 提交证据后若 Grader 再次判定 insufficient，Graph 可能重新创建循环并将计数归零。现在主要依赖 Graph `recursion_limit=50` 和 Query 300 秒超时兜底。生产实现必须在 QueryState/Run 中增加全局 `research_attempt_count`，跨 Research 重入累计并持久化，超过上限后进入可观测的拒答或降级终态。
+
+这些问题在 Agentic RAG 控制台页面中必须可见：子 Agent 未接入、Todo 未创建、研究预算耗尽或检索/模型降级都要显示有限原因、是否可重试和对应 Run 事件，不能只显示“处理中”。
 
 ## 7. 下一次开发的准确起点
 
-Follow-up Task 7 已完成；下一步是分支级发布审查和合并，不应重新实现 Phase 1–5 或 Query Runtime follow-up。
+Follow-up Task 7 已完成并已合并到 `main`；下一步是先补齐上述 Query Runtime 缺口，再实现 Agentic RAG 控制台页面和真实 API 联调。
 
 恢复步骤：
 
-1. 进入实现 worktree，确认分支为 `sdd-agentic-rag-implementation`、工作树干净。
-2. 运行 `docs/local-operations.md` 中的静态、真实服务、Graph/API 评测和最终验收命令。
-3. 请求独立 reviewer 对 follow-up 与 Task 5 提交范围复审；若通过，执行分支级 diff、迁移和发布审查。
-4. 将实现分支合并到 `main` 前，重新确认 `.env.local`、备份目录和隔离测试数据库未被纳入提交。
+1. 确认 `main` 工作树干净并加载 `.env.local`。
+2. 修复子 Agent 生产注入、Todo 创建和全局研究预算。
+3. 实现 Agentic RAG 控制台页面，联调 Query、SSE、文档、Memory 和 Health API。
+4. 运行真实 Graph/API 验收，确认泄漏、引用覆盖、审计、恢复、备份和降级日志门禁。
 
 Phase 5 顺序：
 
