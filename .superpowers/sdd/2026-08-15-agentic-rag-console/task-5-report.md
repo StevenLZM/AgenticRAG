@@ -32,9 +32,9 @@ git diff --check
 
 ## 修复轮 2：控制台门禁归属更正
 
-- `run_real_query_acceptance.py` 的顺序为先调用 `EvalRunner.run()`，再单独执行 `console_acceptance_passed()`；它不是 EvalRunner 的内置 console gate。
+- `run_real_query_acceptance.py` 的顺序为先调用 `EvalRunner.run()`，再单独执行 `console_acceptance_passed` 独立控制台门禁；它在 EvalRunner 后执行，不属于 EvalRunner 本身。
 - 三份运维/状态文档统一为“`console_acceptance_passed` 控制台门禁在 EvalRunner 后执行”，并保留通用 `scripts/verify_acceptance.py` 的职责边界。
-- 文档契约改为要求 `console_acceptance_passed`、`在 EvalRunner 后执行`，并拒绝陈旧的 `EvalRunner console gate` 归属表述。
+- 文档契约改为要求 `console_acceptance_passed`、`在 EvalRunner 后执行`，并拒绝把控制台门禁归属给 EvalRunner 的陈旧表述。
 
 ## 注意事项
 
@@ -45,7 +45,7 @@ git diff --check
 
 - 本地运行手册和开发进度明确 `run_api.py`、`run_query_worker.py`、`run_ingestion_worker.py` 均为阻塞进程，必须在三个独立终端或受监督后台进程运行，避免 API 阻塞后 Worker 永远不启动。
 - 控制台实际调用 `POST /v1/query` 同步 wrapper；`POST /v1/query-runs` 是同一持久化 Run 的异步 API。文档保留 SSE 路径，并明确页面不使用异步创建路径替代同步调用。
-- 真实接受脚本与 EvalRunner console gate 负责当前 snapshot、精确 `client_provenance=real_query_api`、Mem0 读写、控制台和 SSE 的专用验证。`scripts/verify_acceptance.py` 仅检查其已有通用 summary 字段，不能单独声称校验这些专用事实。
+- 真实接受脚本先运行 `EvalRunner.run()`，再由 `console_acceptance_passed` 独立控制台门禁在 EvalRunner 后执行，负责当前 snapshot、精确 `client_provenance=real_query_api`、Mem0 读写、控制台和 SSE 的专用验证。`scripts/verify_acceptance.py` 仅检查其已有通用 summary 字段，不能单独声称校验这些专用事实。
 - `research_attempt_count` 的持久化范围更正为 QueryState/SQLite checkpoint；它不是 QueryRun DB 字段。
 
 ### 修复轮 TDD 与验证
