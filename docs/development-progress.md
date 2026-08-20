@@ -1,259 +1,90 @@
 # Agentic RAG 开发进度快照
 
-> 快照日期：2026-08-15
+> 快照日期：2026-08-20
 >
-> 当前状态：路线图 Phase 1–5、Query Outbox/Worker、真实 Query E2E、Mem0 生产组合、真实评测和降级遥测均已完成；本次又完成了真实 Graph/API + DeepSeek/Qwen/Reranker/Mem0 的当前快照验收，当前实现位于独立 worktree，尚未合并到 `main`。
->
-> 本文档是恢复开发时的首要状态入口；详细设计、接口约束和任务拆分以文末权威文档为准。
+> 当前状态：原始五阶段路线图、Query Runtime/Mem0/真实评测后续任务，以及控制台与其运行时补强均已在当前 `main` 完成。不存在需要合并的实现 worktree 或分支；后续工作从仓库根目录的 `main` 开始。
 
-## 1. 当前开发位置
+> 本文档是恢复开发时的状态入口；设计约束和任务拆分以文末权威文档为准。
+
+## 当前开发位置
 
 - 仓库根目录：`/Users/steven/LzmWorkSpace/AgenticRAG`
-- 实现 worktree：`/Users/steven/LzmWorkSpace/AgenticRAG/.worktrees/agentic-rag-implementation`
-- 实现分支：`sdd-agentic-rag-implementation`
-- 分支基线：`main@1e02fbb`
-- Phase 4 最终代码：`c3cf053 fix: preserve business terminal query outcomes`
-- 当前 follow-up 最终提交：`8be939c feat: complete real query mem0 acceptance`；实现分支尚未合并到 `main`。
+- 当前分支：`main`
+- 当前基线：`fb1a5b5`
 - Conda 环境：`agentic-rag`
+- 启动前检查：在仓库根目录运行 `git status --short` 和 `git log -5 --oneline`，确认当前 `main` 工作树干净。
 
-`main` 尚未合并当前实现。继续开发前先进入实现 worktree，并确认工作树干净：
+## 总体进度
 
-```bash
-cd /Users/steven/LzmWorkSpace/AgenticRAG/.worktrees/agentic-rag-implementation
-git branch --show-current
-git status --short
-git log -5 --oneline
-```
-
-## 2. 总体进度
-
-原始路线图共 32 个任务（Phase 1/2/3 各 6 个，Phase 4 为 9 个，Phase 5 为 5 个）；其后新增的 Query Runtime/Mem0/真实评测 follow-up 共 7 个任务。
-
-| 阶段 | 状态 | 任务数 | 交付摘要 |
-|---|---:|---:|---|
-| Phase 1：Foundation and Persistence | 完成 | 6/6 | 领域契约、MySQL、Outbox/Redis、Checkpoint、Artifact Store、Bootstrap/Health |
-| Phase 2：Document Ingestion | 完成 | 6/6 | 安全上传、Docling AST、Parent/Child、Embedding、发布/对账、可恢复 Worker |
-| Phase 3：Retrieval and Evidence | 完成 | 6/6 | Dense/BM25、RRF/Rerank、Parent 聚合、降级检索图、EvidenceBuilder |
-| Phase 4：Query and Agent Runtime | 完成 | 9/9 | ModelGateway、Memory、Fast/Research、Subagent、审计、QueryGraph、Worker、API |
-| Phase 5：Evaluation and Operations | 完成 | 5/5 | Trace/在线指标、确定性评测、离线报告、对抗/负载/恢复演练、备份恢复/就绪检查/最终验收 |
-
-**总体完成：原始路线图 `32/32`，follow-up `7/7`；实现任务 `100%`，当前只剩分支合并与生产鉴权/RBAC 审批。**
-
-## 3. 已实现能力
-
-### 3.1 Phase 1–2：基础设施与文档摄取
-
-- Python 3.11、Pydantic Settings、pytest/Ruff/mypy 工具链，以及共享领域模型、运行时版本快照和 UUIDv7 标识。
-- MySQL 持久化、Alembic 迁移、事务 Outbox、Redis Streams、SQLite Checkpoint、Artifact Store 和 FastAPI Bootstrap/Health。
-- 上传安全门、MIME/大小/压缩炸弹检查、Docling Fragment/Canonical AST、结构优先 Parent-Child Chunking。
-- Qwen embedding 适配、Elasticsearch Child/向量索引、Manifest 驱动发布、Publisher/Reconciler、删除 tombstone、Claim/Lease/Heartbeat 和 DLQ 恢复。
-
-Phase 2 最终里程碑为 `55a132e`；Phase 1/2 的详细任务提交和约束见对应阶段计划。
-
-### 3.2 Phase 3：检索与证据
-
-- 服务端 `user_id`、scope、版本和 date/search selectors 过滤；Dense 与 BM25 适配器并发召回，单 lane 降级和双失败 fail-closed。
-- 固定 RRF（`k=60`）融合、Cross-Encoder rerank、Child 去重、Parent 聚合/抓取及 provenance 保留。
-- 确定性 Retrieval Graph，输入错误/取消透传，检索结果携带 snapshot/index generation。
-- EvidenceBuilder 实现 scope/provenance 校验、DataEnvelope、coverage-first 选择、token 上限、普通检索每文档上限及可信单文档 selector 例外。
-
-Phase 3 最终代码里程碑为 `c0d1305`，独立复审通过。
-
-### 3.3 Phase 4：Query 与 Agent Runtime
-
-| Task | 最终提交 | 交付 |
+| 阶段 | 状态 | 交付摘要 |
 |---|---|---|
-| 1 | `a4c999e` | OpenAI-compatible Structured ModelGateway、单次 repair/retry、usage/prompt hash 和不可变 Runtime Snapshot |
-| 2 | `36e5e9d` | scoped Mem0 边界、轻量事实抽取、assistant confirmation 校验、tombstone 删除/重试/对账、租户 fail-closed |
-| 3 | `55f253d` | JSON-safe QueryState、Memory-aware Router、Fast RAG、取消和非有限 JSON 值保护 |
-| 4 | `31ad0b5` | 动态 Todo、calculator/research tools、受限 ResearchAgentLoop 和严格 action schema repair |
-| 5 | `bfc96ea` | 有界并发 Subagent、隔离子状态、超时/取消清理、确定性 evidence reducer |
-| 6 | `ec4920f` | Generation、Faithfulness/Citation 强制审计、授权/version resolver、单次修订闭环 |
-| 7 | `11535b0` | 固定 QueryGraph、checkpoint namespace、真实 EvidenceBuilder 路径、可重放幂等事件 |
-| 8 | `38ad905..7ecfb1f` | 原子 Run/Outbox、Query Worker lease/heartbeat/reclaim、批量投递清空、重试/DLQ/取消 |
-| 9 | `8f44b93..c3cf053` | Query Run、SSE/cursor、sync wrapper、cancel、Memory、Feedback API；业务终止结果保留为 COMPLETED |
+| 阶段 1：基础设施与持久化 | 完成 | 领域契约、MySQL、Outbox/Redis、Checkpoint、Artifact Store、Bootstrap/Health |
+| 阶段 2：文档摄取 | 完成 | 安全上传、Docling AST、Parent/Child、Embedding、发布/对账、可恢复 Worker |
+| 阶段 3：检索与证据 | 完成 | Dense/BM25、RRF/Rerank、Parent 聚合、降级检索图、EvidenceBuilder |
+| 阶段 4：查询与 Agent 运行时 | 完成 | ModelGateway、Memory、Fast/Research、Subagent、审计、QueryGraph、Worker、API |
+| 阶段 5：评测与运维 | 完成 | Trace/在线指标、确定性评测、离线报告、对抗/负载/恢复演练、备份恢复与最终验收 |
+| 控制台与运行时补强 | 完成 | 全局研究预算、生产 Subagent、同源控制台、真实 Graph/API 验收 |
 
-Phase 4 当前具备的关键边界：
+原始路线图的 `32/32` 项和后续 Query Runtime/Mem0/真实评测任务均已完成。当前 `main` 的剩余事项是上线审批，而不是代码分支合并。
 
-- QueryGraph 固定编排 Fast/Research、EvidenceBuilder、Generation、Faithfulness、Citation 和 Finalize；缺证据、审计失败、无法回答等结果 fail-closed。
-- Query Run 持久化 `question` 与最终 `answer`（迁移 `0006`、`0007`），Worker 在崩溃后可从 Run 重建状态；Redis reclaim 与 fresh delivery 按批次全部处理，避免消息滞留 PEL。
-- 终止原因 `clarify`、`refuse`、`cannot_answer`、`audit_failed`、`research_round_limit`、`research_action_invalid` 等映射为结构化业务完成；未知或非字符串原因仍重试并最终进入失败/DLQ。
-- API 覆盖 `/v1/query-runs`、SSE 重连、取消、同步 `/v1/query`、`/v1/memories` 和 `/v1/feedback`；未知 SSE 事件摘要脱敏，未配置 Memory provider 时读写均 fail-closed。
+## 已实现能力
 
-### 3.4 Phase 5：评测与运维（已完成 Task 1–5）
+### 持久化、摄取、检索与证据
 
-- Task 1 最终提交为 `8729171`（基线实现 `053e8e4`，后续安全/接入修复至 `b83b716`、生命周期与成本语义修复 `ecf2274`、队列重领取去重 `8729171`）。
-- `TraceRecorder` 提供本地 OpenTelemetry-compatible 嵌套 span，绑定 `run_id`、快照和 parent/span 层级；取消、异常和跨 Run/Recorder 上下文均 fail-closed。
-- `AgentEventEmitter` 仅持久化严格 allowlist 的有限枚举/数值字段，拒绝 prompt、隐藏推理、原始 Tool payload、凭据和不安全标识；事件 payload 使用内容寻址 Artifact，并校验 URI/hash 完整性。
-- QueryGraph、QueryWorker、ModelGateway、Tool/Memory/Retrieval/Rerank/Audit 边界已接入共享快照遥测；Graph/Worker 生命周期事件使用稳定 event key，Redis 重领取不会重复队列指标，lease 丢失不会伪造终态事件。
-- `MetricsProjector` 支持 cursor/reducer 跨页累计 queue/run/node latency、retrieval、token/call、citation、repair、degraded、feedback、outbox/lease/reconciler 和业务终态指标。无可信定价来源时 `estimated_cost_status=unavailable`，不把零值伪装成成本估算；只有带安全成本字段的观察事件才标记 `observed`。
+- MySQL 持久化 Run、Event、Outbox、文档版本和审计状态；Elasticsearch 保存可检索 Child；SQLite 分别保存 Query 与 Ingestion checkpoint；Artifact 使用内容寻址存储。
+- 文档摄取包含 MIME、大小和压缩炸弹防护、Docling Fragment/Canonical AST、Parent-Child 分块、Qwen embedding、索引发布、对账、租约、心跳与 DLQ 恢复。
+- 检索在服务端执行 `user_id`、scope、版本和 selector 过滤，使用 Dense/BM25、固定 RRF、Cross-Encoder、Parent 聚合和 `EvidenceBuilder`。任一路检索故障会留下有限降级证据；双路不可用时 fail-closed。
 
-Task 2（`7aac8d8`，基线实现 `fff7ea5`）已完成：
+### 查询运行时与生产投递
 
-- 新增纯离线 `evals` 包和严格 `EvaluationCase`、`IngestionFidelityCase`、`SecurityCase` 模型；拒绝未知字段、非 JSON/非有限值、敏感/provider 字段、重复 ID、路径穿越和非严格类型转换。
-- Recall@k、MRR、NDCG@k 使用 binary relevance，先按原始排名位置截取 top-k，再在窗口内去重；重复事件按稳定 `event_key` 去重，并按 `user_id` 与 `runtime_config_snapshot_id` fail-closed 过滤。
-- 固定数据集已纳入 wheel：baseline 24（8 single-hop、8 multi-hop、4 scanned-PDF、4 Excel）、ingestion fidelity 13、security 12；CLI 为 `python -m evals.validate_datasets evals/datasets`。
+- Query Outbox 在 `POST /v1/query-runs` 的同一个 MySQL 事务内持久化 Run 与 `query_run` 投递意图，因而 Redis 短暂不可用不会丢失已提交查询。
+- Query Worker 从 Redis Stream 领取和重新领取任务，维护租约与心跳，从 checkpoint/持久化 Run 恢复，执行 QueryGraph，实施重试/DLQ、取消和终态 ACK。答案或业务拒答只有在持久化且通过审计后才 ACK，避免重复 Run 和伪完成。
+- QueryGraph 固定编排 Fast/Research、EvidenceBuilder、Generation、Faithfulness、Citation 和 Finalize。`clarify`、`refuse`、`cannot_answer`、`audit_failed`、`research_round_limit` 与 `research_action_invalid` 都是结构化、可观察的业务终态；未知故障仍按重试/DLQ 路径处理。
+- `SubagentDispatcher` 已接入生产组合根，并与 QueryGraph/Query Worker 共享 `ConcurrencyManager`。研究路径会进行 Todo 初始创建；合法动作可 Todo 追加，服务器校验 Todo 所有权与动作 schema。
+- `research_attempt_count` 是保存在 QueryState/Run 的全局研究尝试数，跨 `ResearchAgentLoop` 重入累计。达到 `RuntimeConfigSnapshot` 上限后，系统阻止未完成 Todo 并以 `research_round_limit` 终态停止，不再调用模型。
 
-Task 3（`15a9150`，基线实现 `6e603a4`）已完成：
+### 记忆、控制台与安全观察
 
-- `EvalRunner` 通过注入 Query API/Graph client 执行离线案例，结果模型严格校验 snapshot、answer、evidence、route、events 引用和 deterministic/Ragas 指标；不构造或改写检索/审计逻辑。
-- results JSONL 与 summary JSON 使用临时文件、fsync 和 `os.replace` 原子写入；完整/同 snapshot 行可断点续跑，损坏、重复或旧 snapshot 行隔离并重算。
-- `RagasAdapter` 允许显式离线 backend；未安装/未配置时输出 `status=unavailable` 空指标，不伪造分数。报告默认拒绝混合 snapshot，仅接受命名 baseline 映射进行比较。
-- CLI `python -m evals.run --dataset ... --output ... [--limit N]` 提供确定性 fixture smoke，产出 results/summary 且不访问外部服务。
+- Mem0 默认启用，按用户命名空间工作，并使用 `infer=False`。没有专用 Mem0 embedding 配置时会复用 Qwen 配置。provider 故障只会产生 `memory_provider_degraded`，使 `/health/ready` 不就绪；不会把空记忆当作成功或放宽检索、引用和审计。
+- `GET /` 提供同源的 Agentic RAG 控制台；页面经既有 Query Run、SSE、文档、Mem0 和 Health API 工作。它仅呈现服务端白名单事件与字段，可显示 `queued`、`running`、`completed`、`refuse`、`audit_failed`、`research_round_limit` 及安全的降级/熔断/重试/DLQ 提示。
+- 事件与日志脱敏 prompt、隐藏推理、工具载荷和服务提供方响应，只保留 `component`、`reason`、`outcome`、`attempt`、`retryable` 等有限字段。`MODEL_REPAIR_EXHAUSTED`、`CIRCUIT_OPEN`、`OUTBOX_RETRY`、`WORKER_DLQ` 与 `memory_provider_degraded` 均可用于排查，不构成泄密通道。
 
-Task 4（`2e99e00..1947806`，基线实现 `2e99e00`）已完成并通过独立复审：
+## 真实验收与证据
 
-- 新增安全回归 E2E：验证文档 prompt injection/filter override、隐藏 Unicode、Evidence ID 伪造、跨用户 evidence/memory/checkpoint/event 隔离、Mem0 不可用降级，以及 Artifact/Event payload 中的原始 prompt/tool/hidden reasoning 脱敏；安全扫描覆盖 durable payload 与 event type/node/summary。
-- 新增背压 E2E：通过真实 `ConcurrencyManager` 观察 run/LLM/reranker 最大并发，独立压测至少 8 个 LLM slot，记录 queue wait 时间，并使用可注入 API/Worker health probes 验证活性。
-- 新增 `scripts/run_recovery_drill.py`：七个固定故障场景使用隔离 in-memory fakes 和现有 `AgentEvent`、`UserScope`、`MemoryServiceImpl`、`LocalArtifactStore` 边界；覆盖 SSE 重连、Query/Ingestion 重放、Outbox Redis 故障、ES 激活中断、Artifact quarantine、Mem0 scope/outage。报告包含 scenario invariants、replay/duplicate/leak/quarantine 计数，使用 fsync+replace 原子写入，失败或泄漏时返回非零。
-- Task 4 最终验证：E2E 10 passed；全量 importlib 测试 530 passed、38 skipped；Ruff、scoped mypy、diff-check 通过；直接脚本与 module CLI 均返回 0，报告确定性且无临时文件残留。
+- 真实服务测试在隔离 MySQL、Redis、Elasticsearch、Mem0 collection、SQLite checkpoint 和 Artifact 中执行，不触碰默认生产命名空间。
+- `scripts/run_real_query_acceptance.py` 启动真实 Query Worker/API，使用当前 snapshot、真实 Graph/API、真实 client provenance 与 Mem0，生成 `evaluation_mode=api`、`client_provenance=real_query_api` 和 `runtime_config_snapshot_id` 证据。
+- `scripts/verify_acceptance.py` 只接受真实 Graph/API summary。最终 PASS 条件包括正数 `real_query_count`、`user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`、Mem0 可用或明确的受控 degraded 证据，以及恢复和备份演练通过。`fixture` 的 `SMOKE ONLY` 结果不能替代该验收。
+- 已覆盖 MySQL schema/API、Redis Streams、Elasticsearch 检索、Mem0 provider、真实模型、恢复演练与备份恢复；外部服务变量缺失时对应 opt-in 测试会明确 skip，已配置但服务不健康时必须失败。
 
-Task 5（Backup/Restore/Readiness/Final Acceptance）已完成：
+## 本地运行与验证入口
 
-- `scripts/backup_local.py` 对 SQLite checkpoint、Artifact、可选 MySQL dump、Elasticsearch generation/alias/template/document 以及显式 Redis key prefix 做内容寻址清单、SHA-256 完整性校验和原子发布；默认不触碰生产服务数据。
-- `scripts/restore_local.py` 在验证 manifest、路径和每个文件 hash 后，仅恢复到不存在的目标；服务恢复要求显式空 MySQL 数据库、新 Elasticsearch generation 和空 Redis target prefix，并在导入后执行 Alembic、文档计数、mapping/alias/Redis payload 校验与 readiness。
-- `scripts/run_api.py` 提供有限优雅退出；`ReadinessChecks.require_ready()` 对依赖不可用 fail-closed；`scripts/verify_acceptance.py` 严格要求泄漏为 0、citation coverage 为 1.0、无未审计答案、恢复演练和备份恢复均通过。
-- 真实本地服务验证使用隔离资源：MySQL schema/API 15+4 项、Redis Streams 3 项、Elasticsearch 检索 1 项、备份恢复 E2E 15 项均通过；不修改默认 `agentic_rag` 数据库、Redis 默认数据或现有 ES generation。真实 DeepSeek/Qwen 模型 smoke 1 项通过（Qwen embedding 1024 维）。
-- 最终 baseline 24 cases 离线评测产生 `user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`、两个恢复 gate 均为 true；`verify_acceptance.py` 返回 `ACCEPTANCE PASSED`。
+加载 `.env.local` 后，依赖和进程的启动顺序见 [本地运行手册](./local-operations.md)。日常控制台验证使用：
 
-### 3.5 Query Runtime/Mem0/真实评测 follow-up（7/7）
-
-| Task | 最终提交 | 交付 |
-|---|---|---|
-| 1 | `ae7c6fe` | Query Outbox 按 `aggregate_type` 隔离，查询 worker 不会消费 ingestion rows |
-| 2 | `d543f31` / `513a0aa` | 生产 Query 依赖组合、Worker 启动与 API/Worker 快照绑定 |
-| 3 | `2a117a3` | API → Outbox → Redis → Query Worker → QueryGraph → MySQL 的真实边界 E2E |
-| 4 | `a4ececf` / `fa85aca` | Mem0 `AsyncMemory` 工厂、用户作用域/删除 tombstone、显式真实 provider 测试开关 |
-| 5 | `2bb7f25` | Graph/API 评测模式、真实 client provenance、严格断点续跑与 `verify_acceptance` 门禁 |
-| 6 | `67d492a` | 降级/熔断/重试/DLQ 的结构化 warning 与 durable event，安全字段 allowlist、指标去重 |
-| 7 | `8be939c` | 发布门禁测试、真实服务运行顺序、文档和最终验收快照 |
-
-这些 follow-up 共同回答了生产级系统的两个核心问题：Query Outbox 保证“数据库 Run 状态与待投递消息”在同一事务中可恢复；Query Worker 负责租约、重领取、心跳、重试/DLQ、取消和最终 ACK。任何降级、熔断或拒绝都会同时留下安全 warning 和可重放 durable event，API/SSE 只暴露有限枚举，不泄露 prompt、工具载荷、隐藏推理或服务提供方响应。
-
-### 3.6 本次真实 Graph/API 验收与 Mem0/DeepSeek 收敛
-
-- `scripts/run_real_query_acceptance.py` 是面向当前运行时快照的真实验收入口：它在隔离的 MySQL 用户/ES 代际/SQLite checkpoint/Artifact/Mem0 collection 下播种文档，启动生产 `QueryWorker`，通过注入同一 `AppContainer` 的 FastAPI ASGI API 发起查询，并使用真实 DeepSeek、Qwen embedding、BGE reranker、Elasticsearch、Redis、MySQL 和 Mem0 边界。
-- 真实结果写入 `evaluation_mode=api`、`client_provenance=real_query_api`、当前 `runtime_config_snapshot_id`，并由 `verify_acceptance.py` 同时检查泄漏、引用覆盖、审计、恢复、备份和真实查询数量。最近一次结果为 `citation_coverage=1.0`、`user_leak_count=0`、`unaudited_answer_count=0`、`recovery_drill_passed=true`、`backup_restore_passed=true`。
-- Mem0 默认启用。未配置专用 embedding 变量时复用 Qwen 配置；本地回环 Elasticsearch 使用内部 `local-no-auth` 兼容哨兵，远程端点仍强制认证。Mem0 构造或操作失败只降级记忆，并写入 `memory_provider_degraded component=mem0 ... outcome=degraded retryable=True`；不会把空记忆伪装成成功，也不会放宽检索、引用或审计门禁。
-- DeepSeek 的 `auto` 协议优先 Chat Completions；结构化调用自动补充 JSON object 前置条件，但最终仍由严格 Pydantic schema 和一次 repair 决定是否接受。provider outage、protocol error、model schema invalid、circuit open 是互不混淆的诊断类别，不记录原始 prompt、隐藏推理或 provider 输出。
-- 真实验收产物：`var/artifacts/evals/real-api-current/summary.json`（本地生成，不提交密钥和服务数据）。
-
-## 4. 最近验证证据
-
-验证基于实现分支 follow-up 工作树，使用 `conda` 环境 `agentic-rag`：
-
-```text
-full importlib suite: 588 passed, 46 skipped
-Task 1 focused observability/graph/worker/model suite: 70 passed
-Task 2 focused evaluation suite: 23 passed
-Task 3 focused runner/evaluation suite: 50 passed
-Task 3 related eval/query/runtime/observability subset: 168 passed
-full unit suite after Task 3: 459 passed
-Task 4 focused E2E suite: 10 passed
-Recovery drill CLI: direct/module invocation exit 0; duplicates=0, leaks=0
-Task 5 backup/restore E2E with disposable MySQL/Redis/Elasticsearch: 15 passed
-real Query composition/E2E integration: 4 passed (API deployment E2E is explicit opt-in)
-Mem0 provider contract: 1 passed with local Elasticsearch + Qwen embedding; missing
-  explicit fixture variables skip, configured provider failures fail the test
-degradation/circuit focused suite: 46 passed
-MySQL schema integration with module-scoped event loop: 15 passed
-MySQL document API integration with module-scoped event loop: 4 passed
-Redis Streams integration: 3 passed
-Elasticsearch retrieval integration: 1 passed
-Live DeepSeek/Qwen smoke: 1 passed
-baseline evaluation: 24 cases; acceptance verifier: ACCEPTANCE PASSED
-real Graph/API acceptance: 1 case; provenance=real_query_api; memory_provider.available=true;
-  current snapshot=4d3c6978a9e099051eca87267ce5402ea5ed2966859b072e922d825029902878;
-  citation=1.0; leakage=0; unaudited=0; recovery=true; backup=true; verifier=ACCEPTANCE PASSED
-ruff check src tests evals scripts: All checks passed
-mypy src evals scripts: no issues found
-git diff --check b83b716..8729171: clean
-git diff --check 2e99e00..1947806: clean
+```sh
+conda run -n agentic-rag python scripts/run_api.py
+conda run -n agentic-rag python scripts/run_query_worker.py
+curl http://127.0.0.1:8000/
 ```
 
-外部服务集成测试的 skip 是显式配置结果，未提供以下独立测试资源时不会伪造通过：
+完整门禁必须额外运行真实 Graph/API 接受脚本及 `scripts/verify_acceptance.py`。所有静态检查使用：
 
-```bash
-AGENTIC_RAG_TEST_MYSQL_DSN
-AGENTIC_RAG_TEST_REDIS_DSN
-AGENTIC_RAG_TEST_ELASTICSEARCH_URL
+```sh
+conda run -n agentic-rag ruff check src tests evals scripts
+MYPYPATH=src conda run -n agentic-rag mypy --explicit-package-bases src evals scripts
 ```
 
-Mem0 真实服务测试同样需要本地 provider/服务配置；当前单元测试使用注入的 async client/fake 覆盖边界行为。
+## 上线审批事项
 
-## 5. 本地运行与数据布局
+以下事项明确保留为生产上线前的审批和验收工作，不应被本地完成状态掩盖：
 
-项目不使用 Docker，默认本地组件如下：
+1. **生产鉴权/RBAC：** 当前 V1 只有 `user_id` 命名空间隔离，尚无完整身份认证、授权或 RBAC；生产入口不能依赖 `default_user`。
+2. **reranker 分数标定：** 必须区分 `retrieval_score`、`rrf_score` 和 `rerank_score`，按 Reranker 模型/revision、score activation、索引代际和评测切片标定版本化 `min_rerank_score`。验收应覆盖真实分数传播、排序、阈值边界、无候选路径、Recall/Precision/NDCG、误拒/误接收率和引用覆盖率。
+3. **发布证据复跑：** 每次候选发布都要在隔离服务上重跑恢复、备份、真实 Graph/API、当前 snapshot、client provenance 与 Mem0 门禁，并保留脱敏的 summary 和遥测。
 
-| 组件 | 默认位置/端口 | 当前职责 |
-|---|---|---|
-| MySQL | `127.0.0.1:3306` | Document、Version、Job、Parent、Run/Event、Outbox、删除/DLQ |
-| Redis | `127.0.0.1:6379/0` | Ingestion/Query Streams、consumer group、reclaim、dead stream |
-| Elasticsearch 8 | `http://127.0.0.1:9200` | Child BM25、dense vector、结构化 filter |
-| SQLite | `var/ingestion_checkpoints.sqlite` | IngestionGraph checkpoint |
-| SQLite | `var/query_checkpoints.sqlite` | QueryGraph checkpoint |
-| Local files | `var/artifacts` | 上传源文件、解析/分块/Manifest artifacts |
-
-Phase 2 的 embedding/provider 环境变量仍按对应计划配置；Query API/Worker 使用同一部署容器和当前运行时快照组合 ModelGateway、检索、Reranker 与 Mem0。
-
-## 6. 尚未实现与上线前注意事项
-
-- 2026-08-15：已确认 Mem0 默认启用；embedding 在未提供专用 Mem0 变量时复用 Qwen 配置，本地回环 Elasticsearch 允许无认证，远程 Elasticsearch 仍强制认证。Mem0 初始化失败时查询继续但 memory 降级、`/health/ready` 不通过，并输出 `memory_provider_degraded`。Task 1 单元回归：`13 passed`。
-- 2026-08-15：DeepSeek 结构化调用新增显式 `auto/chat/responses` 协议选择；`auto` 优先 Chat，结构化请求要求 JSON object，安全去除 JSON 围栏并保留严格 schema 校验。新增 `provider_outage`、`protocol_error`、`model_schema_invalid` 诊断字段（含 schema/model/attempt/hash，不含原始内容）。Task 2 focused 回归：`33 passed`。
-- 2026-08-15：真实 API 验收已通过：`scripts/run_real_query_acceptance.py` 产出当前快照、真实 client provenance、审计答案和 Graph/API 门禁结果；最近一次结果为 `citation_coverage=1.0`、`user_leak_count=0`、`unaudited_answer_count=0`、恢复与备份均通过。Mem0 provider 合约实测 `1 passed`，不再把 Mem0 真实可用性描述为仅“部署注入”。
-- 生产上线前仍需执行一次分支级发布审查，并把实现 worktree 合并到 `main`；本地最终验收不等同于生产鉴权/RBAC 审批。
-- 检索分数传播与相关性门禁仍需在发布前加固：
-  - 当前 `Reranker` 只按 CrossEncoder 预测分数重排，却没有把该分数写回结果；后续 Parent 聚合与 `EvidenceBuilder` 又把 Elasticsearch 原始 `_score` 当作 `rerank_score` 使用，可能反转 CrossEncoder 排序，而且 Dense/BM25 原始分数本身不可直接比较。
-  - 修复时应显式区分并传播 `retrieval_score`、`rrf_score` 与 `rerank_score`；Parent 以其最佳 Child 的真实 CrossEncoder 分数排序，同分时再用 CrossEncoder 顺序稳定破平。
-  - 采用“宽召回、后置门禁”：Dense/BM25 继续按 Top-K 召回，RRF 继续保留 Top-30，不对未经标定的各路原始分数设置统一硬阈值；CrossEncoder 对候选完整打分后应用版本化的 `min_rerank_score`，Parent 至少有一个 Child 达标才可进入 `EvidenceBuilder`。
-  - `min_rerank_score` 必须按 Reranker 模型及 revision、score activation、索引代际和评测切片离线标定，并纳入 `RuntimeConfigSnapshot`；全部候选被过滤时应升级 Research 或拒答，不得绕过 Evidence、Faithfulness 与 Citation 门禁。
-  - 验收至少覆盖真实分数传播、CrossEncoder 排序不反转、阈值边界、无候选路径，以及 Parent Recall@6、Precision@6、NDCG、可回答问题误拒率、无答案问题误接收率和引用覆盖率。
-- 当前 V1 只有 `user_id` 命名空间隔离，没有完整鉴权、RBAC 或用户身份解析；生产入口不能继续依赖 `default_user`。
-- Mem0 默认启用；初始化或运行时 provider 故障只允许 memory 降级，并必须留下 `memory_provider_degraded` 日志/事件，`/health/ready` 保持不就绪，不能把 no-op 结果当作生产记忆。
-- 本地 Elasticsearch、MySQL、Redis 和 Mem0 已用隔离资源完成联调；真实 Graph/API 验收使用当前 snapshot 与真实 client provenance，fixture 结果仍不能替代生产验收。
-- 当前实现已合并到 `main`；后续功能开发必须先解决以下 Query Runtime 缺口，再把页面验收接入真实 Graph/API 门禁。
-
-### Query Runtime 待解决问题
-
-1. **子 Agent 尚未接入生产组合根。** `ResearchAgentLoop` 已定义 `delegate_research`，但生产依赖组合仍未注入 `SubagentDispatcher`（见 `src/agentic_rag/runtime/query_composition.py`）；因此委派动作只能记录不可用/待处理状态，不能真正启动子 Agent。
-2. **正常链路不会创建 Todo。** `update_todos` 只能更新已有 Todo，不能从研究计划或初始问题创建 Todo；当前查询无法稳定完成“任务拆分 → 子任务委派 → 汇总证据”的完整链路。
-3. **研究轮数不是 Query 全局上限。** 当前四轮限制只约束一次 `ResearchAgentLoop` 调用；Research 提交证据后若 Grader 再次判定 insufficient，Graph 可能重新创建循环并将计数归零。现在主要依赖 Graph `recursion_limit=50` 和 Query 300 秒超时兜底。生产实现必须在 QueryState/Run 中增加全局 `research_attempt_count`，跨 Research 重入累计并持久化，超过上限后进入可观测的拒答或降级终态。
-
-这些问题在 Agentic RAG 控制台页面中必须可见：子 Agent 未接入、Todo 未创建、研究预算耗尽或检索/模型降级都要显示有限原因、是否可重试和对应 Run 事件，不能只显示“处理中”。
-
-## 7. 下一次开发的准确起点
-
-Follow-up Task 7 已完成并已合并到 `main`；下一步是先补齐上述 Query Runtime 缺口，再实现 Agentic RAG 控制台页面和真实 API 联调。
-
-恢复步骤：
-
-1. 确认 `main` 工作树干净并加载 `.env.local`。
-2. 修复子 Agent 生产注入、Todo 创建和全局研究预算。
-3. 实现 Agentic RAG 控制台页面，联调 Query、SSE、文档、Memory 和 Health API。
-4. 运行真实 Graph/API 验收，确认泄漏、引用覆盖、审计、恢复、备份和降级日志门禁。
-
-Phase 5 顺序：
-
-```text
-Trace Recorder + Online Metrics (complete)
-  -> Deterministic Retrieval/AgentLoop Evaluation (complete)
-  -> Offline Ragas Reports (complete)
-  -> Adversarial/Load/Recovery Suites (complete)
-  -> Backup/Restore/Readiness/Final Acceptance (complete)
-```
-
-## 8. 权威文档索引
+## 权威文档索引
 
 - [生产级 Agentic RAG 总体设计](./superpowers/specs/2026-08-04-production-agentic-rag-design.md)
 - [五阶段实现路线图](./superpowers/plans/2026-08-04-agentic-rag-implementation-roadmap.md)
-- [Phase 1 计划](./superpowers/plans/2026-08-04-agentic-rag-phase-1-foundation.md)
-- [Phase 2 计划](./superpowers/plans/2026-08-04-agentic-rag-phase-2-ingestion.md)
-- [Phase 3 计划](./superpowers/plans/2026-08-04-agentic-rag-phase-3-retrieval.md)
-- [Phase 4 计划](./superpowers/plans/2026-08-04-agentic-rag-phase-4-query-runtime.md)
-- [Phase 5 计划](./superpowers/plans/2026-08-04-agentic-rag-phase-5-evaluation-operations.md)
-
-## 9. 恢复开发时的第一条提示词建议
-
-```text
-继续开发 AgenticRAG。先完整阅读 docs/development-progress.md、总体设计、实现路线图、Phase 5 计划和 query-runtime follow-up 计划；确认当前 worktree/branch/HEAD 与进度快照一致，运行静态、全量、真实服务和 Graph/API 验收门禁。不要重做已完成阶段，不要把 fixture smoke 当作生产验收，也不要跳过 Mem0、备份恢复或降级/熔断遥测检查。
-```
+- [查询运行时与 Mem0 设计](./superpowers/specs/2026-08-14-query-runtime-mem0-evaluation-design.md)
+- [控制台设计与实施计划](./superpowers/plans/2026-08-15-agentic-rag-console.md)
+- [本地运行手册](./local-operations.md)

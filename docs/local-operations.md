@@ -6,7 +6,7 @@
 set -a; source .env.local; set +a
 ```
 
-## 启动与升级
+## 启动、控制台与查询
 
 按以下顺序启动依赖：Elasticsearch、MySQL、Redis。确认三者都指向本地端点后，再按以下顺序执行迁移并启动进程：
 
@@ -18,17 +18,34 @@ conda run -n agentic-rag python scripts/run_query_worker.py
 conda run -n agentic-rag python scripts/run_ingestion_worker.py
 ```
 
-API 启动后可访问 `/health/live`；只有在所有依赖都报告 `available` 后，才使用 `/health/ready`。升级时先停止 Worker，等待当前图节点到达 SQLite checkpoint，再执行迁移，并按相同顺序重新启动。
+API 启动后可访问 `/health/live`；只有在所有依赖都报告 `available` 后，才使用 `/health/ready`。在浏览器打开 Agentic RAG 控制台，或用以下命令确认同源页面已提供：
+
+```sh
+curl http://127.0.0.1:8000/
+```
+
+控制台通过 `POST /v1/query-runs` 创建查询，并使用 `GET /v1/query-runs/{run_id}/events` 的 SSE 接收进度。断线后页面会使用最后收到的 event ID 重连；运维排查也可传入 `Last-Event-ID` 重新连接同一路径。页面只呈现服务端白名单内的运行状态、证据、审计、`runtime_config_snapshot_id` 与 `client_provenance`，绝不呈现 prompt、记忆原文、隐藏推理、工具载荷或服务提供方原始响应。升级时先停止 Worker，等待当前图节点到达 SQLite checkpoint，再执行迁移，并按相同顺序重新启动。
 
 ## Query Outbox 与 Query Worker
 
-`POST /v1/query-runs` 会在同一个 MySQL 事务中写入持久化 Run 和
-`query_run` Outbox 行。Query Worker 只把 `query_run` 行分发到 Query Redis
-Stream，通过租约领取/重新领取消息，在图运行期间发送心跳，并且只在审计后的答案（或终态业务拒答）持久化之后 ACK。Redis 发布失败会保留为可重试状态；连续失败后进入有界重试/DLQ 流程。这样可以避免请求已提交但任务在 MySQL 与 Redis 之间丢失，并允许重启后的 Worker 继续处理而不创建第二个 Run。
+Query Outbox 与 Query Worker 是两个不同的生产职责，缺一不可。`POST /v1/query-runs` 的 Query Outbox 在 MySQL 同事务中写入持久化 Run 和待投递的 `query_run` 意图；它不执行 Graph，也不依赖 Redis 当时可用。Query Worker 再将 `query_run` 投递到 Query Redis Stream，通过 Redis 领取/重新领取消息、维护租约和心跳、恢复中断的 Run、执行 QueryGraph、处理有界重试/DLQ，并且只在审计后的答案或终态业务拒答已持久化后执行终态 ACK。
 
-所有降级边界都会产生可观察信号。进程日志会写入有界警告，事件仓储会写入安全的持久化事件，例如
-`RETRIEVAL_DEGRADED`、`CIRCUIT_OPEN`、`COMPONENT_DEGRADED`、`OUTBOX_RETRY` 或
-`WORKER_DLQ`；事件只包含白名单中的 component/reason/outcome/attempt 字段。SSE 会暴露相同的运行事件名称，但始终脱敏原始 prompt、记忆文本、隐藏推理、工具载荷和服务提供方响应。熔断打开或服务降级时，API 也会明确保留 `retryable`/`degraded_components` 字段。
+这种拆分避免了“HTTP 已成功但 Redis 未发布”的丢失窗口，也避免 Worker 重启时重复创建 Run。Redis 发布故障保持为可重试 Outbox 状态；Worker 失联后由租约和重新领取恢复；超过重试上限才进入 DLQ。不得手动 ACK pending 消息来制造完成状态。
+
+## 子 Agent、Todo 与研究预算
+
+`SubagentDispatcher` 已接入生产组合根，并与 QueryGraph 和 Query Worker 共用 `ConcurrencyManager`。研究路径开始时会完成 Todo 初始创建，为原始问题生成服务器所有的根 Todo；合法的研究动作可以继续 Todo 追加，所有权、标题和动作 schema 都由后端校验。控制台仅显示这些已校验的 Todo、有限状态和对应事件。
+
+`research_attempt_count` 是跨 QueryGraph 重入且持久化的全局研究尝试计数，不是单次 `ResearchAgentLoop` 的局部循环变量。达到当前 `RuntimeConfigSnapshot` 中的上限时，未完成 Todo 会标记为 blocked，查询以 `research_round_limit` 的可观察终态停止，且不再调用模型。这个预算、子 Agent 的超时/取消及证据归并共同防止递归研究消耗失控。
+
+## 降级、熔断与重试日志
+
+所有降级边界都会产生可观察信号。进程日志会写入有界 warning，事件仓储会写入安全的持久化事件，例如 `memory_provider_degraded`、`RETRIEVAL_DEGRADED`、`MODEL_REPAIR_EXHAUSTED`、`CIRCUIT_OPEN`、`COMPONENT_DEGRADED`、`OUTBOX_RETRY` 或 `WORKER_DLQ`。日志和 SSE 只保留白名单字段 `component`、`reason`、`outcome`、`attempt`、`retryable` 与 `degraded_components`；始终脱敏原始 prompt、记忆文本、隐藏推理、工具载荷和服务提供方响应。
+
+- `memory_provider_degraded`：检查 Mem0 配置、provider 连通性与 `/health/ready`；查询可继续，但记忆接口会 fail-closed。
+- `MODEL_REPAIR_EXHAUSTED`：模型结构化输出在允许的 repair 后仍不符合 schema；保留 fail-closed 拒答，不要复制原始模型内容。
+- `CIRCUIT_OPEN`：连续依赖失败已打开熔断；检查对应 `component`、`reason` 和冷却窗口，而不是强制重试。
+- `WORKER_DLQ`：修复根因后检查 Run、租约和 Redis dead stream，再走受控重试；不得直接 ACK。
 
 ## DeepSeek 结构化调用与故障诊断
 
@@ -163,7 +180,7 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
 
 ```sh
 conda run -n agentic-rag ruff check src tests evals scripts
-conda run -n agentic-rag mypy src
+MYPYPATH=src conda run -n agentic-rag mypy --explicit-package-bases src evals scripts
 conda run -n agentic-rag python -m pytest -m 'not integration and not e2e and not live_model' -q
 conda run -n agentic-rag python -m pytest -m integration -q
 conda run -n agentic-rag python -m pytest -m e2e -q
