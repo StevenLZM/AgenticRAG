@@ -41,7 +41,7 @@
 - Query Worker 从 Redis Stream 领取和重新领取任务，维护租约与心跳，从 checkpoint/持久化 Run 恢复，执行 QueryGraph，实施重试/DLQ、取消和终态 ACK。答案或业务拒答只有在持久化且通过审计后才 ACK，避免重复 Run 和伪完成。
 - QueryGraph 固定编排 Fast/Research、EvidenceBuilder、Generation、Faithfulness、Citation 和 Finalize。`clarify`、`refuse`、`cannot_answer`、`audit_failed`、`research_round_limit` 与 `research_action_invalid` 都是结构化、可观察的业务终态；未知故障仍按重试/DLQ 路径处理。
 - `SubagentDispatcher` 已接入生产组合根，并与 QueryGraph/Query Worker 共享 `ConcurrencyManager`。研究路径会进行 Todo 初始创建；合法动作可 Todo 追加，服务器校验 Todo 所有权与动作 schema。
-- `research_attempt_count` 是保存在 QueryState/Run 的全局研究尝试数，跨 `ResearchAgentLoop` 重入累计。达到 `RuntimeConfigSnapshot` 上限后，系统阻止未完成 Todo 并以 `research_round_limit` 终态停止，不再调用模型。
+- `research_attempt_count` 是保存在 QueryState/SQLite checkpoint 的全局研究尝试数，跨 `ResearchAgentLoop` 重入累计；它不是 QueryRun DB 字段。达到 `RuntimeConfigSnapshot` 上限后，系统阻止未完成 Todo 并以 `research_round_limit` 终态停止，不再调用模型。
 
 ### 记忆、控制台与安全观察
 
@@ -53,16 +53,25 @@
 
 - 真实服务测试在隔离 MySQL、Redis、Elasticsearch、Mem0 collection、SQLite checkpoint 和 Artifact 中执行，不触碰默认生产命名空间。
 - `scripts/run_real_query_acceptance.py` 启动真实 Query Worker/API，使用当前 snapshot、真实 Graph/API、真实 client provenance 与 Mem0，生成 `evaluation_mode=api`、`client_provenance=real_query_api` 和 `runtime_config_snapshot_id` 证据。
-- `scripts/verify_acceptance.py` 只接受真实 Graph/API summary。最终 PASS 条件包括正数 `real_query_count`、`user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`、Mem0 可用或明确的受控 degraded 证据，以及恢复和备份演练通过。`fixture` 的 `SMOKE ONLY` 结果不能替代该验收。
+- `scripts/run_real_query_acceptance.py` 与其 EvalRunner console gate 校验当前 snapshot、精确 `client_provenance=real_query_api`、Mem0 读写、控制台/SSE 以及恢复和备份证据。`scripts/verify_acceptance.py` 是通用验证器，只校验其已有的 summary 字段：正数 `real_query_count`、`user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`、恢复/备份、`evaluation_mode` 与非空且非 `fixture` 的 `client_provenance`；它不单独校验当前 snapshot、精确 provenance 或 Mem0。`fixture` 的 `SMOKE ONLY` 结果不能替代该验收。
 - 已覆盖 MySQL schema/API、Redis Streams、Elasticsearch 检索、Mem0 provider、真实模型、恢复演练与备份恢复；外部服务变量缺失时对应 opt-in 测试会明确 skip，已配置但服务不健康时必须失败。
 
 ## 本地运行与验证入口
 
-加载 `.env.local` 后，依赖和进程的启动顺序见 [本地运行手册](./local-operations.md)。日常控制台验证使用：
+加载 `.env.local` 后，依赖和进程的启动顺序见 [本地运行手册](./local-operations.md)。以下三个命令都是阻塞进程，必须在三个独立终端（或受监督的后台进程）启动，不能写成串行命令；否则 API 不退出时两个 Worker 永远不会启动：
 
 ```sh
+# 终端一
 conda run -n agentic-rag python scripts/run_api.py
+# 终端二
 conda run -n agentic-rag python scripts/run_query_worker.py
+# 终端三
+conda run -n agentic-rag python scripts/run_ingestion_worker.py
+```
+
+控制台调用 `POST /v1/query` 同步 wrapper；`POST /v1/query-runs` 是同一持久化 Run 的异步 API，供不等待终态的客户端使用。三个进程就绪后再验证页面：
+
+```sh
 curl http://127.0.0.1:8000/
 ```
 

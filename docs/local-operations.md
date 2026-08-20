@@ -8,13 +8,30 @@ set -a; source .env.local; set +a
 
 ## 启动、控制台与查询
 
-按以下顺序启动依赖：Elasticsearch、MySQL、Redis。确认三者都指向本地端点后，再按以下顺序执行迁移并启动进程：
+按以下顺序启动依赖：Elasticsearch、MySQL、Redis。确认三者都指向本地端点后，先执行依赖检查和迁移：
 
 ```sh
 conda run -n agentic-rag python scripts/check_local_dependencies.py
 conda run -n agentic-rag alembic upgrade head
+```
+
+`python scripts/run_api.py`、`python scripts/run_query_worker.py` 和 `python scripts/run_ingestion_worker.py` 都是阻塞进程。必须在三个独立终端（或三个受监督的后台进程）分别启动，不能把它们放入一段串行命令：第一个进程会持续运行，后面的 Worker 永远不会启动。
+
+终端一启动 API：
+
+```sh
 conda run -n agentic-rag python scripts/run_api.py --grace-seconds 30
+```
+
+终端二启动 Query Worker：
+
+```sh
 conda run -n agentic-rag python scripts/run_query_worker.py
+```
+
+终端三启动 Ingestion Worker：
+
+```sh
 conda run -n agentic-rag python scripts/run_ingestion_worker.py
 ```
 
@@ -24,7 +41,7 @@ API 启动后可访问 `/health/live`；只有在所有依赖都报告 `availabl
 curl http://127.0.0.1:8000/
 ```
 
-控制台通过 `POST /v1/query-runs` 创建查询，并使用 `GET /v1/query-runs/{run_id}/events` 的 SSE 接收进度。断线后页面会使用最后收到的 event ID 重连；运维排查也可传入 `Last-Event-ID` 重新连接同一路径。页面只呈现服务端白名单内的运行状态、证据、审计、`runtime_config_snapshot_id` 与 `client_provenance`，绝不呈现 prompt、记忆原文、隐藏推理、工具载荷或服务提供方原始响应。升级时先停止 Worker，等待当前图节点到达 SQLite checkpoint，再执行迁移，并按相同顺序重新启动。
+控制台实际调用 `POST /v1/query` 这个同步 wrapper：它创建与异步 API 相同的持久化 Run，并在 `wait_seconds` 内等待终态；未完成时返回现有 Run 的 `202` 响应，不会创建第二个 Run。`POST /v1/query-runs` 是直接创建 Run 后立即返回的异步 API，供其他客户端或显式异步流程使用；页面不会把它误当成同步路径。两种入口都通过 `GET /v1/query-runs/{run_id}/events` 的 SSE 接收进度。断线后页面会使用最后收到的 event ID 重连；运维排查也可传入 `Last-Event-ID` 重新连接同一路径。页面只呈现服务端白名单内的运行状态、证据、审计、`runtime_config_snapshot_id` 与 `client_provenance`，绝不呈现 prompt、记忆原文、隐藏推理、工具载荷或服务提供方原始响应。升级时先停止 Worker，等待当前图节点到达 SQLite checkpoint，再执行迁移，并按相同顺序重新启动。
 
 ## Query Outbox 与 Query Worker
 
@@ -36,7 +53,7 @@ Query Outbox 与 Query Worker 是两个不同的生产职责，缺一不可。`P
 
 `SubagentDispatcher` 已接入生产组合根，并与 QueryGraph 和 Query Worker 共用 `ConcurrencyManager`。研究路径开始时会完成 Todo 初始创建，为原始问题生成服务器所有的根 Todo；合法的研究动作可以继续 Todo 追加，所有权、标题和动作 schema 都由后端校验。控制台仅显示这些已校验的 Todo、有限状态和对应事件。
 
-`research_attempt_count` 是跨 QueryGraph 重入且持久化的全局研究尝试计数，不是单次 `ResearchAgentLoop` 的局部循环变量。达到当前 `RuntimeConfigSnapshot` 中的上限时，未完成 Todo 会标记为 blocked，查询以 `research_round_limit` 的可观察终态停止，且不再调用模型。这个预算、子 Agent 的超时/取消及证据归并共同防止递归研究消耗失控。
+`research_attempt_count` 是跨 QueryGraph 重入且持久化在 QueryState/SQLite checkpoint 的全局研究尝试计数，不是单次 `ResearchAgentLoop` 的局部循环变量，也不是 QueryRun DB 字段。达到当前 `RuntimeConfigSnapshot` 中的上限时，未完成 Todo 会标记为 blocked，查询以 `research_round_limit` 的可观察终态停止，且不再调用模型。这个预算、子 Agent 的超时/取消及证据归并共同防止递归研究消耗失控。
 
 ## 降级、熔断与重试日志
 
@@ -223,4 +240,6 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
   tests/e2e/test_release_query_gate.py -q
 ```
 
-默认的 `fixture` 模式仅用于离线冒烟测试，并会打印 `SMOKE ONLY`；它永远不能满足最终验收。Graph/API 模式会持久化真实客户端来源证明，并拒绝运行时快照与组合出的 QueryGraph/API Run 不一致的案例。请基于已播种的文档和当前 `RuntimeConfigSnapshot` 准备 `runtime-baseline.jsonl`，不要事后修改数据集的 snapshot ID。`verify_acceptance.py` 必须针对 Graph/API 摘要（而不是 fixture 摘要）运行。只要泄漏不为零、引用覆盖率不等于 1.0、存在未审计答案、恢复或备份演练失败，或 `real_query_count` 不为正数，验证器就会失败。未配置 Ragas 后端时，Ragas 会明确保持 `unavailable`，不会伪造分数。
+默认的 `fixture` 模式仅用于离线冒烟测试，并会打印 `SMOKE ONLY`；它永远不能满足最终验收。`scripts/run_real_query_acceptance.py` 会调用 EvalRunner console gate，校验当前 snapshot、精确的 `client_provenance=real_query_api`、Mem0 读写可用性、控制台页面、SSE 与恢复/备份证据，然后才提升最终 summary。Graph/API 模式也会持久化真实客户端来源证明，并拒绝运行时快照与组合出的 QueryGraph/API Run 不一致的案例。请基于已播种的文档和当前 `RuntimeConfigSnapshot` 准备 `runtime-baseline.jsonl`，不要事后修改数据集的 snapshot ID。
+
+`scripts/verify_acceptance.py` 是通用验证器：它只校验 summary 已有的泄漏、引用覆盖、未审计答案、恢复/备份、`evaluation_mode`、非空且非 `fixture` 的 `client_provenance` 与正数 `real_query_count` 字段；它不单独校验当前 snapshot、精确 `real_query_api` provenance 或 Mem0。必须先运行真实接受脚本及其 EvalRunner console gate，再让通用验证器检查生成的 Graph/API summary。未配置 Ragas 后端时，Ragas 会明确保持 `unavailable`，不会伪造分数。

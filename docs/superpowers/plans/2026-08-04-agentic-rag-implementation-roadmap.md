@@ -34,7 +34,7 @@
 
 - `SubagentDispatcher` 已接入生产组合根，并和 QueryGraph、Query Worker 共用 `ConcurrencyManager`；超时、取消与 evidence reducer 保持有界。
 - 研究路径会完成 Todo 初始创建，合法动作可 Todo 追加。Todo 的所有者、标题和动作 schema 均在服务端校验，页面只显示安全状态。
-- `research_attempt_count` 是持久化、跨 Graph 重入的全局预算。达到 `RuntimeConfigSnapshot` 上限即阻止未完成 Todo，以 `research_round_limit` 终态结束，不继续调用模型。
+- `research_attempt_count` 是持久化在 QueryState/SQLite checkpoint、跨 Graph 重入的全局预算，不是 QueryRun DB 字段。达到 `RuntimeConfigSnapshot` 上限即阻止未完成 Todo，以 `research_round_limit` 终态结束，不继续调用模型。
 - `GET /` 提供 Agentic RAG 控制台；它使用 Query Run、SSE、文档、Mem0 和 Health API，支持断线重连，仅显示服务端白名单字段和安全终态。
 - `MODEL_REPAIR_EXHAUSTED`、`CIRCUIT_OPEN`、`WORKER_DLQ`、`OUTBOX_RETRY`、`memory_provider_degraded` 和检索降级均有有限日志与 durable event。日志字段固定为 `component`、`reason`、`outcome`、`attempt`、`retryable` 与 `degraded_components`。
 
@@ -64,7 +64,7 @@ conda run -n agentic-rag python scripts/verify_acceptance.py \
   --report var/artifacts/evals/real-api-current/summary.json
 ```
 
-最终 PASS 要求真实 Graph/API summary 同时证明：当前 snapshot 与 `runtime_config_snapshot_id` 一致、`client_provenance=real_query_api`、Mem0 可用或有明确受控的 provider degraded 证据、`real_query_count` 为正数、`user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`，以及恢复和备份演练均通过。缺失真实来源、服务不健康或任一指标不满足时，`scripts/verify_acceptance.py` 必须非零退出。
+`scripts/run_real_query_acceptance.py` 通过 EvalRunner console gate 证明当前 snapshot 与 `runtime_config_snapshot_id` 一致、精确 `client_provenance=real_query_api`、Mem0 读写可用、控制台/SSE 与恢复/备份证据。`scripts/verify_acceptance.py` 是通用验证器，只检查已有 summary 中的泄漏、引用覆盖、未审计答案、恢复/备份、`evaluation_mode`、非空且非 `fixture` 的 `client_provenance` 与正数 `real_query_count`；它不单独校验当前 snapshot、精确 provenance 或 Mem0。真实接受脚本的 console gate 先通过后，通用验证器才应对生成 summary 返回零。
 
 ## 上线前审批事项
 

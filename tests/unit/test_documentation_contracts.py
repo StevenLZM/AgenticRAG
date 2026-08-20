@@ -85,3 +85,32 @@ def test_progress_and_roadmap_record_mainline_completion_and_release_work() -> N
         "reranker 分数标定",
     ):
         assert term in roadmap
+
+
+def test_docs_keep_process_api_acceptance_and_checkpoint_boundaries_accurate() -> None:
+    """Catch stale console, verifier, or research-state operating guidance."""
+    operations = OPERATIONS.read_text(encoding="utf-8")
+    progress = PROGRESS.read_text(encoding="utf-8")
+    roadmap = ROADMAP.read_text(encoding="utf-8")
+
+    for document in (operations, progress):
+        assert "三个独立终端" in document
+        assert "阻塞进程" in document
+
+    for term in (
+        "`POST /v1/query`",
+        "同步 wrapper",
+        "`POST /v1/query-runs`",
+        "异步 API",
+    ):
+        assert term in operations
+
+    for document in (operations, progress, roadmap):
+        assert "QueryState/SQLite checkpoint" in document
+        assert "QueryState/Run" not in document
+
+    for document in (progress, roadmap):
+        assert "run_real_query_acceptance.py" in document
+        assert "EvalRunner console gate" in document
+        assert "通用验证器" in document
+        assert "不单独校验" in document

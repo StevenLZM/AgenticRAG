@@ -34,3 +34,30 @@ git diff --check
 
 - 真实 Graph/API 与 Mem0 验收仍是显式 opt-in；缺少隔离服务变量时测试必须清晰 skip，不能生成 PASS summary。
 - 本任务只收敛文档与文档契约测试，不修改页面或运行时代码。
+
+## 修复轮 1：运行拓扑与验收职责更正
+
+- 本地运行手册和开发进度明确 `run_api.py`、`run_query_worker.py`、`run_ingestion_worker.py` 均为阻塞进程，必须在三个独立终端或受监督后台进程运行，避免 API 阻塞后 Worker 永远不启动。
+- 控制台实际调用 `POST /v1/query` 同步 wrapper；`POST /v1/query-runs` 是同一持久化 Run 的异步 API。文档保留 SSE 路径，并明确页面不使用异步创建路径替代同步调用。
+- 真实接受脚本与 EvalRunner console gate 负责当前 snapshot、精确 `client_provenance=real_query_api`、Mem0 读写、控制台和 SSE 的专用验证。`scripts/verify_acceptance.py` 仅检查其已有通用 summary 字段，不能单独声称校验这些专用事实。
+- `research_attempt_count` 的持久化范围更正为 QueryState/SQLite checkpoint；它不是 QueryRun DB 字段。
+
+### 修复轮 TDD 与验证
+
+- 新增文档回归后先运行：`2 passed, 1 failed`；失败原因是旧文档没有“三个独立终端”说明。
+- 修正三份文档后，最终验证为：
+
+```text
+conda run -n agentic-rag pytest --import-mode=importlib \
+  tests/unit/test_documentation_contracts.py -q
+3 passed
+
+conda run -n agentic-rag ruff check src tests evals scripts
+All checks passed!
+
+MYPYPATH=src conda run -n agentic-rag mypy --explicit-package-bases src evals scripts
+Success: no issues found in 113 source files
+
+git diff --check
+无输出（通过）
+```
