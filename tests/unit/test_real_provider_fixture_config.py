@@ -98,7 +98,11 @@ class _NoopLifespan:
 
 
 class _NoopContainerClose:
-    async def close(self) -> None:
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+
+    async def close(self, *, raise_on_error: bool = False) -> None:
+        self.calls.append(raise_on_error)
         return None
 
 
@@ -115,22 +119,23 @@ async def test_real_fixture_cleanup_surfaces_elasticsearch_failures() -> None:
         mem0_collection="fixture-memory",
     )
 
-    with pytest.raises(OSError, match="elasticsearch cleanup failed"):
-        await query_services._cleanup_real_provider_runtime(
-            container,  # type: ignore[arg-type]
-            settings,  # type: ignore[arg-type]
-            broker=None,
-        )
+    failures: list[tuple[str, BaseException]] = []
+    await query_services._cleanup_real_provider_boundaries(
+        failures, container, settings, broker=None  # type: ignore[arg-type]
+    )
+    with pytest.raises(query_services.FixtureTeardownError, match="fixture query index: OSError"):
+        query_services._raise_fixture_teardown_failures(failures)
 
 
 @pytest.mark.asyncio
 async def test_shared_real_query_fixture_does_not_suppress_elasticsearch_cleanup_errors() -> None:
     fixture: Any = object.__new__(query_services.RealQueryFixture)
+    closer = _NoopContainerClose()
     fixture.settings = SimpleNamespace(index_generation="fixture-index", default_user_id="user")
     fixture.container = SimpleNamespace(
         elasticsearch=SimpleNamespace(indices=_FailingIndices()),
         repositories=SimpleNamespace(session_factory=_CleanupFactory()),
-        close=_NoopContainerClose().close,
+        close=closer.close,
     )
     fixture.client = _NoopClient()
     fixture._app_lifespan = _NoopLifespan()
@@ -140,5 +145,7 @@ async def test_shared_real_query_fixture_does_not_suppress_elasticsearch_cleanup
 
     fixture.stop_worker = stop_worker
 
-    with pytest.raises(OSError, match="elasticsearch cleanup failed"):
+    with pytest.raises(query_services.FixtureTeardownError, match="fixture Elasticsearch index: OSError"):
         await fixture.close()
+
+    assert closer.calls == [True]

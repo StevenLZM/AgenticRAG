@@ -11,8 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -97,6 +96,35 @@ from evals.run import EvalRunner
 from scripts.backup_local import run_backup_restore_drill
 from scripts.run_query_worker import TransactionalQueryOutboxAdapter
 from scripts.run_recovery_drill import run_recovery_drill
+
+
+class FixtureTeardownError(RuntimeError):
+    """A disposable real-service fixture could not release all owned state."""
+
+
+async def _record_fixture_teardown_error(
+    failures: list[tuple[str, BaseException]], boundary: str, operation: Awaitable[object]
+) -> None:
+    try:
+        await operation
+    except BaseException as error:
+        failures.append((boundary, error))
+
+
+def _raise_fixture_teardown_failures(
+    failures: Sequence[tuple[str, BaseException]],
+) -> None:
+    if not failures:
+        return
+    for _, error in failures:
+        if not isinstance(error, Exception):
+            raise error
+    details = ", ".join(f"{boundary}: {type(error).__name__}" for boundary, error in failures)
+    raise FixtureTeardownError(f"real Query fixture teardown failed ({details})") from failures[0][1]
+
+
+async def _strict_container_close(container: AppContainer) -> None:
+    await container.close(raise_on_error=True)
 
 
 class _FixedEmbedding:
@@ -514,6 +542,15 @@ class _SessionParents(SqlAlchemyParentRepository):
             return await SqlAlchemyParentRepository(session).get_many(parent_ids, scope)
 
 
+async def _cleanup_local_fixture_mysql(container: AppContainer, settings: Settings) -> None:
+    async with container.repositories.session_factory.begin() as session:
+        await session.execute(delete(task_outbox))
+        await session.execute(delete(agent_events).where(agent_events.c.user_id == settings.default_user_id))
+        await session.execute(delete(agent_runs).where(agent_runs.c.user_id == settings.default_user_id))
+        await session.execute(delete(parent_chunks).where(parent_chunks.c.user_id == settings.default_user_id))
+        await session.execute(delete(documents).where(documents.c.user_id == settings.default_user_id))
+
+
 class RealQueryFixture:
     def __init__(
         self,
@@ -563,8 +600,7 @@ class RealQueryFixture:
     async def stop_worker(self) -> None:
         self._stop.set()
         if self._worker_task is not None:
-            with suppress(asyncio.CancelledError):
-                await self._worker_task
+            await self._worker_task
         self._worker_task = None
         if self._checkpoint_context is not None:
             await self._checkpoint_context.__aexit__(None, None, None)
@@ -618,22 +654,27 @@ class RealQueryFixture:
         return sum(event.event_type in {"RUN_COMPLETED", "RUN_FAILED", "RUN_CANCELLED"} for event in events)
 
     async def close(self) -> None:
-        await self.stop_worker()
-        await self.client.aclose()
-        await self._app_lifespan.__aexit__(None, None, None)
-        index_name = f"agenticrag-children-{self.settings.index_generation}"
-        await self.container.elasticsearch.indices.delete(
-            index=index_name,
-            ignore_unavailable=True,
+        failures: list[tuple[str, BaseException]] = []
+        await _record_fixture_teardown_error(failures, "Query Worker", self.stop_worker())
+        await _record_fixture_teardown_error(failures, "Query API client", self.client.aclose())
+        await _record_fixture_teardown_error(
+            failures, "Query API lifespan", self._app_lifespan.__aexit__(None, None, None)
         )
-        with suppress(Exception):
-            async with self.container.repositories.session_factory.begin() as session:
-                await session.execute(delete(task_outbox))
-                await session.execute(delete(agent_events).where(agent_events.c.user_id == self.settings.default_user_id))
-                await session.execute(delete(agent_runs).where(agent_runs.c.user_id == self.settings.default_user_id))
-                await session.execute(delete(parent_chunks).where(parent_chunks.c.user_id == self.settings.default_user_id))
-                await session.execute(delete(documents).where(documents.c.user_id == self.settings.default_user_id))
-        await self.container.close()
+        await _record_fixture_teardown_error(
+            failures,
+            "fixture Elasticsearch index",
+            self.container.elasticsearch.indices.delete(
+                index=f"agenticrag-children-{self.settings.index_generation}",
+                ignore_unavailable=True,
+            ),
+        )
+        await _record_fixture_teardown_error(
+            failures, "fixture MySQL state", _cleanup_local_fixture_mysql(self.container, self.settings)
+        )
+        await _record_fixture_teardown_error(
+            failures, "fixture container", _strict_container_close(self.container)
+        )
+        _raise_fixture_teardown_failures(failures)
 
 
 @pytest.fixture
@@ -871,34 +912,29 @@ class RealQueryRuntime(RealQueryFixture):
 
     async def close(self) -> None:
         """Tear down every real boundary even when the worker already failed."""
-        try:
-            await self.stop_worker()
-        finally:
-            # ``RealQueryFixture.stop_worker`` deliberately lets worker errors
-            # surface.  It therefore may not reach its checkpoint cleanup.
-            if self._checkpoint_context is not None:
-                with suppress(Exception):
-                    await self._checkpoint_context.__aexit__(None, None, None)
-                self._checkpoint_context = None
-            try:
-                if self._dependencies is not None:
-                    try:
-                        await close_query_dependencies(self._dependencies)
-                    finally:
-                        self._dependencies = None
-            finally:
-                try:
-                    await self.client.aclose()
-                finally:
-                    try:
-                        await self._app_lifespan.__aexit__(None, None, None)
-                    finally:
-                        try:
-                            await _cleanup_real_provider_runtime(
-                                self.container, self.settings, self._isolated_broker
-                            )
-                        finally:
-                            await self.container.close()
+        failures: list[tuple[str, BaseException]] = []
+        await _record_fixture_teardown_error(failures, "Query Worker", self.stop_worker())
+        if self._checkpoint_context is not None:
+            await _record_fixture_teardown_error(
+                failures, "Query checkpoint", self._checkpoint_context.__aexit__(None, None, None)
+            )
+            self._checkpoint_context = None
+        if self._dependencies is not None:
+            await _record_fixture_teardown_error(
+                failures, "Query dependencies", close_query_dependencies(self._dependencies)
+            )
+            self._dependencies = None
+        await _record_fixture_teardown_error(failures, "Query API client", self.client.aclose())
+        await _record_fixture_teardown_error(
+            failures, "Query API lifespan", self._app_lifespan.__aexit__(None, None, None)
+        )
+        await _cleanup_real_provider_boundaries(
+            failures, self.container, self.settings, self._isolated_broker
+        )
+        await _record_fixture_teardown_error(
+            failures, "fixture container", _strict_container_close(self.container)
+        )
+        _raise_fixture_teardown_failures(failures)
 
     async def _emit_controlled_degradation(self, run_id: str) -> None:
         if run_id in self._degradation_run_ids:
@@ -925,7 +961,7 @@ class RealQueryRuntime(RealQueryFixture):
         self._degradation_run_ids.add(run_id)
 
 
-async def _cleanup_real_provider_runtime(
+async def _cleanup_real_provider_mysql(
     container: AppContainer,
     settings: Settings,
     broker: IsolatedQueryBroker | None,
@@ -966,15 +1002,42 @@ async def _cleanup_real_provider_runtime(
         await session.execute(
             delete(documents).where(documents.c.user_id == settings.default_user_id)
         )
+async def _cleanup_real_provider_redis(
+    container: AppContainer, broker: IsolatedQueryBroker | None
+) -> None:
     if broker is not None:
         await container.redis.delete(*broker.cleanup_keys)
+
+
+async def _cleanup_real_provider_query_index(container: AppContainer, settings: Settings) -> None:
     await container.elasticsearch.indices.delete(
         index=f"agenticrag-children-{settings.index_generation}",
         ignore_unavailable=True,
     )
+async def _cleanup_real_provider_mem0_index(container: AppContainer, settings: Settings) -> None:
     await container.elasticsearch.indices.delete(
         index=settings.mem0_collection,
         ignore_unavailable=True,
+    )
+
+
+async def _cleanup_real_provider_boundaries(
+    failures: list[tuple[str, BaseException]],
+    container: AppContainer,
+    settings: Settings,
+    broker: IsolatedQueryBroker | None,
+) -> None:
+    await _record_fixture_teardown_error(
+        failures, "fixture MySQL state", _cleanup_real_provider_mysql(container, settings, broker)
+    )
+    await _record_fixture_teardown_error(
+        failures, "fixture Redis state", _cleanup_real_provider_redis(container, broker)
+    )
+    await _record_fixture_teardown_error(
+        failures, "fixture query index", _cleanup_real_provider_query_index(container, settings)
+    )
+    await _record_fixture_teardown_error(
+        failures, "fixture Mem0 index", _cleanup_real_provider_mem0_index(container, settings)
     )
 @pytest.fixture
 async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
@@ -1046,9 +1109,11 @@ async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
                     if app_lifespan is not None:
                         await app_lifespan.__aexit__(None, None, None)
                 finally:
-                    try:
-                        await _cleanup_real_provider_runtime(
-                            container, settings, isolated_broker
-                        )
-                    finally:
-                        await container.close()
+                    failures: list[tuple[str, BaseException]] = []
+                    await _cleanup_real_provider_boundaries(
+                        failures, container, settings, isolated_broker
+                    )
+                    await _record_fixture_teardown_error(
+                        failures, "fixture container", _strict_container_close(container)
+                    )
+                    _raise_fixture_teardown_failures(failures)

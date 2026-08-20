@@ -55,3 +55,9 @@ conda run -n agentic-rag pytest --import-mode=importlib \
 - `RealQueryFixture` 与 provider fixture 都不再吞 Elasticsearch index 删除错误；cleanup failure 会传播，避免测试把未清理的服务状态误判为成功。
 - 新增 RED/GREEN 回归分别覆盖：MySQL cleanup 失败后其他 durable backend 仍执行、两个 fixture 的 ES cleanup error 传播、以及 seeded Parent ID 的 API evidence 断言。
 - 验证：相关 `111 passed, 3 skipped`；全量 `635 passed, 47 skipped`；`ruff check .`、Task4 scoped `mypy`、`git diff --check` 均通过。真实 E2E 仍因缺少 `AGENTIC_RAG_TEST_MYSQL_DSN`、`AGENTIC_RAG_TEST_REDIS_DSN`、`AGENTIC_RAG_TEST_ELASTICSEARCH_URL` 明确 skip，未创建 PASS summary。
+
+## Follow-up review round 2
+
+- `RealQueryFixture.close` 与 `RealQueryRuntime.close` 都改为独立尝试 worker、client、lifespan、ES、MySQL/Redis、checkpoint/dependencies 与 strict `container.close(raise_on_error=True)`；所有 `BaseException` 累计，完成全部尝试后才重抛。
+- provider fixture 的 MySQL、Redis、query index 与 Mem0 index 也拆成独立 boundary。新增回归证明 ES 删除失败后 container close 仍以 strict mode 执行。
+- 验证：focused `11 passed, 1 skipped`；fixture scoped Ruff 与 mypy 通过。
