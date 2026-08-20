@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -106,6 +107,67 @@ class _NoopContainerClose:
         return None
 
 
+class _TrackingCleanupContext(_CleanupContext):
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    async def __aenter__(self) -> _CleanupSession:
+        self._events.append("mysql")
+        return await super().__aenter__()
+
+
+class _TrackingCleanupFactory:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def begin(self) -> _TrackingCleanupContext:
+        return _TrackingCleanupContext(self._events)
+
+
+class _TrackingRedis:
+    def __init__(self, events: list[str], *, error: BaseException | None = None) -> None:
+        self._events = events
+        self._error = error
+
+    async def delete(self, *keys: str) -> None:
+        assert keys
+        self._events.append("redis")
+        if self._error is not None:
+            raise self._error
+
+
+class _TrackingIndices:
+    def __init__(self, events: list[str], *, failing_index: str | None = None) -> None:
+        self._events = events
+        self._failing_index = failing_index
+
+    async def delete(self, *, index: str, ignore_unavailable: bool) -> None:
+        assert ignore_unavailable is True
+        self._events.append(f"elasticsearch:{index}")
+        if index == self._failing_index:
+            raise OSError("elasticsearch cleanup failed")
+
+
+class _TrackingCheckpointContext:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+        self._events.append("checkpoint")
+
+
+class _TrackingContainerClose:
+    def __init__(self, events: list[str], *, error: BaseException | None = None) -> None:
+        self._events = events
+        self._error = error
+
+    async def close(self, *, raise_on_error: bool = False) -> None:
+        self._events.append(f"container:{raise_on_error}")
+        if self._error is not None:
+            raise self._error
+
+
 @pytest.mark.asyncio
 async def test_real_fixture_cleanup_surfaces_elasticsearch_failures() -> None:
     container = SimpleNamespace(
@@ -135,6 +197,7 @@ async def test_shared_real_query_fixture_does_not_suppress_elasticsearch_cleanup
     fixture.container = SimpleNamespace(
         elasticsearch=SimpleNamespace(indices=_FailingIndices()),
         repositories=SimpleNamespace(session_factory=_CleanupFactory()),
+        redis=_Redis(),
         close=closer.close,
     )
     fixture.client = _NoopClient()
@@ -149,3 +212,75 @@ async def test_shared_real_query_fixture_does_not_suppress_elasticsearch_cleanup
         await fixture.close()
 
     assert closer.calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_shared_fixture_worker_failure_still_closes_checkpoint_mysql_and_redis() -> None:
+    events: list[str] = []
+    fixture: Any = object.__new__(query_services.RealQueryFixture)
+    closer = _TrackingContainerClose(events)
+    fixture.settings = SimpleNamespace(
+        index_generation="fixture-index",
+        default_user_id="fixture-user",
+    )
+    fixture.container = SimpleNamespace(
+        elasticsearch=SimpleNamespace(indices=_TrackingIndices(events)),
+        repositories=SimpleNamespace(session_factory=_TrackingCleanupFactory(events)),
+        redis=_TrackingRedis(events),
+        close=closer.close,
+    )
+    fixture.client = _NoopClient()
+    fixture._app_lifespan = _NoopLifespan()
+    fixture._stop = asyncio.Event()
+    fixture._checkpoint_context = _TrackingCheckpointContext(events)
+
+    async def fail_worker() -> None:
+        raise RuntimeError("worker task failed")
+
+    fixture._worker_task = asyncio.create_task(fail_worker())
+
+    with pytest.raises(query_services.FixtureTeardownError, match="Query Worker: RuntimeError"):
+        await fixture.close()
+
+    assert {"checkpoint", "mysql", "redis", "container:True"} <= set(events)
+
+
+@pytest.mark.asyncio
+async def test_real_runtime_es_failure_still_cleans_redis_and_aggregates_close_errors() -> None:
+    events: list[str] = []
+    runtime: Any = object.__new__(query_services.RealQueryRuntime)
+    closer = _TrackingContainerClose(events, error=RuntimeError("container close failed"))
+    query_index = "agenticrag-children-runtime-index"
+    runtime.settings = SimpleNamespace(
+        index_generation="runtime-index",
+        default_user_id="runtime-user",
+        mem0_collection="runtime-memory",
+    )
+    runtime.container = SimpleNamespace(
+        elasticsearch=SimpleNamespace(
+            indices=_TrackingIndices(events, failing_index=query_index)
+        ),
+        repositories=SimpleNamespace(session_factory=_TrackingCleanupFactory(events)),
+        redis=_TrackingRedis(events, error=ConnectionError("redis cleanup failed")),
+        close=closer.close,
+    )
+    runtime.client = _NoopClient()
+    runtime._app_lifespan = _NoopLifespan()
+    runtime._checkpoint_context = None
+    runtime._dependencies = None
+    runtime._isolated_broker = SimpleNamespace(cleanup_keys=("runtime-query",))
+
+    async def stop_worker() -> None:
+        return None
+
+    runtime.stop_worker = stop_worker
+
+    with pytest.raises(query_services.FixtureTeardownError) as caught:
+        await runtime.close()
+
+    message = str(caught.value)
+    assert "fixture query index: OSError" in message
+    assert "fixture Redis state: ConnectionError" in message
+    assert "fixture container: RuntimeError" in message
+    assert events.index(f"elasticsearch:{query_index}") < events.index("redis")
+    assert events.index("redis") < events.index("container:True")

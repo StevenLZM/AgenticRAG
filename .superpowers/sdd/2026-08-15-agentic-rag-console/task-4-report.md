@@ -61,3 +61,10 @@ conda run -n agentic-rag pytest --import-mode=importlib \
 - `RealQueryFixture.close` 与 `RealQueryRuntime.close` 都改为独立尝试 worker、client、lifespan、ES、MySQL/Redis、checkpoint/dependencies 与 strict `container.close(raise_on_error=True)`；所有 `BaseException` 累计，完成全部尝试后才重抛。
 - provider fixture 的 MySQL、Redis、query index 与 Mem0 index 也拆成独立 boundary。新增回归证明 ES 删除失败后 container close 仍以 strict mode 执行。
 - 验证：focused `11 passed, 1 skipped`；fixture scoped Ruff 与 mypy 通过。
+
+## Follow-up review round 3
+
+- `RealQueryFixture.stop_worker` 不再拥有 SQLite checkpoint context；`restart_worker` 与 `close` 分别把 worker task 和 checkpoint `__aexit__` 作为独立错误累计边界。即使 worker task 已失败，共享 fixture 仍会关闭 checkpoint，并继续 Elasticsearch、MySQL、Redis 与 strict container cleanup。
+- 共享 local-service fixture 新增显式 Query stream/dead-letter stream 及其 dedupe key 清理。provider runtime 按 query index、Mem0 index、MySQL、Redis、strict container 的顺序逐边界执行；ES、Redis 与 container 同时失败时会在完成全部 teardown 后汇总为 `FixtureTeardownError`。
+- RED：worker task failure 回归最初缺少 checkpoint/Redis cleanup；runtime 回归最初观察到 Redis 在 ES 之前执行，无法证明 ES failure 后继续清理。GREEN：两个 focused 回归 `2 passed`。
+- 验证：focused fixture/E2E `9 passed, 5 skipped`（仅显式真实服务 opt-in 跳过）；全量 `637 passed, 47 skipped`；`ruff check .`、修改文件 scoped mypy 与 `git diff --check` 均通过。
