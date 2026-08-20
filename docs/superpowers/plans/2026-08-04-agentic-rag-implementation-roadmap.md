@@ -64,7 +64,7 @@ conda run -n agentic-rag python scripts/verify_acceptance.py \
   --report var/artifacts/evals/real-api-current/summary.json
 ```
 
-`scripts/run_real_query_acceptance.py` 通过 EvalRunner console gate 证明当前 snapshot 与 `runtime_config_snapshot_id` 一致、精确 `client_provenance=real_query_api`、Mem0 读写可用、控制台/SSE 与恢复/备份证据。`scripts/verify_acceptance.py` 是通用验证器，只检查已有 summary 中的泄漏、引用覆盖、未审计答案、恢复/备份、`evaluation_mode`、非空且非 `fixture` 的 `client_provenance` 与正数 `real_query_count`；它不单独校验当前 snapshot、精确 provenance 或 Mem0。真实接受脚本的 console gate 先通过后，通用验证器才应对生成 summary 返回零。
+`scripts/run_real_query_acceptance.py` 先调用 `EvalRunner.run()`，再由 `console_acceptance_passed` 控制台门禁在 EvalRunner 后执行，证明当前 snapshot 与 `runtime_config_snapshot_id` 一致、精确 `client_provenance=real_query_api`、Mem0 读写可用、控制台/SSE 与恢复/备份证据。`scripts/verify_acceptance.py` 是通用验证器，只检查已有 summary 中的泄漏、引用覆盖、未审计答案、恢复/备份、`evaluation_mode`、非空且非 `fixture` 的 `client_provenance` 与正数 `real_query_count`；它不单独校验当前 snapshot、精确 provenance 或 Mem0。真实接受脚本的 `console_acceptance_passed` 控制台门禁先通过后，通用验证器才应对生成 summary 返回零。
 
 ## 上线前审批事项
 

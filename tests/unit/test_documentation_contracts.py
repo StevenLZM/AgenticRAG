@@ -109,8 +109,10 @@ def test_docs_keep_process_api_acceptance_and_checkpoint_boundaries_accurate() -
         assert "QueryState/SQLite checkpoint" in document
         assert "QueryState/Run" not in document
 
-    for document in (progress, roadmap):
+    for document in (operations, progress, roadmap):
         assert "run_real_query_acceptance.py" in document
-        assert "EvalRunner console gate" in document
+        assert "console_acceptance_passed" in document
+        assert "在 EvalRunner 后执行" in document
+        assert "EvalRunner console gate" not in document
         assert "通用验证器" in document
         assert "不单独校验" in document

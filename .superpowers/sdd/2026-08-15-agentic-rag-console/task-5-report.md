@@ -30,6 +30,12 @@ git diff --check
 无输出（通过）
 ```
 
+## 修复轮 2：控制台门禁归属更正
+
+- `run_real_query_acceptance.py` 的顺序为先调用 `EvalRunner.run()`，再单独执行 `console_acceptance_passed()`；它不是 EvalRunner 的内置 console gate。
+- 三份运维/状态文档统一为“`console_acceptance_passed` 控制台门禁在 EvalRunner 后执行”，并保留通用 `scripts/verify_acceptance.py` 的职责边界。
+- 文档契约改为要求 `console_acceptance_passed`、`在 EvalRunner 后执行`，并拒绝陈旧的 `EvalRunner console gate` 归属表述。
+
 ## 注意事项
 
 - 真实 Graph/API 与 Mem0 验收仍是显式 opt-in；缺少隔离服务变量时测试必须清晰 skip，不能生成 PASS summary。

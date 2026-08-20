@@ -240,6 +240,6 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
   tests/e2e/test_release_query_gate.py -q
 ```
 
-默认的 `fixture` 模式仅用于离线冒烟测试，并会打印 `SMOKE ONLY`；它永远不能满足最终验收。`scripts/run_real_query_acceptance.py` 会调用 EvalRunner console gate，校验当前 snapshot、精确的 `client_provenance=real_query_api`、Mem0 读写可用性、控制台页面、SSE 与恢复/备份证据，然后才提升最终 summary。Graph/API 模式也会持久化真实客户端来源证明，并拒绝运行时快照与组合出的 QueryGraph/API Run 不一致的案例。请基于已播种的文档和当前 `RuntimeConfigSnapshot` 准备 `runtime-baseline.jsonl`，不要事后修改数据集的 snapshot ID。
+默认的 `fixture` 模式仅用于离线冒烟测试，并会打印 `SMOKE ONLY`；它永远不能满足最终验收。`scripts/run_real_query_acceptance.py` 先调用 `EvalRunner.run()` 生成真实评测 summary，再由 `console_acceptance_passed` 控制台门禁在 EvalRunner 后执行，校验当前 snapshot、精确的 `client_provenance=real_query_api`、Mem0 读写可用性、控制台页面、SSE 与恢复/备份证据，然后才提升最终 summary。Graph/API 模式也会持久化真实客户端来源证明，并拒绝运行时快照与组合出的 QueryGraph/API Run 不一致的案例。请基于已播种的文档和当前 `RuntimeConfigSnapshot` 准备 `runtime-baseline.jsonl`，不要事后修改数据集的 snapshot ID。
 
-`scripts/verify_acceptance.py` 是通用验证器：它只校验 summary 已有的泄漏、引用覆盖、未审计答案、恢复/备份、`evaluation_mode`、非空且非 `fixture` 的 `client_provenance` 与正数 `real_query_count` 字段；它不单独校验当前 snapshot、精确 `real_query_api` provenance 或 Mem0。必须先运行真实接受脚本及其 EvalRunner console gate，再让通用验证器检查生成的 Graph/API summary。未配置 Ragas 后端时，Ragas 会明确保持 `unavailable`，不会伪造分数。
+`scripts/verify_acceptance.py` 是通用验证器：它只校验 summary 已有的泄漏、引用覆盖、未审计答案、恢复/备份、`evaluation_mode`、非空且非 `fixture` 的 `client_provenance` 与正数 `real_query_count` 字段；它不单独校验当前 snapshot、精确 `real_query_api` provenance 或 Mem0。必须先运行真实接受脚本，在 EvalRunner 后执行 `console_acceptance_passed` 控制台门禁，再让通用验证器检查生成的 Graph/API summary。未配置 Ragas 后端时，Ragas 会明确保持 `unavailable`，不会伪造分数。

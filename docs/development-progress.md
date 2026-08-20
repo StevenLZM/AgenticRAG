@@ -53,7 +53,7 @@
 
 - 真实服务测试在隔离 MySQL、Redis、Elasticsearch、Mem0 collection、SQLite checkpoint 和 Artifact 中执行，不触碰默认生产命名空间。
 - `scripts/run_real_query_acceptance.py` 启动真实 Query Worker/API，使用当前 snapshot、真实 Graph/API、真实 client provenance 与 Mem0，生成 `evaluation_mode=api`、`client_provenance=real_query_api` 和 `runtime_config_snapshot_id` 证据。
-- `scripts/run_real_query_acceptance.py` 与其 EvalRunner console gate 校验当前 snapshot、精确 `client_provenance=real_query_api`、Mem0 读写、控制台/SSE 以及恢复和备份证据。`scripts/verify_acceptance.py` 是通用验证器，只校验其已有的 summary 字段：正数 `real_query_count`、`user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`、恢复/备份、`evaluation_mode` 与非空且非 `fixture` 的 `client_provenance`；它不单独校验当前 snapshot、精确 provenance 或 Mem0。`fixture` 的 `SMOKE ONLY` 结果不能替代该验收。
+- `scripts/run_real_query_acceptance.py` 先调用 `EvalRunner.run()`，再由 `console_acceptance_passed` 控制台门禁在 EvalRunner 后执行，校验当前 snapshot、精确 `client_provenance=real_query_api`、Mem0 读写、控制台/SSE 以及恢复和备份证据。`scripts/verify_acceptance.py` 是通用验证器，只校验其已有的 summary 字段：正数 `real_query_count`、`user_leak_count=0`、`citation_coverage=1.0`、`unaudited_answer_count=0`、恢复/备份、`evaluation_mode` 与非空且非 `fixture` 的 `client_provenance`；它不单独校验当前 snapshot、精确 provenance 或 Mem0。`fixture` 的 `SMOKE ONLY` 结果不能替代该验收。
 - 已覆盖 MySQL schema/API、Redis Streams、Elasticsearch 检索、Mem0 provider、真实模型、恢复演练与备份恢复；外部服务变量缺失时对应 opt-in 测试会明确 skip，已配置但服务不健康时必须失败。
 
 ## 本地运行与验证入口
