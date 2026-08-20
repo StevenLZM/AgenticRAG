@@ -1,6 +1,6 @@
 # Agentic RAG 生产实现路线图
 
-> **当前实现状态：** 五个阶段、Query Runtime/Mem0/真实评测后续加固，以及控制台运行时补强均已完成并已合并到 `main`。当前基线为 `fb1a5b5`；不存在待合并的实现分支。真实 Graph/API 验收使用当前 snapshot、真实 client provenance 与隔离服务资源。剩余工作仅为生产鉴权/RBAC 和 reranker 分数标定等上线审批事项。
+> **当前实现状态：** 五个阶段、Query Runtime/Mem0/真实评测后续加固，以及控制台运行时补强均已完成并已合并到 `main`。当前基线为 `f3a0e53`（控制台最终边界加固；以 `git log -1 --oneline` 为准）；不存在待合并的实现分支。真实 Graph/API 验收使用当前 snapshot、真实 client provenance 与隔离服务资源。剩余工作仅为生产鉴权/RBAC 和 reranker 分数标定等上线审批事项。
 
 > **使用说明：** 本路线图记录已交付的生产能力与继续开发的门禁。新增变更必须遵循 red-green-refactor，保持命令、环境变量、API 路径、事件名、状态枚举和文件路径可直接复制。
 

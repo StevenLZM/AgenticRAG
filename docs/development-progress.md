@@ -10,7 +10,7 @@
 
 - 仓库根目录：`/Users/steven/LzmWorkSpace/AgenticRAG`
 - 当前分支：`main`
-- 当前基线：`fb1a5b5`
+- 当前基线：`f3a0e53`（控制台最终边界加固；以 `git log -1 --oneline` 为准）
 - Conda 环境：`agentic-rag`
 - 启动前检查：在仓库根目录运行 `git status --short` 和 `git log -5 --oneline`，确认当前 `main` 工作树干净。
 
