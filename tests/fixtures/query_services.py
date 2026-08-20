@@ -622,8 +622,10 @@ class RealQueryFixture:
         await self.client.aclose()
         await self._app_lifespan.__aexit__(None, None, None)
         index_name = f"agenticrag-children-{self.settings.index_generation}"
-        with suppress(Exception):
-            await self.container.elasticsearch.indices.delete(index=index_name, ignore_unavailable=True)
+        await self.container.elasticsearch.indices.delete(
+            index=index_name,
+            ignore_unavailable=True,
+        )
         with suppress(Exception):
             async with self.container.repositories.session_factory.begin() as session:
                 await session.execute(delete(task_outbox))
@@ -713,6 +715,11 @@ class RealQueryRuntime(RealQueryFixture):
         if self._evaluation_summary is None:
             raise RuntimeError("real Query evaluation has not completed")
         return self._evaluation_summary
+
+    @property
+    def seeded_parent_id(self) -> str:
+        """Server-created Parent ID the live API answer must cite."""
+        return self._parent_id
 
     async def start_worker(self) -> None:
         dependencies = await build_query_dependencies(
@@ -961,16 +968,14 @@ async def _cleanup_real_provider_runtime(
         )
     if broker is not None:
         await container.redis.delete(*broker.cleanup_keys)
-    with suppress(Exception):
-        await container.elasticsearch.indices.delete(
-            index=f"agenticrag-children-{settings.index_generation}",
-            ignore_unavailable=True,
-        )
-    with suppress(Exception):
-        await container.elasticsearch.indices.delete(
-            index=settings.mem0_collection,
-            ignore_unavailable=True,
-        )
+    await container.elasticsearch.indices.delete(
+        index=f"agenticrag-children-{settings.index_generation}",
+        ignore_unavailable=True,
+    )
+    await container.elasticsearch.indices.delete(
+        index=settings.mem0_collection,
+        ignore_unavailable=True,
+    )
 @pytest.fixture
 async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
     """Opt-in live provider fixture; setup errors fail instead of becoming a pass."""

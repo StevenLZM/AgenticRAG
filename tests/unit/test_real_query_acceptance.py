@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.run_real_query_acceptance import (
     AcceptanceTeardownError,
+    _cleanup_durable_boundaries,
     _invalidate_previous_summary,
     _raise_teardown_failures,
     _record_teardown_error,
@@ -143,4 +145,68 @@ async def test_teardown_continues_after_cancellation_and_reraises_it_after_clean
 
     assert completed == ["http client"]
     with pytest.raises(asyncio.CancelledError):
+        _raise_teardown_failures(failures)
+
+
+class _BrokenMysqlContext:
+    async def __aenter__(self) -> object:
+        raise OSError("mysql cleanup failed")
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+
+
+class _BrokenMysqlFactory:
+    def begin(self) -> _BrokenMysqlContext:
+        return _BrokenMysqlContext()
+
+
+class _RecordingRedis:
+    def __init__(self) -> None:
+        self.keys: tuple[str, ...] = ()
+
+    async def delete(self, *keys: str) -> None:
+        self.keys = keys
+
+
+class _RecordingIndices:
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    async def delete(self, *, index: str, ignore_unavailable: bool) -> None:
+        assert ignore_unavailable is True
+        self.deleted.append(index)
+
+
+@pytest.mark.asyncio
+async def test_durable_cleanup_continues_after_mysql_failure() -> None:
+    """One failed durable boundary cannot strand Redis or either isolated index."""
+    redis = _RecordingRedis()
+    indices = _RecordingIndices()
+    container = SimpleNamespace(
+        repositories=SimpleNamespace(session_factory=_BrokenMysqlFactory()),
+        redis=redis,
+        elasticsearch=SimpleNamespace(indices=indices),
+    )
+    settings = SimpleNamespace(
+        default_user_id="acceptance-user",
+        index_generation="acceptance-index",
+        mem0_collection="acceptance-memory",
+    )
+    broker = SimpleNamespace(cleanup_keys=("private-query", "private-dead"))
+    failures: list[tuple[str, BaseException]] = []
+
+    await _cleanup_durable_boundaries(
+        failures,
+        container=container,  # type: ignore[arg-type]
+        settings=settings,  # type: ignore[arg-type]
+        broker=broker,  # type: ignore[arg-type]
+    )
+
+    assert redis.keys == ("private-query", "private-dead")
+    assert indices.deleted == [
+        "agenticrag-children-acceptance-index",
+        "acceptance-memory",
+    ]
+    with pytest.raises(AcceptanceTeardownError, match="acceptance MySQL state: OSError"):
         _raise_teardown_failures(failures)

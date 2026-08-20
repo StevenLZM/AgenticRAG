@@ -50,6 +50,7 @@ async def test_console_real_graph_api_query_has_snapshot_provenance_and_gates(
     assert answer["audited"] is True
     assert answer["segments"]
     assert answer["evidence_parent_ids"]
+    assert real_query_runtime.seeded_parent_id in answer["evidence_parent_ids"]
 
     degradation = next(
         event for event in events if event["event_type"] == "CIRCUIT_OPEN"

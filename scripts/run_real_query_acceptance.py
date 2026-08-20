@@ -587,12 +587,8 @@ async def _seed_document(
     return parent_id
 
 
-async def _cleanup(
-    container: AppContainer,
-    settings: Settings,
-    broker: IsolatedQueryBroker | None,
-) -> None:
-    """Delete only this acceptance user's durable rows, queues and indices."""
+async def _cleanup_mysql_state(container: AppContainer, settings: Settings) -> None:
+    """Delete only this acceptance user's MySQL rows."""
     run_ids: list[str] = []
     async with container.repositories.session_factory.begin() as session:
         run_ids = list(
@@ -628,19 +624,58 @@ async def _cleanup(
         await session.execute(
             delete(documents).where(documents.c.user_id == settings.default_user_id)
         )
+
+
+async def _cleanup_redis_state(
+    container: AppContainer,
+    broker: IsolatedQueryBroker | None,
+) -> None:
+    """Delete only the private stream and dedupe keys owned by this attempt."""
     if broker is not None:
         # The adapter's stream/group is private to this acceptance attempt.
         # Delete entire keys rather than scanning production queue names, so
         # teardown cannot observe, ACK or alter another worker's delivery.
         await container.redis.delete(*broker.cleanup_keys)
+
+
+async def _cleanup_query_index(container: AppContainer, settings: Settings) -> None:
+    """Delete this acceptance attempt's isolated child index."""
     await container.elasticsearch.indices.delete(
         index=f"agenticrag-children-{settings.index_generation}",
         ignore_unavailable=True,
     )
+
+
+async def _cleanup_mem0_index(container: AppContainer, settings: Settings) -> None:
+    """Delete this acceptance attempt's isolated Mem0 index."""
     await container.elasticsearch.indices.delete(
         index=settings.mem0_collection,
         ignore_unavailable=True,
     )
+
+
+async def _cleanup_durable_boundaries(
+    failures: list[tuple[str, BaseException]],
+    *,
+    container: AppContainer,
+    settings: Settings,
+    broker: IsolatedQueryBroker | None,
+) -> None:
+    """Attempt every durable-state cleanup even if an earlier backend fails."""
+    await _record_teardown_error(
+        failures, "acceptance MySQL state", _cleanup_mysql_state(container, settings)
+    )
+    await _record_teardown_error(
+        failures, "acceptance Redis state", _cleanup_redis_state(container, broker)
+    )
+    await _record_teardown_error(
+        failures, "acceptance query index", _cleanup_query_index(container, settings)
+    )
+    await _record_teardown_error(
+        failures, "acceptance Mem0 index", _cleanup_mem0_index(container, settings)
+    )
+
+
 async def run(output: Path) -> dict[str, object]:
     _invalidate_previous_summary(output)
     base, mysql_dsn, redis_url, elasticsearch_url = _require_real_provider_base_settings()
@@ -871,10 +906,11 @@ async def run(output: Path) -> dict[str, object]:
                 close_query_dependencies(dependencies),
             )
         if container is not None:
-            await _record_teardown_error(
+            await _cleanup_durable_boundaries(
                 teardown_failures,
-                "acceptance durable state",
-                _cleanup(container, settings, isolated_broker),
+                container=container,
+                settings=settings,
+                broker=isolated_broker,
             )
             await _record_teardown_error(
                 teardown_failures,

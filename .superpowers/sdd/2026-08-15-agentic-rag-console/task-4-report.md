@@ -47,3 +47,11 @@ conda run -n agentic-rag pytest --import-mode=importlib \
 
 - 要完成真实 provider 放行，操作者需要提供以上三个指向 loopback 测试服务的显式变量，并保留有效 DeepSeek、Qwen 与 Mem0 配置；随后运行 brief 中的 `run_real_query_acceptance.py` 和 opt-in E2E 命令。已配置后任一 provider outage 或 schema 失败都会 fail closed。
 - 对 `tests/unit/memory/test_service.py` 运行独立 mypy 仍报告 12 个既有 fake/模型构造注解问题（行 144–299，早于本任务新增的 outage assertions）；本任务新增/修改的 production、fixture、script 和 gate 文件的 scoped mypy 已通过。
+
+## Follow-up review round 1
+
+- `run_real_query_acceptance.py` 不再把 MySQL、Redis、查询 index 与 Mem0 index 清理串在单个 coroutine 中。它们现在是四个独立 guarded teardown boundary；MySQL 失败后仍会尝试删除 private Redis keys、当前 generation child index 和 Mem0 collection，并把所有失败累计到 fail-closed gate。
+- 真实 E2E 明确断言 `answer.evidence_parent_ids` 包含 fixture seed 生成的 server Parent ID，而不只检查字段非空。`RealQueryRuntime` 只暴露该 server-created ID 给该断言。
+- `RealQueryFixture` 与 provider fixture 都不再吞 Elasticsearch index 删除错误；cleanup failure 会传播，避免测试把未清理的服务状态误判为成功。
+- 新增 RED/GREEN 回归分别覆盖：MySQL cleanup 失败后其他 durable backend 仍执行、两个 fixture 的 ES cleanup error 传播、以及 seeded Parent ID 的 API evidence 断言。
+- 验证：相关 `111 passed, 3 skipped`；全量 `635 passed, 47 skipped`；`ruff check .`、Task4 scoped `mypy`、`git diff --check` 均通过。真实 E2E 仍因缺少 `AGENTIC_RAG_TEST_MYSQL_DSN`、`AGENTIC_RAG_TEST_REDIS_DSN`、`AGENTIC_RAG_TEST_ELASTICSEARCH_URL` 明确 skip，未创建 PASS summary。
