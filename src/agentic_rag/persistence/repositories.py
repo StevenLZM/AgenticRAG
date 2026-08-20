@@ -23,6 +23,7 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     case,
+    exists,
     func,
     insert,
     or_,
@@ -34,6 +35,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects import mysql
 from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.sql.elements import ColumnElement
 
 from agentic_rag.domain.models import (
     DocumentStatus,
@@ -48,6 +50,7 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 metadata = MetaData()
 ast_locator_type = Text().with_variant(mysql.LONGTEXT(), "mysql")
+DEFAULT_QUERY_OUTBOX_STREAM = "agenticrag:jobs:query"
 
 documents = Table(
     "documents",
@@ -673,7 +676,10 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         *,
         question: str = "",
         transaction: AsyncSession | None = None,
+        outbox_stream_name: str = DEFAULT_QUERY_OUTBOX_STREAM,
     ) -> QueryRun:
+        if not outbox_stream_name.strip():
+            raise ValueError("query outbox stream name must not be blank")
         session = self._session(transaction)
         now = _now()
         run = QueryRun(
@@ -714,7 +720,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                 id=new_id(),
                 aggregate_type="query_run",
                 aggregate_id=run.id,
-                stream_name="agenticrag:jobs:query",
+                stream_name=outbox_stream_name,
                 status="pending",
                 attempt_count=0,
                 next_attempt_at=now,
@@ -1305,7 +1311,12 @@ class SqlAlchemyEventRepository(_SqlAlchemyRepository):
 
 class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
     async def list_pending(
-        self, limit: int, *, aggregate_type: str | None = None
+        self,
+        limit: int,
+        *,
+        aggregate_type: str | None = None,
+        user_id: str | None = None,
+        stream_name: str | None = None,
     ) -> list[OutboxRecord]:
         if limit <= 0:
             return []
@@ -1315,6 +1326,8 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
         ]
         if aggregate_type is not None:
             predicates.append(task_outbox.c.aggregate_type == aggregate_type)
+        predicates.extend(_query_outbox_scope_predicates(aggregate_type, user_id))
+        predicates.extend(_outbox_stream_predicates(stream_name))
         rows = (
             (
                 await self._session().execute(
@@ -1330,7 +1343,12 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
         return _outbox_records(rows)
 
     async def claim_pending(
-        self, limit: int, *, aggregate_type: str | None = None
+        self,
+        limit: int,
+        *,
+        aggregate_type: str | None = None,
+        user_id: str | None = None,
+        stream_name: str | None = None,
     ) -> list[OutboxRecord]:
         if limit <= 0:
             return []
@@ -1342,6 +1360,8 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
         ]
         if aggregate_type is not None:
             predicates.append(task_outbox.c.aggregate_type == aggregate_type)
+        predicates.extend(_query_outbox_scope_predicates(aggregate_type, user_id))
+        predicates.extend(_outbox_stream_predicates(stream_name))
         rows = (
             (
                 await session.execute(
@@ -1361,24 +1381,84 @@ class SqlAlchemyOutboxRepository(_SqlAlchemyRepository):
                 .where(
                     task_outbox.c.id.in_([row["id"] for row in rows]),
                     task_outbox.c.status == "pending",
+                    *_query_outbox_scope_predicates(aggregate_type, user_id),
+                    *_outbox_stream_predicates(stream_name),
                 )
                 .values(next_attempt_at=now + OUTBOX_CLAIM_LEASE)
             )
         return _outbox_records(rows)
 
-    async def mark_dispatched(self, outbox_id: str) -> None:
+    async def mark_dispatched(
+        self,
+        outbox_id: str,
+        *,
+        user_id: str | None = None,
+        stream_name: str | None = None,
+    ) -> None:
         await self._session().execute(
             update(task_outbox)
-            .where(task_outbox.c.id == outbox_id, task_outbox.c.status == "pending")
+            .where(
+                task_outbox.c.id == outbox_id,
+                task_outbox.c.status == "pending",
+                *_query_outbox_scope_predicates("query_run", user_id),
+                *_outbox_stream_predicates(stream_name),
+            )
             .values(status="dispatched", dispatched_at=_now())
         )
 
-    async def schedule_retry(self, outbox_id: str) -> None:
+    async def schedule_retry(
+        self,
+        outbox_id: str,
+        *,
+        user_id: str | None = None,
+        stream_name: str | None = None,
+    ) -> None:
         await self._session().execute(
             update(task_outbox)
-            .where(task_outbox.c.id == outbox_id, task_outbox.c.status == "pending")
+            .where(
+                task_outbox.c.id == outbox_id,
+                task_outbox.c.status == "pending",
+                *_query_outbox_scope_predicates("query_run", user_id),
+                *_outbox_stream_predicates(stream_name),
+            )
             .values(next_attempt_at=_now() + timedelta(seconds=5))
         )
+
+
+def _query_outbox_scope_predicates(
+    aggregate_type: str | None,
+    user_id: str | None,
+) -> tuple[ColumnElement[bool], ...]:
+    """Fence optional outbox work to query runs owned by one server user.
+
+    General workers intentionally dispatch every due row.  Disposable live
+    acceptance workers instead set ``user_id`` so they cannot lease, publish,
+    retry or mark another user's Query Outbox row while sharing a MySQL server.
+    """
+    if user_id is None:
+        return ()
+    if not user_id.strip():
+        raise ValueError("outbox user_id must not be blank")
+    if aggregate_type not in {None, "query_run"}:
+        raise ValueError("outbox user scope is supported only for query_run rows")
+    return (
+        task_outbox.c.aggregate_type == "query_run",
+        exists(
+            select(agent_runs.c.id).where(
+                agent_runs.c.id == task_outbox.c.aggregate_id,
+                agent_runs.c.user_id == user_id,
+            )
+        ),
+    )
+
+
+def _outbox_stream_predicates(stream_name: str | None) -> tuple[ColumnElement[bool], ...]:
+    """Optionally constrain a dispatcher to its own durable stream route."""
+    if stream_name is None:
+        return ()
+    if not stream_name.strip():
+        raise ValueError("outbox stream name must not be blank")
+    return (task_outbox.c.stream_name == stream_name,)
 
 
 def _outbox_records(rows: Sequence[Any]) -> list[OutboxRecord]:

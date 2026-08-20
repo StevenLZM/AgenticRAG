@@ -31,6 +31,7 @@ from agentic_rag.persistence.repositories import (  # noqa: E402
 from agentic_rag.query.graph import QueryGraphDependencies  # noqa: E402
 from agentic_rag.runtime.concurrency import ConcurrencyManager  # noqa: E402
 from agentic_rag.runtime.query_worker import (  # noqa: E402
+    QUERY_STREAM,
     QueryWorker,
     build_graph_factory,
 )
@@ -48,15 +49,36 @@ DependenciesFactory = Callable[[AppContainer, Settings], Awaitable[QueryGraphDep
 class TransactionalQueryOutboxAdapter:
     """Open a short SQL transaction for Query Outbox lifecycle operations."""
 
-    def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        *,
+        user_id: str | None = None,
+        stream_name: str = QUERY_STREAM,
+    ) -> None:
+        if user_id is not None and not user_id.strip():
+            raise ValueError("query outbox user_id must not be blank")
+        if not stream_name.strip():
+            raise ValueError("query outbox stream name must not be blank")
+        if stream_name.startswith("agenticrag:e2e:") and user_id is None:
+            # Acceptance runs share MySQL with ordinary workers.  A private
+            # Redis stream prevents broker delivery collisions, while this
+            # required user predicate prevents an accidentally reused stream
+            # name from leasing another acceptance user's outbox row.
+            raise ValueError("private query outbox stream requires a user_id")
         self._factory = factory
+        self._user_id = user_id
+        self._stream_name = stream_name
 
     async def list_pending(
         self, limit: int, *, aggregate_type: str | None = None
     ) -> list[OutboxRecord]:
         async with self._factory() as session:
             return await SqlAlchemyOutboxRepository(session).list_pending(
-                limit, aggregate_type=aggregate_type
+                limit,
+                aggregate_type=aggregate_type,
+                user_id=self._user_id,
+                stream_name=self._stream_name,
             )
 
     async def claim_pending(
@@ -64,16 +86,27 @@ class TransactionalQueryOutboxAdapter:
     ) -> list[OutboxRecord]:
         async with self._factory.begin() as session:
             return await SqlAlchemyOutboxRepository(session).claim_pending(
-                limit, aggregate_type=aggregate_type
+                limit,
+                aggregate_type=aggregate_type,
+                user_id=self._user_id,
+                stream_name=self._stream_name,
             )
 
     async def mark_dispatched(self, outbox_id: str) -> None:
         async with self._factory.begin() as session:
-            await SqlAlchemyOutboxRepository(session).mark_dispatched(outbox_id)
+            await SqlAlchemyOutboxRepository(session).mark_dispatched(
+                outbox_id,
+                user_id=self._user_id,
+                stream_name=self._stream_name,
+            )
 
     async def schedule_retry(self, outbox_id: str) -> None:
         async with self._factory.begin() as session:
-            await SqlAlchemyOutboxRepository(session).schedule_retry(outbox_id)
+            await SqlAlchemyOutboxRepository(session).schedule_retry(
+                outbox_id,
+                user_id=self._user_id,
+                stream_name=self._stream_name,
+            )
 
 
 async def run(

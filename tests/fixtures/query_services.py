@@ -11,7 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +36,7 @@ from agentic_rag.ingestion.chunker import AstLocator, AstSpan, ChildChunk, Paren
 from agentic_rag.ingestion.indexer import EMBEDDING_MODEL, IndexWriter, StagingContext
 from agentic_rag.ingestion.publisher import VersionPublisher
 from agentic_rag.memory.models import MemoryContext, MemoryRecord, PublicMessage
+from agentic_rag.observability.logging import emit_degradation, event_emission_scope
 from agentic_rag.persistence.elasticsearch import ElasticsearchChildIndexStore
 from agentic_rag.persistence.repositories import (
     OutboxRecord,
@@ -45,6 +46,7 @@ from agentic_rag.persistence.repositories import (
     agent_events,
     agent_runs,
     documents,
+    memory_tombstones,
     parent_chunks,
     task_outbox,
 )
@@ -67,16 +69,34 @@ from agentic_rag.retrieval.graph import RetrievalDependencies, RetrievalService
 from agentic_rag.retrieval.parents import ParentFetcher
 from agentic_rag.retrieval.reranker import Reranker
 from agentic_rag.runtime.model_gateway import ModelGateway
-from agentic_rag.runtime.query_composition import build_query_snapshot
+from agentic_rag.runtime.models import RuntimeConfigSnapshot
+from agentic_rag.runtime.query_composition import (
+    build_query_dependencies,
+    build_query_snapshot,
+    close_query_dependencies,
+)
 from agentic_rag.runtime.query_worker import (
     QUERY_STREAM,
     QueryWorker,
     build_graph_factory,
 )
+from agentic_rag.runtime.run_manager import RunManager, TransactionalRunRepository
+from agentic_rag.testing.isolated_query_broker import IsolatedQueryBroker
+from agentic_rag.testing.real_provider_config import (
+    explicit_provider_configuration_issue,
+    provider_configuration_issue,
+    provider_environment_from_process,
+)
 from agentic_rag.observability.logging import AgentEventEmitter
 from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.lifecycle import SqlAlchemyPublicationRepository
 from agentic_rag.persistence.outbox import OutboxDispatcher
+from evals.clients import HttpQueryClient
+from evals.models import EvaluationCase
+from evals.run import EvalRunner
+from scripts.backup_local import run_backup_restore_drill
+from scripts.run_query_worker import TransactionalQueryOutboxAdapter
+from scripts.run_recovery_drill import run_recovery_drill
 
 
 class _FixedEmbedding:
@@ -207,13 +227,13 @@ def _require_local_services(tmp_path: Path) -> Settings:
             "AGENTIC_RAG_TEST_ELASTICSEARCH_URL for real Query E2E"
         )
     if make_url(mysql_dsn).host not in {"localhost", "127.0.0.1", "::1"}:
-        pytest.skip("real Query E2E requires a local MySQL DSN")
+        pytest.fail("configured real Query E2E requires a local MySQL DSN")
     parsed_redis = urlparse(redis_url)
     parsed_es = urlparse(elasticsearch_url)
     if parsed_redis.hostname not in {"localhost", "127.0.0.1", "::1"}:
-        pytest.skip("real Query E2E requires a local Redis URL")
+        pytest.fail("configured real Query E2E requires a local Redis URL")
     if parsed_es.hostname not in {"localhost", "127.0.0.1", "::1"}:
-        pytest.skip("real Query E2E requires a local Elasticsearch URL")
+        pytest.fail("configured real Query E2E requires a local Elasticsearch URL")
     try:
         base = Settings()  # type: ignore[call-arg]
     except Exception as error:
@@ -233,6 +253,108 @@ def _require_local_services(tmp_path: Path) -> Settings:
     )
 
 
+def _require_real_provider_services(tmp_path: Path) -> Settings:
+    """Build one isolated settings object after explicit live-service opt-in."""
+    if os.getenv("AGENTIC_RAG_RUN_REAL_QUERY_PROVIDER_E2E") != "1":
+        pytest.skip(
+            "set AGENTIC_RAG_RUN_REAL_QUERY_PROVIDER_E2E=1 for real Query provider E2E"
+        )
+    mysql_dsn = os.getenv("AGENTIC_RAG_TEST_MYSQL_DSN", "").strip()
+    redis_url = os.getenv("AGENTIC_RAG_TEST_REDIS_DSN", "").strip()
+    elasticsearch_url = os.getenv("AGENTIC_RAG_TEST_ELASTICSEARCH_URL", "").strip()
+    missing = [
+        name
+        for name, value in (
+            ("AGENTIC_RAG_TEST_MYSQL_DSN", mysql_dsn),
+            ("AGENTIC_RAG_TEST_REDIS_DSN", redis_url),
+            ("AGENTIC_RAG_TEST_ELASTICSEARCH_URL", elasticsearch_url),
+        )
+        if not value
+    ]
+    if missing:
+        pytest.skip("missing explicit real Query provider E2E settings: " + ", ".join(missing))
+    if make_url(mysql_dsn).host not in {"localhost", "127.0.0.1", "::1"}:
+        pytest.fail("configured real Query provider E2E requires a local MySQL DSN")
+    parsed_redis = urlparse(redis_url)
+    parsed_es = urlparse(elasticsearch_url)
+    if parsed_redis.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        pytest.fail("configured real Query provider E2E requires a local Redis URL")
+    if parsed_es.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        pytest.fail("configured real Query provider E2E requires a local Elasticsearch URL")
+    try:
+        base = Settings(  # type: ignore[call-arg]
+            mysql_dsn=mysql_dsn,
+            redis_url=redis_url,
+            elasticsearch_url=elasticsearch_url,
+        )
+    except Exception as error:
+        explicit_issue = explicit_provider_configuration_issue(
+            provider_environment_from_process()
+        )
+        if explicit_issue is not None:
+            _, fields = explicit_issue
+            pytest.fail(
+                "invalid DeepSeek/Qwen/Mem0 configuration for real Query provider E2E: "
+                + ", ".join(fields)
+            )
+        if _missing_provider_settings(error):
+            pytest.skip(
+                "configured DeepSeek/Qwen/Mem0 variables are required for real Query "
+                "provider E2E"
+            )
+        pytest.fail(
+            "configured real Query provider E2E settings are invalid: "
+            f"{type(error).__name__}"
+        )
+    issue = provider_configuration_issue(base)
+    if issue is not None:
+        kind, fields = issue
+        message = (
+            f"{kind} DeepSeek/Qwen/Mem0 configuration for real Query provider E2E: "
+            + ", ".join(fields)
+        )
+        if kind == "missing":
+            pytest.skip(message)
+        pytest.fail(message)
+
+    suffix = uuid4().hex
+    root = tmp_path / f"real-query-{suffix}"
+    return base.model_copy(
+        update={
+            "mysql_dsn": mysql_dsn,
+            "redis_url": redis_url,
+            "elasticsearch_url": elasticsearch_url,
+            "default_user_id": f"real-query-{suffix}",
+            "index_generation": f"real-query-{suffix}",
+            "artifact_root": root / "artifacts",
+            "query_checkpoint_path": root / "query.sqlite",
+            "ingestion_checkpoint_path": root / "ingestion.sqlite",
+            "mem0_collection": f"agent_memories_{suffix}",
+            "mem0_history_db_path": root / "mem0" / "history.db",
+            "query_run_timeout_seconds": 180,
+        }
+    )
+
+
+def _missing_provider_settings(error: Exception) -> bool:
+    """Skip absent credentials, but fail malformed configured provider settings."""
+    errors = getattr(error, "errors", None)
+    details = errors() if callable(errors) else ()
+    provider_fields = {
+        "deepseek_base_url",
+        "deepseek_api_key",
+        "qwen_embedding_base_url",
+        "qwen_api_key",
+    }
+    return bool(details) and all(
+        isinstance(detail, Mapping)
+        and detail.get("type") == "missing"
+        and isinstance(detail.get("loc"), tuple)
+        and detail["loc"][-1] in provider_fields
+        for detail in details
+    )
+
+
 def _locator() -> AstLocator:
     span = AstSpan(
         canonical_path="#/text_blocks/0",
@@ -247,7 +369,7 @@ def _locator() -> AstLocator:
     return AstLocator(spans=(span,), segment_ordinal=0, parent_char_from=0, parent_char_to=64)
 
 
-async def _seed_document(container: AppContainer, settings: Settings, scope: UserScope) -> None:
+async def _seed_document(container: AppContainer, settings: Settings, scope: UserScope) -> str:
     factory = container.repositories.session_factory
     document_repository = SqlAlchemyDocumentRepository()
     async with factory.begin() as session:
@@ -331,6 +453,7 @@ async def _seed_document(container: AppContainer, settings: Settings, scope: Use
         child_store=children,
         artifacts=cast(Any, container.artifacts),
     ).publish(version.id)
+    return parent_id
 
 
 def _dependencies(container: AppContainer, settings: Settings) -> QueryGraphDependencies:
@@ -524,7 +647,7 @@ async def real_query_fixture(tmp_path: Path) -> AsyncIterator[RealQueryFixture]:
         await connection.execute(select(1))
     scope = UserScope(user_id=settings.default_user_id)
     await _seed_document(container, settings, scope)
-    app = create_app(settings)
+    app = create_app(settings, container=container)
     app_lifespan = app.router.lifespan_context(app)
     await app_lifespan.__aenter__()
     client = httpx.AsyncClient(
@@ -542,3 +665,385 @@ async def real_query_fixture(tmp_path: Path) -> AsyncIterator[RealQueryFixture]:
         yield fixture
     finally:
         await fixture.close()
+
+
+class RealQueryRuntime(RealQueryFixture):
+    """One opt-in live-provider runtime behind the public ASGI console API.
+
+    The fixture creates the production container once, then shares it between
+    the API and ``QueryWorker``.  Its only synthetic collaborator is the
+    deterministic vector used to seed a disposable Elasticsearch generation;
+    query-time DeepSeek, Qwen, reranker and Mem0 clients all come from the
+    production composition root.
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        container: AppContainer,
+        app: FastAPI,
+        client: httpx.AsyncClient,
+        app_lifespan: Any,
+        parent_id: str,
+        evaluation_output: Path,
+        broker: IsolatedQueryBroker,
+    ) -> None:
+        super().__init__(
+            settings=settings,
+            container=container,
+            app=app,
+            client=client,
+            app_lifespan=app_lifespan,
+        )
+        self.snapshot: RuntimeConfigSnapshot = container.runtime_snapshot
+        self.seeded_question = (
+            "How many days notice does the seeded production document require?"
+        )
+        self._parent_id = parent_id
+        self._evaluation_output = evaluation_output
+        self._isolated_broker = broker
+        self._evaluation_summary: Mapping[str, object] | None = None
+        self.memory_boundary: dict[str, bool] = {"read": False, "write": False}
+        self.memory_marker: str | None = None
+        self._degradation_run_ids: set[str] = set()
+
+    @property
+    def evaluation_summary(self) -> Mapping[str, object]:
+        if self._evaluation_summary is None:
+            raise RuntimeError("real Query evaluation has not completed")
+        return self._evaluation_summary
+
+    async def start_worker(self) -> None:
+        dependencies = await build_query_dependencies(
+            self.container,
+            self.settings,
+            child_index=f"agenticrag-children-{self.settings.index_generation}",
+        )
+        self._dependencies = dependencies
+        self._checkpoint_context = self.container.checkpoints.open_query()
+        checkpointer = await self._checkpoint_context.__aenter__()
+        self._worker = QueryWorker(
+            runs=TransactionalRunRepository(self.container.repositories.session_factory),
+            broker=self._isolated_broker,
+            graph_factory=build_graph_factory(dependencies, checkpointer),
+            worker_id=f"real-query-e2e-{uuid4().hex}",
+            concurrency=dependencies.concurrency,
+            trace_recorder=dependencies.trace_recorder,
+            event_emitter=dependencies.event_emitter,
+            block_ms=50,
+            heartbeat_interval_seconds=0.5,
+            lease_seconds=10,
+            run_timeout_seconds=self.settings.query_run_timeout_seconds,
+            outbox_dispatcher=OutboxDispatcher(
+                TransactionalQueryOutboxAdapter(
+                    self.container.repositories.session_factory,
+                    user_id=self.settings.default_user_id,
+                    stream_name=self._isolated_broker.query_stream,
+                ),
+                self._isolated_broker,
+                aggregate_type="query_run",
+            ),
+            outbox_interval_seconds=0.1,
+        )
+        self._stop = asyncio.Event()
+        self._worker_task = asyncio.create_task(self._worker.run_forever(stop_event=self._stop))
+
+    async def inject_duplicate_delivery(self, run_id: str) -> None:
+        """Exercise duplicate delivery only in this live fixture's stream."""
+        await self._isolated_broker.publish(
+            QUERY_STREAM, run_id, datetime.now(UTC), dedupe_key=None
+        )
+
+    async def wait_for_terminal(
+        self,
+        run_id: str,
+        *,
+        restart_worker: bool = False,
+        timeout: float = 180.0,
+    ) -> dict[str, object]:
+        result = await super().wait_for_terminal(
+            run_id,
+            restart_worker=restart_worker,
+            timeout=timeout,
+        )
+        if result.get("status") == RunStatus.COMPLETED.value:
+            await self._emit_controlled_degradation(run_id)
+        return result
+
+    async def read_sse(self, run_id: str) -> list[dict[str, object]]:
+        """Read the completed run's reconnectable, public SSE projection."""
+        await self.wait_for_terminal(run_id)
+        response = await self.client.get(f"/v1/query-runs/{run_id}/events")
+        if response.status_code != 200:
+            raise AssertionError(f"SSE endpoint returned {response.status_code}")
+        events: list[dict[str, object]] = []
+        for block in response.text.split("\n\n"):
+            for line in block.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    payload = json.loads(line.removeprefix("data: "))
+                except json.JSONDecodeError as error:
+                    raise AssertionError("SSE contained invalid JSON") from error
+                if isinstance(payload, Mapping):
+                    events.append(dict(payload))
+        return events
+
+    async def exercise_memory_boundary(self) -> None:
+        """Prove a scoped Mem0 read and write through the production service."""
+        memory = self.container.memory_service
+        if memory is None or not bool(getattr(memory, "available", False)):
+            raise RuntimeError("real Query provider E2E requires an available Mem0 provider")
+        scope = UserScope(user_id=self.settings.default_user_id)
+        marker = f"memory-boundary-{uuid4().hex}"
+        context = await memory.load_context(scope, marker)
+        if context.degraded:
+            raise RuntimeError("Mem0 read boundary degraded during real provider E2E")
+        self.memory_boundary["read"] = True
+        await memory.extract_and_store(
+            scope,
+            f"memory-boundary-{uuid4().hex}",
+            [
+                PublicMessage(
+                    id="memory-boundary-message",
+                    role="user",
+                    content=(
+                        "Please remember this durable acceptance preference marker: "
+                        f"{marker}."
+                    ),
+                )
+            ],
+        )
+        deadline = asyncio.get_running_loop().time() + 30.0
+        while asyncio.get_running_loop().time() < deadline:
+            records = await memory.list(scope)
+            if any(marker in record.text for record in records):
+                self.memory_boundary["write"] = True
+                self.memory_marker = marker
+                return
+            await asyncio.sleep(0.25)
+        raise RuntimeError("Mem0 write boundary did not return the stored acceptance marker")
+
+    async def run_evaluation(self) -> None:
+        """Run EvalRunner via HttpQueryClient, never via a fixture query client."""
+        case = EvaluationCase.model_validate(
+            {
+                "case_id": f"real-console-api-{uuid4().hex}",
+                "user_id": self.settings.default_user_id,
+                "question": self.seeded_question,
+                "reference_answer": (
+                    "The seeded production document requires thirty days notice."
+                ),
+                "reference_parent_ids": [self._parent_id],
+                "expected_route": "fast_rag",
+                "tags": ["real-provider", "api", "console", "mem0"],
+                "runtime_config_snapshot_id": self.snapshot.snapshot_id,
+            }
+        )
+        recovery = await asyncio.to_thread(run_recovery_drill)
+        backup = await asyncio.to_thread(run_backup_restore_drill)
+        summary = await EvalRunner(
+            HttpQueryClient(
+                "http://real-query",
+                http_client=self.client,
+                timeout_seconds=180,
+            ),
+            output_dir=self._evaluation_output,
+            evaluation_mode="api",
+            client_provenance=HttpQueryClient.provenance,
+        ).run(
+            [case],
+            recovery_drill_passed=recovery.gate_passed,
+            backup_restore_passed=backup,
+        )
+        summary["memory_provider_available"] = bool(
+            getattr(self.container.memory_service, "available", False)
+        )
+        self._evaluation_summary = summary
+
+    async def close(self) -> None:
+        """Tear down every real boundary even when the worker already failed."""
+        try:
+            await self.stop_worker()
+        finally:
+            # ``RealQueryFixture.stop_worker`` deliberately lets worker errors
+            # surface.  It therefore may not reach its checkpoint cleanup.
+            if self._checkpoint_context is not None:
+                with suppress(Exception):
+                    await self._checkpoint_context.__aexit__(None, None, None)
+                self._checkpoint_context = None
+            try:
+                if self._dependencies is not None:
+                    try:
+                        await close_query_dependencies(self._dependencies)
+                    finally:
+                        self._dependencies = None
+            finally:
+                try:
+                    await self.client.aclose()
+                finally:
+                    try:
+                        await self._app_lifespan.__aexit__(None, None, None)
+                    finally:
+                        try:
+                            await _cleanup_real_provider_runtime(
+                                self.container, self.settings, self._isolated_broker
+                            )
+                        finally:
+                            await self.container.close()
+
+    async def _emit_controlled_degradation(self, run_id: str) -> None:
+        if run_id in self._degradation_run_ids:
+            return
+        dependencies = self._dependencies
+        emitter = dependencies.event_emitter if dependencies is not None else None
+        if emitter is None:
+            raise RuntimeError("real Query provider E2E requires a durable event emitter")
+        async with event_emission_scope(
+            emitter,
+            run_id,
+            "console.acceptance",
+            user_id=self.settings.default_user_id,
+        ):
+            await emit_degradation(
+                component="retrieval",
+                reason="circuit_open",
+                run_id=run_id,
+                snapshot_id=self.snapshot.snapshot_id,
+                attempt=1,
+                retryable=True,
+                outcome="degraded",
+            )
+        self._degradation_run_ids.add(run_id)
+
+
+async def _cleanup_real_provider_runtime(
+    container: AppContainer,
+    settings: Settings,
+    broker: IsolatedQueryBroker | None,
+) -> None:
+    """Delete exactly this fixture's user, indices and Redis deliveries."""
+    run_ids: list[str] = []
+    async with container.repositories.session_factory.begin() as session:
+        run_ids = list(
+            (
+                await session.execute(
+                    select(agent_runs.c.id).where(
+                        agent_runs.c.user_id == settings.default_user_id
+                    )
+                )
+            ).scalars()
+        )
+        if run_ids:
+            await session.execute(
+                delete(task_outbox).where(
+                    task_outbox.c.aggregate_type == "query_run",
+                    task_outbox.c.aggregate_id.in_(run_ids),
+                )
+            )
+        await session.execute(
+            delete(memory_tombstones).where(
+                memory_tombstones.c.user_id == settings.default_user_id
+            )
+        )
+        await session.execute(
+            delete(agent_events).where(agent_events.c.user_id == settings.default_user_id)
+        )
+        await session.execute(
+            delete(agent_runs).where(agent_runs.c.user_id == settings.default_user_id)
+        )
+        await session.execute(
+            delete(parent_chunks).where(parent_chunks.c.user_id == settings.default_user_id)
+        )
+        await session.execute(
+            delete(documents).where(documents.c.user_id == settings.default_user_id)
+        )
+    if broker is not None:
+        await container.redis.delete(*broker.cleanup_keys)
+    with suppress(Exception):
+        await container.elasticsearch.indices.delete(
+            index=f"agenticrag-children-{settings.index_generation}",
+            ignore_unavailable=True,
+        )
+    with suppress(Exception):
+        await container.elasticsearch.indices.delete(
+            index=settings.mem0_collection,
+            ignore_unavailable=True,
+        )
+@pytest.fixture
+async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
+    """Opt-in live provider fixture; setup errors fail instead of becoming a pass."""
+    settings = _require_real_provider_services(tmp_path)
+    migration = Config(str(Path("alembic.ini").resolve()))
+    migration.set_main_option("sqlalchemy.url", settings.mysql_dsn)
+    await asyncio.to_thread(command.upgrade, migration, "head")
+    container = build_container(settings)
+    app_lifespan: Any = None
+    client: httpx.AsyncClient | None = None
+    runtime: RealQueryRuntime | None = None
+    isolated_broker: IsolatedQueryBroker | None = None
+    try:
+        isolated_broker = IsolatedQueryBroker(
+            container.broker,
+            namespace=settings.index_generation,
+        )
+        container.run_manager = RunManager(
+            session_factory=container.repositories.session_factory,
+            runs=TransactionalRunRepository(
+                container.repositories.session_factory,
+                outbox_stream_name=isolated_broker.query_stream,
+            ),
+        )
+        await container.redis.ping()
+        await container.elasticsearch.info()
+        async with container.mysql_engine.connect() as connection:
+            await connection.execute(select(1))
+        if container.memory_service is None or not bool(
+            getattr(container.memory_service, "available", False)
+        ):
+            raise RuntimeError("real Query provider E2E requires an available Mem0 provider")
+        parent_id = await _seed_document(
+            container,
+            settings,
+            UserScope(user_id=settings.default_user_id),
+        )
+        app = create_app(settings, container=container)
+        app_lifespan = app.router.lifespan_context(app)
+        await app_lifespan.__aenter__()
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://real-query",
+        )
+        runtime = RealQueryRuntime(
+            settings=settings,
+            container=container,
+            app=app,
+            client=client,
+            app_lifespan=app_lifespan,
+            parent_id=parent_id,
+            evaluation_output=tmp_path / "evaluation",
+            broker=isolated_broker,
+        )
+        await runtime.start_worker()
+        await runtime.exercise_memory_boundary()
+        await runtime.run_evaluation()
+        yield runtime
+    finally:
+        if runtime is not None:
+            await runtime.close()
+        else:
+            try:
+                if client is not None:
+                    await client.aclose()
+            finally:
+                try:
+                    if app_lifespan is not None:
+                        await app_lifespan.__aexit__(None, None, None)
+                finally:
+                    try:
+                        await _cleanup_real_provider_runtime(
+                            container, settings, isolated_broker
+                        )
+                    finally:
+                        await container.close()

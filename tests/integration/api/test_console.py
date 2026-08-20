@@ -68,6 +68,19 @@ process.stdout.write(JSON.stringify({
   query: call("buildQueryPayload", "  需要检索的问题  "),
   headers: [call("buildSseHeaders", 0), call("buildSseHeaders", 17)],
   unknown: call("eventPresentation", {event_type: "INTERNAL_TOOL_PAYLOAD", summary: "private"}),
+  degradation: call("eventPresentation", {
+    event_type: "RETRIEVAL_DEGRADED",
+    summary: "degraded",
+    attributes: {
+      component: "dense",
+      reason: "lane_timeout",
+      outcome: "degraded",
+      retryable: true,
+      attempt: 1,
+      prompt: "never expose this prompt",
+      provider_response: "Bearer never expose this provider output"
+    }
+  }),
   notices: ["RETRIEVAL_DEGRADED", "CIRCUIT_OPEN", "MODEL_REPAIR_EXHAUSTED", "WORKER_DLQ", "AUDIT_REFUSED"].map((type) => call("noticeCodeForEvent", type)),
   terminal: ["research_action_invalid", "research_round_limit", "audit_failed", "cannot_answer", "refuse", "clarify"].map((status) => call("terminalNoticeCode", {answer: {status}})),
   memory: call("memoryErrorPresentation", "provider unavailable"),
@@ -122,6 +135,18 @@ def test_console_client_contract_preserves_scope_and_safe_terminal_states() -> N
         "label": "进度更新",
         "summary": "进度更新",
         "noticeCode": None,
+    }
+    assert contract["degradation"] == {
+        "label": "RETRIEVAL_DEGRADED",
+        "summary": "degraded",
+        "noticeCode": "RETRIEVAL_DEGRADED",
+        "attributes": {
+            "attempt": 1,
+            "component": "dense",
+            "outcome": "degraded",
+            "reason": "lane_timeout",
+            "retryable": True,
+        },
     }
     assert contract["notices"] == [
         "RETRIEVAL_DEGRADED",

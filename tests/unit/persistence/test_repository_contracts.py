@@ -217,6 +217,23 @@ async def test_run_creation_stages_run_and_matching_outbox_in_same_transaction()
 
 
 @pytest.mark.asyncio
+async def test_run_creation_can_stage_an_isolated_query_outbox_stream() -> None:
+    """A live acceptance Run is never visible to the global Query stream."""
+    transaction = RecordingSession()
+    private_stream = "agenticrag:e2e:real-query-a1b2:query"
+
+    await SqlAlchemyRunRepository().create_queued(
+        scope=UserScope(user_id="acceptance-user"),
+        thread_id="thread-1",
+        snapshot=SNAPSHOT,
+        transaction=cast(AsyncSession, transaction),
+        outbox_stream_name=private_stream,
+    )
+
+    assert transaction.statements[1].compile().params["stream_name"] == private_stream
+
+
+@pytest.mark.asyncio
 async def test_job_creation_stages_job_and_matching_outbox_in_same_transaction() -> (
     None
 ):
@@ -373,6 +390,48 @@ async def test_outbox_claim_and_retry_leave_transaction_commit_to_the_caller() -
     assert "next_attempt_at" in transaction.statements[1].compile().params
     assert transaction.statements[2].table.name == "task_outbox"
     assert transaction.commit_called is False
+
+
+@pytest.mark.asyncio
+async def test_query_outbox_user_scope_fences_claim_and_lifecycle_updates() -> None:
+    """An isolated acceptance dispatcher may never claim another user's Run."""
+    now = datetime.now(UTC)
+    transaction = RecordingSession(
+        rows=[
+            {
+                "id": "outbox-1",
+                "aggregate_type": "query_run",
+                "aggregate_id": "run-1",
+                "stream_name": "agenticrag:jobs:query",
+                "status": "pending",
+                "attempt_count": 0,
+                "next_attempt_at": now,
+                "created_at": now,
+            }
+        ]
+    )
+    repository = SqlAlchemyOutboxRepository(cast(AsyncSession, transaction))
+    private_stream = "agenticrag:e2e:real-query-a1b2:query"
+
+    records = await repository.claim_pending(
+        limit=1,
+        aggregate_type="query_run",
+        user_id="acceptance-user",
+        stream_name=private_stream,
+    )
+    await repository.mark_dispatched(
+        "outbox-1", user_id="acceptance-user", stream_name=private_stream
+    )
+    await repository.schedule_retry(
+        "outbox-1", user_id="acceptance-user", stream_name=private_stream
+    )
+
+    assert [record.aggregate_id for record in records] == ["run-1"]
+    for statement in transaction.statements:
+        rendered = str(statement.whereclause)
+        assert "agent_runs.user_id" in rendered
+        assert "EXISTS" in rendered
+        assert "task_outbox.stream_name" in rendered
 
 
 @pytest.mark.asyncio

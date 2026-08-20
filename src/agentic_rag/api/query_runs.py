@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from agentic_rag.api.errors import ApiException
 from agentic_rag.domain.models import RunStatus, UserScope
+from agentic_rag.observability.logging import sanitize_attributes, sanitize_summary
 from agentic_rag.persistence.repositories import ActiveRunConflict, AgentEvent, QueryRun
 from agentic_rag.runtime.ids import new_id
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
@@ -110,6 +111,23 @@ _PUBLIC_EVENT_TYPES = {
     "RUN_CANCELLED",
     "USER_FEEDBACK",
 }
+_PUBLIC_DEGRADATION_EVENT_TYPES = {
+    "COMPONENT_DEGRADED",
+    "COMPONENT_REFUSED",
+    "RETRIEVAL_DEGRADED",
+    "CIRCUIT_OPEN",
+    "OUTBOX_RETRY",
+    "WORKER_DLQ",
+    "QUERY_TIMEOUT",
+    "LEASE_LOST",
+    "MODEL_RETRY",
+    "MODEL_RETRY_EXHAUSTED",
+    "MODEL_REPAIR_EXHAUSTED",
+    "AUDIT_REFUSED",
+}
+_PUBLIC_DEGRADATION_ATTRIBUTE_FIELDS = frozenset(
+    {"attempt", "component", "reason", "outcome", "retryable"}
+)
 
 
 def _scope(request: Request) -> UserScope:
@@ -278,7 +296,8 @@ async def query_run_events(
                     if event.id is None or event.id <= cursor:
                         continue
                     cursor = event.id
-                    yield _sse_event(event)
+                    container = request.app.state.container
+                    yield _sse_event(event, artifacts=getattr(container, "artifacts", None))
                 continue
             if current.status in TERMINAL_STATUSES:
                 return
@@ -297,18 +316,53 @@ def _parse_cursor(value: str | None) -> int:
     return max(cursor, 0)
 
 
-def _sse_event(event: AgentEvent) -> str:
+def _sse_event(event: AgentEvent, *, artifacts: object | None = None) -> str:
     is_public = event.event_type in _PUBLIC_EVENT_TYPES
     event_type = event.event_type if is_public else "PROGRESS"
-    payload = {
+    payload: dict[str, object] = {
         "run_id": event.run_id,
         "event_type": event_type,
         # Unknown event types may contain internal/tool payload summaries. Do
         # not forward their source text merely because the event row is scoped.
-        "summary": event.summary[:1_000] if is_public else "progress update",
+        # A public event *type* only permits its stable notification shape.
+        # Event summaries can still originate from model, provider or tool
+        # boundaries, so project them through the telemetry sanitizer instead
+        # of treating the durable row as a client-safe payload.
+        "summary": sanitize_summary(event.summary) if is_public else "progress update",
         "created_at": (event.created_at or datetime.now(UTC)).isoformat(),
     }
+    attributes = _safe_degradation_attributes(event, artifacts)
+    if attributes:
+        payload["attributes"] = attributes
     return f"id: {event.id}\nevent: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def _safe_degradation_attributes(
+    event: AgentEvent, artifacts: object | None
+) -> dict[str, object]:
+    """Read only the event artifact's existing allowlisted degradation metadata."""
+    if (
+        event.event_type not in _PUBLIC_DEGRADATION_EVENT_TYPES
+        or not isinstance(event.payload_ref, str)
+        or not event.payload_ref
+        or artifacts is None
+    ):
+        return {}
+    describe = getattr(artifacts, "describe", None)
+    read_json = getattr(artifacts, "read_json", None)
+    if not callable(describe) or not callable(read_json):
+        return {}
+    try:
+        payload = read_json(describe(event.payload_ref))
+    except Exception:
+        return {}
+    raw_attributes = payload.get("attributes") if isinstance(payload, Mapping) else None
+    sanitized = sanitize_attributes(raw_attributes if isinstance(raw_attributes, Mapping) else None)
+    return {
+        key: sanitized[key]
+        for key in _PUBLIC_DEGRADATION_ATTRIBUTE_FIELDS
+        if key in sanitized
+    }
 
 
 @query_runs_router.post("/query")

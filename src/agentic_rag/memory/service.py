@@ -49,6 +49,10 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 logger = logging.getLogger(__name__)
 
 
+class MemoryProviderUnavailable(OSError):
+    """An operational Mem0 failure that callers must not mistake for an empty namespace."""
+
+
 @runtime_checkable
 class MemoryService(Protocol):
     """The only memory API exposed to query-graph dependencies."""
@@ -71,9 +75,11 @@ class MemoryService(Protocol):
 class MemoryServiceImpl:
     """Enforce user isolation and durable deletion around an unreliable provider.
 
-    Provider outages are operational degradation: reads are empty and writes are
-    ignored.  Scope mismatches are security failures and therefore return no
-    data / perform no mutation.
+    Query-time context loading and capture degrade without failing an otherwise
+    valid answer.  Explicit list/delete calls instead propagate an operational
+    outage so the public API can distinguish it from an empty namespace.
+    Scope mismatches are security failures and therefore return no data / make
+    no mutation.
     """
 
     def __init__(
@@ -152,7 +158,7 @@ class MemoryServiceImpl:
             return self._records(await self._mem0.get_all(user_id=scope.user_id), scope)
         except _operational_errors() as error:
             await _log_degraded("list", error)
-            return []
+            raise _provider_unavailable(error) from error
 
     async def delete(self, scope: UserScope, memory_id: str) -> None:
         # Refuse an unowned / nonexistent ID before creating a deletion record.
@@ -160,7 +166,7 @@ class MemoryServiceImpl:
             visible = self._records(await self._mem0.get_all(user_id=scope.user_id), scope)
         except _operational_errors() as error:
             await _log_degraded("delete", error)
-            return
+            raise _provider_unavailable(error) from error
         if memory_id not in {record.id for record in visible}:
             return
 
@@ -168,8 +174,8 @@ class MemoryServiceImpl:
             await self._tombstones.request(scope, memory_id)
         except _operational_errors() as error:
             await _log_degraded("tombstone_request", error)
-            return
-        await self._attempt_delete(scope, memory_id)
+            raise _provider_unavailable(error) from error
+        await self._attempt_delete(scope, memory_id, raise_on_failure=True)
 
     async def reconcile_deletions(self) -> None:
         try:
@@ -181,7 +187,13 @@ class MemoryServiceImpl:
             # Tombstones are application-owned; reconstructing this scope is safe.
             await self._attempt_delete(UserScope(user_id=tombstone.user_id), tombstone.memory_id)
 
-    async def _attempt_delete(self, scope: UserScope, memory_id: str) -> None:
+    async def _attempt_delete(
+        self,
+        scope: UserScope,
+        memory_id: str,
+        *,
+        raise_on_failure: bool = False,
+    ) -> None:
         try:
             visible = self._records(
                 await self._mem0.get_all(user_id=scope.user_id), scope
@@ -211,6 +223,8 @@ class MemoryServiceImpl:
                 await self._tombstones.mark_retry(scope, memory_id, type(error).__name__)
             except _operational_errors():
                 pass
+            if raise_on_failure:
+                raise _provider_unavailable(error) from error
             return
         try:
             await self._tombstones.mark_completed(scope, memory_id)
@@ -358,6 +372,11 @@ def _operational_errors() -> tuple[type[BaseException], ...]:
         InternalServerError,
         RateLimitError,
     )
+
+
+def _provider_unavailable(error: BaseException) -> MemoryProviderUnavailable:
+    """Normalize provider exception classes at the API-facing service boundary."""
+    return MemoryProviderUnavailable(f"memory provider unavailable: {type(error).__name__}")
 
 
 async def _log_degraded(operation: str, error: BaseException) -> None:

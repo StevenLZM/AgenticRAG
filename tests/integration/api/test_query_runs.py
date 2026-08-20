@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -17,6 +19,7 @@ from fastapi import FastAPI
 from agentic_rag.api.errors import register_error_handlers
 from agentic_rag.domain.models import RunStatus, UserScope
 from agentic_rag.memory.models import MemoryRecord, MemoryType
+from agentic_rag.persistence.artifacts import LocalArtifactStore
 from agentic_rag.persistence.repositories import ActiveRunConflict, AgentEvent, QueryRun
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
@@ -144,6 +147,7 @@ def _app(
     runs: FakeRunManager | None = None,
     events: FakeEvents | None = None,
     memory: FakeMemory | None = None,
+    artifacts: object | None = None,
 ) -> tuple[FastAPI, FakeRunManager, FakeEvents, FakeMemory]:
     run_manager = runs or FakeRunManager()
     event_repository = events or FakeEvents()
@@ -154,6 +158,7 @@ def _app(
         run_manager=run_manager,
         event_repository=event_repository,
         memory_service=memory_service,
+        artifacts=artifacts,
     )
     from agentic_rag.api.feedback import feedback_router
     from agentic_rag.api.memories import memories_router
@@ -285,6 +290,33 @@ async def test_sse_unknown_event_does_not_forward_raw_summary() -> None:
 
 
 @pytest.mark.integration
+async def test_sse_public_event_does_not_forward_raw_summary() -> None:
+    """A public event name never authorizes prompt/provider/tool summary text."""
+    event = AgentEvent(
+        id=1,
+        event_key="public-raw-summary",
+        trace_id="trace-1",
+        run_id="run-1",
+        user_id=SCOPE.user_id,
+        event_type="TOOL_COMPLETED",
+        summary="Bearer provider response with prompt and raw tool_input",
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        created_at=datetime.now(UTC),
+    )
+    runs = FakeRunManager(runs={"run-1": _run(status=RunStatus.COMPLETED)})
+    app, _, _, _ = _app(runs, FakeEvents(events=[event]))
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/query-runs/run-1/events")
+
+    assert response.status_code == 200
+    assert "Bearer " not in response.text
+    assert "prompt" not in response.text
+    assert "tool_input" not in response.text
+    assert '"summary":"telemetry event"' in response.text
+
+
+@pytest.mark.integration
 async def test_sse_exposes_safe_degradation_event_notice() -> None:
     event = AgentEvent(
         id=1,
@@ -309,16 +341,93 @@ async def test_sse_exposes_safe_degradation_event_notice() -> None:
 
 
 @pytest.mark.integration
-async def test_unconfigured_memory_list_fails_closed() -> None:
+async def test_sse_exposes_only_allowlisted_degradation_attributes(tmp_path: Path) -> None:
+    """A console can render reason/outcome/retryability without raw provider data."""
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    payload_ref = artifacts.put_json(
+        "observability/events/degradation.json",
+        {
+            "attributes": {
+                "attempt": 1,
+                "component": "dense",
+                "outcome": "degraded",
+                "prompt": "never expose this prompt",
+                "provider_response": "Bearer secret-provider-text",
+                "reason": "lane_timeout",
+                "retryable": True,
+                "tool_input": "never expose this tool payload",
+            }
+        },
+    )
+    event = AgentEvent(
+        id=1,
+        event_key="retrieval-degraded-attributes",
+        trace_id="trace-1",
+        run_id="run-1",
+        user_id=SCOPE.user_id,
+        event_type="RETRIEVAL_DEGRADED",
+        summary="degraded",
+        payload_ref=payload_ref.uri,
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        created_at=datetime.now(UTC),
+    )
+    runs = FakeRunManager(runs={"run-1": _run(status=RunStatus.COMPLETED)})
+    app, _, _, _ = _app(runs, FakeEvents(events=[event]), artifacts=artifacts)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/query-runs/run-1/events")
+
+    assert response.status_code == 200
+    payload = next(
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    )
+    assert payload["attributes"] == {
+        "attempt": 1,
+        "component": "dense",
+        "outcome": "degraded",
+        "reason": "lane_timeout",
+        "retryable": True,
+    }
+    assert "never expose" not in response.text
+    assert "Bearer " not in response.text
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("error_type", (OSError, TimeoutError, ConnectionError))
+async def test_memory_list_provider_errors_fail_closed(
+    error_type: type[OSError],
+) -> None:
     class UnavailableMemory(FakeMemory):
         async def list(self, scope: UserScope) -> list[MemoryRecord]:
             del scope
-            raise OSError("provider unavailable")
+            raise error_type("provider unavailable")
 
     app, _, _, _ = _app(memory=UnavailableMemory())
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/v1/memories")
+
+    assert response.status_code == 503
+    assert response.json()["error_code"] == "MEMORY_UNAVAILABLE"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("error_type", (OSError, TimeoutError, ConnectionError))
+async def test_memory_delete_provider_errors_fail_closed(
+    error_type: type[OSError],
+) -> None:
+    class UnavailableMemory(FakeMemory):
+        async def delete(self, scope: UserScope, memory_id: str) -> None:
+            del scope, memory_id
+            raise error_type("provider unavailable")
+
+    app, _, _, _ = _app(memory=UnavailableMemory())
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete("/v1/memories/memory-1")
 
     assert response.status_code == 503
     assert response.json()["error_code"] == "MEMORY_UNAVAILABLE"

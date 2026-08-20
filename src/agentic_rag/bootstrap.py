@@ -65,8 +65,14 @@ class AppContainer:
     event_repository: object | None = None
     memory_service: MemoryService | None = None
 
-    async def close(self) -> None:
-        """Attempt cleanup of every process-owned async client."""
+    async def close(self, *, raise_on_error: bool = False) -> None:
+        """Attempt cleanup of every process-owned async client.
+
+        Normal service shutdown remains best-effort so one remote close does
+        not prevent sibling clients from closing.  Acceptance runners may set
+        ``raise_on_error`` to turn every observed close failure into a durable
+        gate failure after all siblings have still been attempted.
+        """
         memory_resources = tuple(
             getattr(self.memory_service, "_owned_resources", ())
             if self.memory_service is not None
@@ -81,13 +87,17 @@ class AppContainer:
             if asyncio.iscoroutine(value):
                 await value
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             self.elasticsearch.close(),
             self.redis.aclose(),
             self.mysql_engine.dispose(),
             *(close_resource(resource) for resource in reversed(memory_resources)),
             return_exceptions=True,
         )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if raise_on_error and failures:
+            detail = ", ".join(type(error).__name__ for error in failures)
+            raise RuntimeError(f"container cleanup failed: {detail}")
 
 
 class _TransactionalEventRepository:

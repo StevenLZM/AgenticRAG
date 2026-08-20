@@ -32,6 +32,19 @@
     AUDIT_REFUSED: "audit_failed",
     QUERY_REFUSED: "refuse"
   };
+  const SAFE_DEGRADATION_COMPONENTS = new Set([
+    "dense", "bm25", "reranker", "memory", "mem0", "llm", "elasticsearch",
+    "redis", "artifact_store", "retrieval", "router", "generation", "audit",
+    "citation", "outbox", "query_worker", "worker", "mysql", "checkpoint", "unknown"
+  ]);
+  const SAFE_DEGRADATION_REASONS = new Set([
+    "lane_failure", "lane_timeout", "retrieval_unavailable", "reranker_unavailable",
+    "memory_unavailable", "router_unavailable", "router_schema_invalid",
+    "model_unavailable", "model_schema_invalid", "generation_unavailable", "audit_failed",
+    "authorization_unavailable", "provider_outage", "circuit_open", "outbox_retry",
+    "lease_lost", "cancelled", "worker_timeout", "worker_dlq", "invalid_input", "unknown"
+  ]);
+  const SAFE_DEGRADATION_OUTCOMES = new Set(["degraded", "refused", "dlq"]);
   const TERMINAL_NOTICE_CODES = new Set([
     "research_action_invalid", "research_round_limit", "audit_failed",
     "cannot_answer", "refuse", "clarify"
@@ -91,13 +104,28 @@
     return Object.prototype.hasOwnProperty.call(NOTICES, eventType) ? eventType : null;
   }
 
+  function degradationAttributes(event) {
+    const raw = event && typeof event.attributes === "object" && event.attributes
+      ? event.attributes : {};
+    const attributes = {};
+    if (SAFE_DEGRADATION_COMPONENTS.has(raw.component)) attributes.component = raw.component;
+    if (SAFE_DEGRADATION_REASONS.has(raw.reason)) attributes.reason = raw.reason;
+    if (SAFE_DEGRADATION_OUTCOMES.has(raw.outcome)) attributes.outcome = raw.outcome;
+    if (typeof raw.retryable === "boolean") attributes.retryable = raw.retryable;
+    if (Number.isInteger(raw.attempt) && raw.attempt >= 0) attributes.attempt = raw.attempt;
+    return attributes;
+  }
+
   function eventPresentation(event) {
     const known = PUBLIC_EVENT_TYPES.has(event.event_type);
-    return {
+    const attributes = known ? degradationAttributes(event) : {};
+    const presentation = {
       label: known ? event.event_type : "进度更新",
       summary: known ? (event.summary || "执行中") : "进度更新",
       noticeCode: noticeCodeForEvent(event.event_type)
     };
+    if (Object.keys(attributes).length) presentation.attributes = attributes;
+    return presentation;
   }
 
   function terminalNoticeCode(run) {
@@ -154,7 +182,10 @@
   function appendTimeline(event) {
     const presentation = eventPresentation(event);
     const item = document.createElement("li");
-    item.textContent = `${presentation.label}：${presentation.summary}`;
+    const detail = presentation.attributes
+      ? `（${Object.entries(presentation.attributes).map(([key, value]) => `${key}=${value}`).join(", ")}）`
+      : "";
+    item.textContent = `${presentation.label}：${presentation.summary}${detail}`;
     const time = document.createElement("time");
     time.dateTime = event.created_at || "";
     time.textContent = event.created_at || "";
@@ -458,7 +489,7 @@
     AgenticRagConsole: {
       contract: {
         buildQueryPayload, buildSseHeaders, eventPresentation, noticeCodeForEvent,
-        terminalNoticeCode, memoryErrorPresentation, provenanceFor
+        terminalNoticeCode, memoryErrorPresentation, provenanceFor, degradationAttributes
       }
     }
   });

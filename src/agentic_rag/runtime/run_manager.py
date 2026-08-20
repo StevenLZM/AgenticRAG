@@ -8,7 +8,13 @@ from typing import Protocol
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentic_rag.domain.models import RunStatus, UserScope
-from agentic_rag.persistence.repositories import ActiveRunConflict, QueryRun, RunRepository, SqlAlchemyRunRepository
+from agentic_rag.persistence.repositories import (
+    DEFAULT_QUERY_OUTBOX_STREAM,
+    ActiveRunConflict,
+    QueryRun,
+    RunRepository,
+    SqlAlchemyRunRepository,
+)
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
@@ -75,8 +81,16 @@ class RunManager:
 class TransactionalRunRepository:
     """Open a short MySQL transaction for each worker lifecycle operation."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        outbox_stream_name: str | None = None,
+    ) -> None:
+        if outbox_stream_name is not None and not outbox_stream_name.strip():
+            raise ValueError("query outbox stream name must not be blank")
         self._factory = session_factory
+        self._outbox_stream_name = outbox_stream_name
 
     async def create_queued(
         self, scope: UserScope, thread_id: str, snapshot: RuntimeConfigSnapshot,
@@ -84,11 +98,24 @@ class TransactionalRunRepository:
     ) -> QueryRun:
         if transaction is not None:
             return await SqlAlchemyRunRepository(transaction).create_queued(
-                scope, thread_id, snapshot, question=question, transaction=transaction,
+                scope,
+                thread_id,
+                snapshot,
+                question=question,
+                transaction=transaction,
+                outbox_stream_name=(
+                    self._outbox_stream_name or DEFAULT_QUERY_OUTBOX_STREAM
+                ),
             )
         async with self._factory.begin() as session:
             return await SqlAlchemyRunRepository(session).create_queued(
-                scope, thread_id, snapshot, question=question,
+                scope,
+                thread_id,
+                snapshot,
+                question=question,
+                outbox_stream_name=(
+                    self._outbox_stream_name or DEFAULT_QUERY_OUTBOX_STREAM
+                ),
             )
 
     async def get(self, run_id: str, scope: UserScope) -> QueryRun | None:
