@@ -27,6 +27,7 @@ class IsolatedQueryBroker:
             raise ValueError("isolated Query broker namespace must be lowercase URL-safe text")
         self._broker = broker
         prefix = f"agenticrag:e2e:{namespace}"
+        self._key_prefix = prefix
         self._query_stream = f"{prefix}:query"
         self._dead_stream = f"{self._query_stream}:dead"
         self._group = f"agenticrag-e2e-{namespace}"
@@ -35,6 +36,16 @@ class IsolatedQueryBroker:
     def query_stream(self) -> str:
         """The durable private stream written by the scoped Run repository."""
         return self._query_stream
+
+    @property
+    def key_prefix(self) -> str:
+        """The exact Redis namespace eligible for service-aware backup."""
+        return self._key_prefix
+
+    @property
+    def query_group(self) -> str:
+        """The private consumer group used to verify duplicate ACK evidence."""
+        return self._group
 
     @property
     def cleanup_keys(self) -> tuple[str, str, str, str]:

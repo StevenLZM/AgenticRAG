@@ -16,6 +16,7 @@ from agentic_rag.api.errors import ApiException
 from agentic_rag.domain.models import RunStatus, UserScope
 from agentic_rag.observability.logging import sanitize_attributes, sanitize_summary
 from agentic_rag.persistence.repositories import ActiveRunConflict, AgentEvent, QueryRun
+from agentic_rag.query.public_answer import PublicAnswer, project_public_answer
 from agentic_rag.runtime.ids import new_id
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
@@ -51,14 +52,17 @@ class QueryRunResponse(BaseModel):
     question: str = ""
     result_ref: str | None = None
     error_code: str | None = None
-    answer: object | None = None
+    answer: PublicAnswer | None = None
 
     @classmethod
     def from_run(cls, run: QueryRun) -> "QueryRunResponse":
         # Some deployment-owned repositories attach an already materialized
         # audited answer.  The SQL Run port deliberately keeps this optional;
         # never expose leases, snapshots or worker internals here.
-        answer = run.answer
+        answer = project_public_answer(
+            run.answer,
+            runtime_config_snapshot_id=run.runtime_config_snapshot_id,
+        )
         return cls(
             run_id=run.id,
             status=run.status,

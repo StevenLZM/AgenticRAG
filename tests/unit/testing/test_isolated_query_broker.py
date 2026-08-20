@@ -71,6 +71,8 @@ async def test_isolated_query_broker_maps_all_query_stream_operations() -> None:
     stream = "agenticrag:e2e:real-query-a1b2:query"
     group = "agenticrag-e2e-real-query-a1b2"
     assert broker.query_stream == stream
+    assert broker.key_prefix == "agenticrag:e2e:real-query-a1b2"
+    assert broker.query_group == group
     assert await broker.publish(stream, "run-1", timestamp, "outbox-2:0") == "1-0"
     assert inner.calls == [
         ("publish", stream, "run-1", "outbox-1:0"),
@@ -115,6 +117,16 @@ def test_real_provider_configuration_distinguishes_missing_from_invalid_values()
     assert provider_configuration_issue(
         SimpleNamespace(**{**vars(valid), "deepseek_api_key": "replace-with-key"})
     ) == ("invalid", ("deepseek_api_key",))
+
+
+def test_parallel_fixture_brokers_have_disjoint_streams_groups_and_cleanup_keys() -> None:
+    first = IsolatedQueryBroker(_RecordingBroker(), namespace="fixture-a")
+    second = IsolatedQueryBroker(_RecordingBroker(), namespace="fixture-b")
+
+    assert first.query_stream != second.query_stream
+    assert set(first.cleanup_keys).isdisjoint(second.cleanup_keys)
+    assert QUERY_STREAM not in first.cleanup_keys
+    assert QUERY_STREAM not in second.cleanup_keys
 
 
 def test_explicit_invalid_provider_environment_overrides_a_missing_settings_skip() -> None:

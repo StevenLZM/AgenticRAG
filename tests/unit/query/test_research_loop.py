@@ -209,6 +209,75 @@ async def test_unknown_model_action_fails_closed_without_arbitrary_tool_executio
 
     assert result["research"]["cannot_answer"] is True
     assert result["termination_reason"] == "research_action_invalid"
+    assert result["research"]["observations"][-1] == {
+        "kind": "cannot_answer",
+        "reason": "research_action_invalid",
+        "error_code": "research_action_invalid",
+        "retryable": False,
+        "attempt": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        (TimeoutError("Authorization: Bearer model-secret provider_response=https://private"), "model_unavailable"),
+        (OSError("Authorization: Bearer model-secret provider_response=https://private"), "model_unavailable"),
+    ],
+)
+async def test_gateway_exception_text_never_enters_research_state(
+    failure: Exception,
+    expected_code: str,
+) -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+
+    class FailingGateway:
+        async def complete_structured(self, call: object, schema: type[object]) -> object:
+            del call, schema
+            raise failure
+
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=FailingGateway(), retrieval=FakeRetrieval(), evidence_builder=EvidenceBuilder()
+    ))
+
+    result = await loop.ainvoke(_state())
+    serialized = json.dumps(result)
+
+    assert expected_code in serialized
+    assert "model-secret" not in serialized
+    assert "provider_response" not in serialized
+    assert "https://private" not in serialized
+
+
+async def test_retrieval_exception_text_is_replaced_by_controlled_metadata() -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+
+    class FailingRetrieval:
+        async def retrieve(self, request: object, scope: object, snapshot: object) -> EvidenceBatch:
+            del request, scope, snapshot
+            raise OSError("Authorization: Bearer retrieval-secret url=https://private")
+
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=ScriptedGateway([
+            {"action": "retrieve_evidence", "query": "notice"},
+            {"action": "cannot_answer", "reason": "insufficient_verified_evidence"},
+        ]),
+        retrieval=FailingRetrieval(),
+        evidence_builder=EvidenceBuilder(),
+    ))
+
+    result = await loop.ainvoke(_state())
+    serialized = json.dumps(result)
+
+    assert result["research"]["observations"][1] == {
+        "kind": "retrieval",
+        "ok": False,
+        "error_code": "retrieval_unavailable",
+        "retryable": True,
+        "attempt": 1,
+    }
+    assert "retrieval-secret" not in serialized
+    assert "https://private" not in serialized
 
 
 async def test_gateway_repairs_action_specific_schema_before_loop_executes() -> None:
@@ -280,7 +349,7 @@ async def test_delegate_with_empty_evidence_blocks_todo_instead_of_completing() 
     loop = ResearchAgentLoop(ResearchLoopDependencies(
         gateway=ScriptedGateway([
             {"action": "delegate_research", "todo_ids": ["todo-1"]},
-            {"action": "cannot_answer", "reason": "empty evidence"},
+            {"action": "cannot_answer", "reason": "insufficient_verified_evidence"},
         ]),
         retrieval=FakeRetrieval(), evidence_builder=EvidenceBuilder(), subagents=EmptyDispatcher(),
     ))
@@ -322,7 +391,7 @@ async def test_delegate_cannot_complete_a_blocked_todo_from_subagent_evidence() 
     loop = ResearchAgentLoop(ResearchLoopDependencies(
         gateway=ScriptedGateway([
             {"action": "delegate_research", "todo_ids": ["todo-1"]},
-            {"action": "cannot_answer", "reason": "stop after invalid result"},
+            {"action": "cannot_answer", "reason": "insufficient_verified_evidence"},
         ]),
         retrieval=FakeRetrieval(),
         evidence_builder=EvidenceBuilder(),
@@ -355,7 +424,7 @@ async def test_delegate_with_all_children_timed_out_keeps_todos_blocked() -> Non
     loop = ResearchAgentLoop(ResearchLoopDependencies(
         gateway=ScriptedGateway([
             {"action": "delegate_research", "todo_ids": ["todo-1"]},
-            {"action": "cannot_answer", "reason": "timeout"},
+            {"action": "cannot_answer", "reason": "insufficient_verified_evidence"},
         ]),
         retrieval=FakeRetrieval(), evidence_builder=EvidenceBuilder(), subagents=TimeoutDispatcher(),
     ))

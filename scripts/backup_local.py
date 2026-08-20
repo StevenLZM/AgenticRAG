@@ -55,6 +55,7 @@ class BackupSpec:
     elasticsearch_url: str | None = None
     redis_dsn: str | None = None
     redis_key_prefix: str | None = None
+    elasticsearch_include_global_metadata: bool = True
     mysqldump_command: str = "mysqldump"
 
 
@@ -87,7 +88,12 @@ def create_backup(spec: BackupSpec) -> Path:
             service_metadata["mysql"] = {"included": True}
         if spec.elasticsearch_url is not None:
             service_metadata["elasticsearch"] = asyncio.run(
-                _export_elasticsearch(spec.elasticsearch_url, spec.index_generation, staging / "elasticsearch" / "export.json")
+                _export_elasticsearch(
+                    spec.elasticsearch_url,
+                    spec.index_generation,
+                    staging / "elasticsearch" / "export.json",
+                    include_global_metadata=spec.elasticsearch_include_global_metadata,
+                )
             )
         if spec.redis_dsn is not None or spec.redis_key_prefix is not None:
             if not spec.redis_dsn or not spec.redis_key_prefix:
@@ -198,7 +204,11 @@ def _dump_mysql(dsn: str, target: Path, command: str) -> None:
 
 
 async def _export_elasticsearch(
-    endpoint: str, index_generation: str, target: Path
+    endpoint: str,
+    index_generation: str,
+    target: Path,
+    *,
+    include_global_metadata: bool = True,
 ) -> dict[str, object]:
     """Export the controlled indices plus aliases/templates in canonical order."""
     from elasticsearch import AsyncElasticsearch, NotFoundError
@@ -210,15 +220,21 @@ async def _export_elasticsearch(
             await client.indices.get(index=index, allow_no_indices=True)
         )
         aliases = _response_body(
-            await client.indices.get_alias(index="agenticrag-*", allow_no_indices=True)
+            await client.indices.get_alias(
+                index="agenticrag-*" if include_global_metadata else index,
+                allow_no_indices=True,
+            )
         )
         templates: Mapping[str, object]
-        try:
-            templates = _response_body(
-                await client.indices.get_index_template(name="agenticrag-*")
-            )
-        except NotFoundError:
+        if not include_global_metadata:
             templates = {"index_templates": []}
+        else:
+            try:
+                templates = _response_body(
+                    await client.indices.get_index_template(name="agenticrag-*")
+                )
+            except NotFoundError:
+                templates = {"index_templates": []}
         index_definition = index_data.get(index)
         if not isinstance(index_definition, Mapping):
             raise BackupError("controlled Elasticsearch index is missing")

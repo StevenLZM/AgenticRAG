@@ -56,6 +56,6 @@ class ResearchToolset:
             value = self._calculator.evaluate(expression)
         except asyncio.CancelledError:
             raise
-        except UnsafeExpression as error:
-            return {"ok": False, "error": str(error)}
+        except UnsafeExpression:
+            return {"ok": False, "error_code": "calculator_input_invalid", "retryable": False}
         return {"ok": True, "value": value}

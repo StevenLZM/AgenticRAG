@@ -148,6 +148,8 @@ _DEGRADATION_REASONS = frozenset(
         "router_unavailable",
         "router_schema_invalid",
         "model_unavailable",
+        "subagent_unavailable",
+        "research_action_invalid",
         "model_schema_invalid",
         "generation_unavailable",
         "audit_failed",

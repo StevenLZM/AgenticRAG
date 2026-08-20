@@ -77,10 +77,17 @@ class SubmitEvidence(BaseModel):
     evidence_ids: tuple[str, ...] = ()
 
 
+ResearchFailureCode = Literal[
+    "insufficient_verified_evidence",
+    "research_action_invalid",
+    "model_unavailable",
+]
+
+
 class CannotAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     action: Literal["cannot_answer"]
-    reason: str = Field(default="insufficient verified evidence", min_length=1, max_length=1_000)
+    reason: ResearchFailureCode = "insufficient_verified_evidence"
 
 
 ResearchAction = Annotated[
@@ -200,10 +207,12 @@ class ResearchAgentLoop:
             return _parse_action(raw)
         except asyncio.CancelledError:
             raise
-        except (StructuredOutputValidationError, ValidationError, TypeError, ValueError) as error:
-            return CannotAnswer(action="cannot_answer", reason=f"research_action_invalid: {error}")
-        except (OSError, TimeoutError, ConnectionError) as error:
-            return CannotAnswer(action="cannot_answer", reason=f"research action unavailable: {error}")
+        except (StructuredOutputValidationError, ValidationError, TypeError, ValueError):
+            return CannotAnswer(action="cannot_answer", reason="research_action_invalid")
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return CannotAnswer(action="cannot_answer", reason="model_unavailable")
 
     async def _execute(
         self,
@@ -220,7 +229,11 @@ class ResearchAgentLoop:
             if not all(titles) or len({title.casefold() for title in titles}) != len(titles):
                 return _Step(
                     todos,
-                    [*observations, {"kind": "todo_created", "ok": False, "error": "todo titles must be nonblank and unique"}],
+                    [*observations, {
+                        "kind": "todo_created", "ok": False,
+                        "error_code": "todo_creation_invalid", "retryable": False,
+                        "attempt": round_number + 1,
+                    }],
                     evidence,
                 )
             try:
@@ -228,7 +241,11 @@ class ResearchAgentLoop:
             except (InvalidTodoTransition, ValueError):
                 return _Step(
                     todos,
-                    [*observations, {"kind": "todo_created", "ok": False, "error": "todo creation rejected"}],
+                    [*observations, {
+                        "kind": "todo_created", "ok": False,
+                        "error_code": "todo_creation_invalid", "retryable": False,
+                        "attempt": round_number + 1,
+                    }],
                     evidence,
                 )
             return _Step(
@@ -248,18 +265,28 @@ class ResearchAgentLoop:
                 )
                 observation = {"kind": "todo_update", "ok": True, "round": round_number + 1}
                 return _Step(updated, [*observations, observation], evidence)
-            except InvalidTodoTransition as error:
-                return _Step(todos, [*observations, {"kind": "todo_update", "ok": False, "error": str(error)}], evidence)
+            except (InvalidTodoTransition, ValueError):
+                return _Step(todos, [*observations, {
+                    "kind": "todo_update", "ok": False,
+                    "error_code": "todo_update_invalid", "retryable": False,
+                    "attempt": round_number + 1,
+                }], evidence)
         if isinstance(action, RetrieveEvidence):
             try:
                 target_id = action.todo_id or f"query:{state['run_id']}"
                 _batch, packed = await self._tools.retrieve_evidence(query=action.query, ctx=context, target_id=target_id)
             except asyncio.CancelledError:
                 raise
-            except (OSError, TimeoutError, ConnectionError, ValueError) as error:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
                 return _Step(
                     _block_active(todos),
-                    [*observations, {"kind": "retrieval", "ok": False, "error": str(error)}],
+                    [*observations, {
+                        "kind": "retrieval", "ok": False,
+                        "error_code": "retrieval_unavailable", "retryable": True,
+                        "attempt": round_number + 1,
+                    }],
                     evidence,
                 )
             additions = [item.model_dump(mode="json") for item in packed.items]
@@ -277,14 +304,26 @@ class ResearchAgentLoop:
             known = {item.get("evidence_id") for item in evidence}
             # Evidence identifiers are server-derived; a model cannot submit an invented one.
             if action.evidence_ids and not set(action.evidence_ids).issubset(known):
-                return _Step(todos, [*observations, {"kind": "submit", "ok": False, "error": "unknown evidence id"}], evidence)
+                return _Step(todos, [*observations, {
+                    "kind": "submit", "ok": False,
+                    "error_code": "unknown_evidence_id", "retryable": False,
+                    "attempt": round_number + 1,
+                }], evidence)
             return _Step(todos, [*observations, {"kind": "submit", "ok": True}], evidence, submitted=True)
         if isinstance(action, DelegateResearch):
             if self._subagents is None:
-                return _Step(todos, [*observations, {"kind": "delegate", "ok": False, "error": "subagents unavailable"}], evidence)
+                return _Step(todos, [*observations, {
+                    "kind": "delegate", "ok": False,
+                    "error_code": "subagent_unavailable", "retryable": True,
+                    "attempt": round_number + 1,
+                }], evidence)
             by_id = {todo.id: todo for todo in todos}
             if not set(action.todo_ids).issubset(by_id):
-                return _Step(todos, [*observations, {"kind": "delegate", "ok": False, "error": "todo does not exist"}], evidence)
+                return _Step(todos, [*observations, {
+                    "kind": "delegate", "ok": False,
+                    "error_code": "todo_not_found", "retryable": False,
+                    "attempt": round_number + 1,
+                }], evidence)
             selected = tuple(by_id[todo_id] for todo_id in action.todo_ids)
             completed = frozenset(todo.id for todo in todos if todo.status == "completed")
             try:
@@ -296,8 +335,14 @@ class ResearchAgentLoop:
                 )
             except asyncio.CancelledError:
                 raise
-            except (OSError, TimeoutError, ConnectionError, ValueError) as error:
-                return _Step(todos, [*observations, {"kind": "delegate", "ok": False, "error": str(error)}], evidence)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return _Step(todos, [*observations, {
+                    "kind": "delegate", "ok": False,
+                    "error_code": "subagent_unavailable", "retryable": True,
+                    "attempt": round_number + 1,
+                }], evidence)
             if delegated.results:
                 packed = EvidenceReducer.merge(
                     delegated.results,
@@ -370,7 +415,11 @@ class ResearchAgentLoop:
             except InvalidTodoTransition:
                 return _Step(
                     _block_active(todos),
-                    [*observations, {"kind": "delegate", "ok": False, "error": "delegated todo transition rejected"}],
+                    [*observations, {
+                        "kind": "delegate", "ok": False,
+                        "error_code": "todo_update_invalid", "retryable": False,
+                        "attempt": round_number + 1,
+                    }],
                     evidence,
                 )
             return _Step(
@@ -382,10 +431,16 @@ class ResearchAgentLoop:
                 merged,
             )
         assert isinstance(action, CannotAnswer)
-        reason = "research_action_invalid" if action.reason.startswith("research_action_invalid:") else "cannot_answer"
+        reason = "research_action_invalid" if action.reason == "research_action_invalid" else "cannot_answer"
         return _Step(
             todos,
-            [*observations, {"kind": "cannot_answer", "reason": action.reason}],
+            [*observations, {
+                "kind": "cannot_answer",
+                "reason": action.reason,
+                "error_code": action.reason,
+                "retryable": action.reason == "model_unavailable",
+                "attempt": round_number + 1,
+            }],
             evidence,
             cannot_answer=True,
             termination_reason=reason,

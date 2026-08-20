@@ -71,6 +71,18 @@ async def test_console_real_graph_api_query_has_snapshot_provenance_and_gates(
     assert summary["unaudited_answer_count"] == 0
     assert summary["recovery_drill_passed"] is True
     assert summary["backup_restore_passed"] is True
+    recovery = summary["recovery_evidence"]
+    assert recovery["provider_e2e"] is True
+    assert recovery["worker_restarted"] is True
+    assert recovery["duplicate_delivery_acked"] is True
+    assert recovery["terminal_event_count"] == 1
+    backup = summary["backup_restore_evidence"]
+    assert backup["provider_e2e"] is True
+    assert backup["source_run_id"] == recovery["source_run_id"]
+    assert all(backup["services"].values())
+    assert backup["source_scope"]["mysql_database"] != backup["restore_scope"]["mysql_database"]
+    assert backup["source_scope"]["redis_prefix"] != backup["restore_scope"]["redis_prefix"]
+    assert backup["source_scope"]["index_generation"] != backup["restore_scope"]["index_generation"]
     assert summary["memory_provider_available"] is True
     assert real_query_runtime.memory_boundary == {"read": True, "write": True}
 

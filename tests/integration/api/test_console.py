@@ -84,7 +84,29 @@ process.stdout.write(JSON.stringify({
   notices: ["RETRIEVAL_DEGRADED", "CIRCUIT_OPEN", "MODEL_REPAIR_EXHAUSTED", "WORKER_DLQ", "AUDIT_REFUSED"].map((type) => call("noticeCodeForEvent", type)),
   terminal: ["research_action_invalid", "research_round_limit", "audit_failed", "cannot_answer", "refuse", "clarify"].map((status) => call("terminalNoticeCode", {answer: {status}})),
   memory: call("memoryErrorPresentation", "provider unavailable"),
-  provenance: call("provenanceFor", {evidence_parent_ids: ["parent-1"], route: "research", client_provenance: "api"}, {runtime_config_snapshot_id: "snapshot-1"})
+  provenance: call("provenanceFor", {evidence_parent_ids: ["parent-1"], route: "research", client_provenance: "api"}, {runtime_config_snapshot_id: "snapshot-1"}),
+  answer: call("answerPresentation", {
+    runtime_config_snapshot_id: "snapshot-1",
+    answer: {
+      audited: true,
+      segments: [{
+        kind: "content",
+        text: "safe answer",
+        evidence_ids: ["e1"],
+        tool_input: "Authorization: Bearer nested-secret"
+      }],
+      evidence_parent_ids: ["parent-1"],
+      route: "research",
+      client_provenance: "real_query_api",
+      citation_coverage: 1,
+      prompt: "Authorization: Bearer prompt-secret",
+      provider_response: "provider-secret",
+      raw: "raw-secret",
+      unknown: "unknown-secret",
+      evidence: "evidence-secret",
+      audit: "audit-secret"
+    }
+  })
 }));
 """
     completed = subprocess.run(
@@ -173,6 +195,22 @@ def test_console_client_contract_preserves_scope_and_safe_terminal_states() -> N
         "runtime_config_snapshot_id": "snapshot-1",
         "client_provenance": "api",
     }
+    assert contract["answer"] == {
+        "text": "safe answer",
+        "evidence": {
+            "evidence_ids": ["e1"],
+            "evidence_parent_ids": ["parent-1"],
+        },
+        "audit": {"audited": True, "citation_coverage": 1},
+        "provenance": {
+            "evidence_parent_ids": ["parent-1"],
+            "route": "research",
+            "runtime_config_snapshot_id": "snapshot-1",
+            "client_provenance": "real_query_api",
+        },
+    }
+    serialized = json.dumps(contract["answer"])
+    assert all(secret not in serialized for secret in ("nested-secret", "prompt-secret", "provider-secret", "raw-secret", "unknown-secret", "evidence-secret", "audit-secret"))
 
 
 @pytest.mark.integration

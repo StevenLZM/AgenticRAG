@@ -317,6 +317,44 @@ async def test_sse_public_event_does_not_forward_raw_summary() -> None:
 
 
 @pytest.mark.integration
+async def test_sensitive_research_exception_is_absent_from_run_api_and_sse() -> None:
+    secret = "Authorization: Bearer research-secret provider_response=https://private"
+    event = AgentEvent(
+        id=1,
+        event_key="research-provider-unavailable",
+        trace_id="trace-1",
+        run_id="run-1",
+        user_id=SCOPE.user_id,
+        event_type="TOOL_COMPLETED",
+        summary=secret,
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        created_at=datetime.now(UTC),
+    )
+    runs = FakeRunManager(runs={
+        "run-1": replace(
+            _run(status=RunStatus.COMPLETED),
+            answer={
+                "status": "cannot_answer",
+                "raw": secret,
+                "provider_response": secret,
+            },
+        )
+    })
+    app, _, _, _ = _app(runs, FakeEvents(events=[event]))
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        run_response = await client.get("/v1/query-runs/run-1")
+        sse_response = await client.get("/v1/query-runs/run-1/events")
+
+    assert run_response.status_code == sse_response.status_code == 200
+    assert run_response.json()["answer"]["status"] == "cannot_answer"
+    for marker in ("research-secret", "provider_response", "https://private"):
+        assert marker not in run_response.text
+        assert marker not in sse_response.text
+
+
+@pytest.mark.integration
 async def test_sse_exposes_safe_degradation_event_notice() -> None:
     event = AgentEvent(
         id=1,
@@ -450,11 +488,28 @@ async def test_sync_query_timeout_returns_202_without_second_run() -> None:
 
 @pytest.mark.integration
 async def test_completed_run_response_exposes_only_audited_answer_projection() -> None:
+    secret = "Authorization: Bearer api-answer-secret"
     runs = FakeRunManager(
         runs={
             "run-1": replace(
                 _run(status=RunStatus.COMPLETED),
-                answer={"segments": [{"text": "notice applies", "evidence_ids": ["e1"]}]},
+                answer={
+                    "audited": True,
+                    "segments": [{
+                        "kind": "content",
+                        "text": "notice applies",
+                        "evidence_ids": ["e1"],
+                        "tool_input": secret,
+                    }],
+                    "evidence_parent_ids": ["parent-1"],
+                    "route": "fast_rag",
+                    "runtime_config_snapshot_id": SNAPSHOT.snapshot_id,
+                    "client_provenance": "real_query_api",
+                    "prompt": secret,
+                    "provider_response": secret,
+                    "raw": secret,
+                    "unknown": secret,
+                },
             )
         }
     )
@@ -464,7 +519,20 @@ async def test_completed_run_response_exposes_only_audited_answer_projection() -
         response = await client.get("/v1/query-runs/run-1")
 
     assert response.status_code == 200
-    assert response.json()["answer"]["segments"][0]["evidence_ids"] == ["e1"]
+    answer = response.json()["answer"]
+    assert answer == {
+        "status": None,
+        "audited": True,
+        "segments": [
+            {"kind": "content", "text": "notice applies", "evidence_ids": ["e1"]}
+        ],
+        "evidence_parent_ids": ["parent-1"],
+        "route": "fast_rag",
+        "runtime_config_snapshot_id": SNAPSHOT.snapshot_id,
+        "client_provenance": "real_query_api",
+        "citation_coverage": None,
+    }
+    assert secret not in response.text
 
 
 @pytest.mark.integration

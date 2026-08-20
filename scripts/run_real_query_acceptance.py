@@ -81,9 +81,16 @@ from evals.clients import HttpQueryClient
 from evals.models import EvaluationCase
 from evals.report import write_summary
 from evals.run import EvalRunner
-from scripts.backup_local import run_backup_restore_drill
+from scripts.real_acceptance_evidence import (
+    ServiceBackupResources,
+    create_isolated_mysql_database,
+    drop_isolated_mysql_database,
+    exercise_query_worker_recovery,
+    isolated_mysql_dsn,
+    require_service_backup_admin_dsn,
+    run_service_backup_restore,
+)
 from scripts.run_query_worker import TransactionalQueryOutboxAdapter
-from scripts.run_recovery_drill import run_recovery_drill
 from scripts.verify_acceptance import verify_acceptance
 
 
@@ -147,6 +154,80 @@ class _FixedEmbedding:
     async def embed_query(self, text: str) -> list[float]:
         del text
         return [1.0] + [0.0] * 1023
+
+
+class _AcceptanceWorkerLifecycle:
+    """Restart the current production-composed worker without changing resources."""
+
+    def __init__(
+        self,
+        *,
+        container: AppContainer,
+        settings: Settings,
+        dependencies: QueryGraphDependencies,
+        broker: IsolatedQueryBroker,
+        worker_prefix: str,
+    ) -> None:
+        self._container = container
+        self._settings = settings
+        self._dependencies = dependencies
+        self._broker = broker
+        self._worker_prefix = worker_prefix
+        self._checkpoint_context: Any = None
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._generation = 0
+
+    async def start(self) -> None:
+        if self._task is not None or self._checkpoint_context is not None:
+            raise RuntimeError("acceptance Query Worker is already running")
+        self._generation += 1
+        self._checkpoint_context = self._container.checkpoints.open_query()
+        checkpointer = await self._checkpoint_context.__aenter__()
+        worker = QueryWorker(
+            runs=TransactionalRunRepository(
+                self._container.repositories.session_factory
+            ),
+            broker=self._broker,
+            graph_factory=build_graph_factory(self._dependencies, checkpointer),
+            worker_id=f"{self._worker_prefix}-restart-{self._generation}",
+            concurrency=self._dependencies.concurrency,
+            trace_recorder=self._dependencies.trace_recorder,
+            event_emitter=self._dependencies.event_emitter,
+            block_ms=50,
+            heartbeat_interval_seconds=0.5,
+            lease_seconds=10,
+            run_timeout_seconds=self._settings.query_run_timeout_seconds,
+            outbox_dispatcher=OutboxDispatcher(
+                TransactionalQueryOutboxAdapter(
+                    self._container.repositories.session_factory,
+                    user_id=self._settings.default_user_id,
+                    stream_name=self._broker.query_stream,
+                ),
+                self._broker,
+                aggregate_type="query_run",
+            ),
+            outbox_interval_seconds=0.1,
+        )
+        self._stop = asyncio.Event()
+        self._task = asyncio.create_task(worker.run_forever(stop_event=self._stop))
+
+    async def stop(self) -> None:
+        failures: list[tuple[str, BaseException]] = []
+        self._stop.set()
+        task = self._task
+        self._task = None
+        if task is not None:
+            await _record_teardown_error(failures, "Query Worker", task)
+        checkpoint_context = self._checkpoint_context
+        self._checkpoint_context = None
+        if checkpoint_context is not None:
+            await _record_teardown_error(
+                failures,
+                "Query checkpoint",
+                checkpoint_context.__aexit__(None, None, None),
+            )
+        _raise_teardown_failures(failures)
 
 
 def _require_real_provider_base_settings() -> tuple[Settings, str, str, str]:
@@ -444,6 +525,8 @@ def console_acceptance_passed(summary: Mapping[str, object]) -> bool:
             and summary.get("unaudited_answer_count") == 0
             and summary.get("recovery_drill_passed") is True
             and summary.get("backup_restore_passed") is True
+            and _real_recovery_evidence_passed(summary)
+            and _service_backup_restore_evidence_passed(summary)
         )
     except (KeyError, TypeError, ValueError):
         return False
@@ -459,6 +542,77 @@ def _has_safe_controlled_degradation(value: object) -> bool:
         if isinstance(attributes, Mapping) and dict(attributes) == _CONTROLLED_DEGRADATION:
             return True
     return False
+
+
+def _real_recovery_evidence_passed(summary: Mapping[str, object]) -> bool:
+    evidence = summary.get("recovery_evidence")
+    if not isinstance(evidence, Mapping):
+        return False
+    run_id = evidence.get("source_run_id")
+    return bool(
+        evidence.get("provider_e2e") is True
+        and isinstance(run_id, str)
+        and bool(run_id.strip())
+        and evidence.get("runtime_config_snapshot_id")
+        == summary.get("runtime_config_snapshot_id")
+        and evidence.get("worker_restarted") is True
+        and evidence.get("duplicate_delivery_injected") is True
+        and evidence.get("duplicate_delivery_acked") is True
+        and evidence.get("terminal_status") == RunStatus.COMPLETED.value
+        and type(evidence.get("terminal_event_count")) is int
+        and evidence.get("terminal_event_count") == 1
+        and evidence.get("final_answer_audited") is True
+    )
+
+
+def _service_backup_restore_evidence_passed(summary: Mapping[str, object]) -> bool:
+    evidence = summary.get("backup_restore_evidence")
+    recovery = summary.get("recovery_evidence")
+    if not isinstance(evidence, Mapping) or not isinstance(recovery, Mapping):
+        return False
+    source = evidence.get("source_scope")
+    restored = evidence.get("restore_scope")
+    services = evidence.get("services")
+    if not all(isinstance(value, Mapping) for value in (source, restored, services)):
+        return False
+    assert isinstance(source, Mapping)
+    assert isinstance(restored, Mapping)
+    assert isinstance(services, Mapping)
+    source_database = source.get("mysql_database")
+    restored_database = restored.get("mysql_database")
+    source_prefix = source.get("redis_prefix")
+    restored_prefix = restored.get("redis_prefix")
+    source_generation = source.get("index_generation")
+    restored_generation = restored.get("index_generation")
+    checkpoint_thread_id = source.get("checkpoint_thread_id")
+    artifact_marker = source.get("artifact_marker")
+    scopes_are_distinct = all(
+        isinstance(left, str)
+        and bool(left.strip())
+        and isinstance(right, str)
+        and bool(right.strip())
+        and left != right
+        for left, right in (
+            (source_database, restored_database),
+            (source_prefix, restored_prefix),
+            (source_generation, restored_generation),
+        )
+    )
+    return bool(
+        evidence.get("provider_e2e") is True
+        and evidence.get("source_run_id") == recovery.get("source_run_id")
+        and evidence.get("runtime_config_snapshot_id")
+        == summary.get("runtime_config_snapshot_id")
+        and scopes_are_distinct
+        and isinstance(checkpoint_thread_id, str)
+        and checkpoint_thread_id.startswith("query:")
+        and isinstance(artifact_marker, str)
+        and artifact_marker.startswith("artifact://")
+        and set(services) == {
+            "mysql", "redis", "elasticsearch", "artifacts", "checkpoints"
+        }
+        and all(services.get(name) is True for name in services)
+    )
 
 
 def _invalidate_previous_summary(output: Path) -> None:
@@ -679,11 +833,15 @@ async def _cleanup_durable_boundaries(
 async def run(output: Path) -> dict[str, object]:
     _invalidate_previous_summary(output)
     base, mysql_dsn, redis_url, elasticsearch_url = _require_real_provider_base_settings()
+    del mysql_dsn
+    admin_mysql_dsn = require_service_backup_admin_dsn()
     root = Path(tempfile.mkdtemp(prefix="agentic-rag-real-query-"))
     suffix = uuid4().hex[:12]
+    source_mysql_database = f"agentic_rag_acceptance_source_{suffix}"
+    source_mysql_dsn = isolated_mysql_dsn(admin_mysql_dsn, source_mysql_database)
     settings = base.model_copy(
         update={
-            "mysql_dsn": mysql_dsn,
+            "mysql_dsn": source_mysql_dsn,
             "redis_url": redis_url,
             "elasticsearch_url": elasticsearch_url,
             "default_user_id": f"real-query-{suffix}",
@@ -698,15 +856,20 @@ async def run(output: Path) -> dict[str, object]:
     )
     container: AppContainer | None = None
     dependencies: QueryGraphDependencies | None = None
-    checkpoint_context: Any = None
-    stop = asyncio.Event()
-    worker_task: asyncio.Task[None] | None = None
+    worker_lifecycle: _AcceptanceWorkerLifecycle | None = None
     app_lifespan: Any = None
     http_client: httpx.AsyncClient | None = None
     isolated_broker: IsolatedQueryBroker | None = None
     accepted_summary: dict[str, object] | None = None
     body_error: BaseException | None = None
+    source_database_created = False
     try:
+        await asyncio.to_thread(
+            create_isolated_mysql_database,
+            admin_mysql_dsn,
+            source_mysql_database,
+        )
+        source_database_created = True
         migration = Config(str((PROJECT_ROOT / "alembic.ini").resolve()))
         migration.set_main_option("sqlalchemy.url", settings.mysql_dsn)
         await asyncio.to_thread(command.upgrade, migration, "head")
@@ -741,32 +904,14 @@ async def run(output: Path) -> dict[str, object]:
             settings,
             child_index=f"agenticrag-children-{settings.index_generation}",
         )
-        checkpoint_context = container.checkpoints.open_query()
-        checkpointer = await checkpoint_context.__aenter__()
-        worker = QueryWorker(
-            runs=TransactionalRunRepository(container.repositories.session_factory),
+        worker_lifecycle = _AcceptanceWorkerLifecycle(
+            container=container,
+            settings=settings,
+            dependencies=dependencies,
             broker=isolated_broker,
-            graph_factory=build_graph_factory(dependencies, checkpointer),
-            worker_id=f"real-query-{suffix}",
-            concurrency=dependencies.concurrency,
-            trace_recorder=dependencies.trace_recorder,
-            event_emitter=dependencies.event_emitter,
-            block_ms=50,
-            heartbeat_interval_seconds=0.5,
-            lease_seconds=10,
-            run_timeout_seconds=180,
-            outbox_dispatcher=OutboxDispatcher(
-                TransactionalQueryOutboxAdapter(
-                    container.repositories.session_factory,
-                    user_id=settings.default_user_id,
-                    stream_name=isolated_broker.query_stream,
-                ),
-                isolated_broker,
-                aggregate_type="query_run",
-            ),
-            outbox_interval_seconds=0.1,
+            worker_prefix=f"real-query-{suffix}",
         )
-        worker_task = asyncio.create_task(worker.run_forever(stop_event=stop))
+        await worker_lifecycle.start()
 
         app = create_app(settings, container=container)
         app_lifespan = app.router.lifespan_context(app)
@@ -832,8 +977,6 @@ async def run(output: Path) -> dict[str, object]:
         client = HttpQueryClient(
             "http://real-query", http_client=http_client, timeout_seconds=180
         )
-        recovery_ok = (await asyncio.to_thread(run_recovery_drill)).gate_passed
-        backup_ok = await asyncio.to_thread(run_backup_restore_drill)
         summary = await EvalRunner(
             client,
             # EvalRunner writes intermediate rows as it goes.  Keep those in
@@ -842,7 +985,49 @@ async def run(output: Path) -> dict[str, object]:
             output_dir=root / "evaluation",
             evaluation_mode="api",
             client_provenance=HttpQueryClient.provenance,
-        ).run([case], recovery_drill_passed=recovery_ok, backup_restore_passed=backup_ok)
+        ).run(
+            [case],
+            recovery_drill_passed=False,
+            backup_restore_passed=False,
+        )
+        recovery_evidence, checkpoint_thread_id = await exercise_query_worker_recovery(
+            client=http_client,
+            container=container,
+            broker=isolated_broker,
+            user_id=settings.default_user_id,
+            snapshot_id=snapshot.snapshot_id,
+            parent_id=parent_id,
+            stop_worker=worker_lifecycle.stop,
+            start_worker=worker_lifecycle.start,
+        )
+        await worker_lifecycle.stop()
+        backup_evidence = await run_service_backup_restore(
+            ServiceBackupResources(
+                working_root=root,
+                artifact_root=settings.artifact_root,
+                query_checkpoint_path=settings.query_checkpoint_path,
+                source_mysql_dsn=settings.mysql_dsn,
+                source_mysql_database=source_mysql_database,
+                admin_mysql_dsn=admin_mysql_dsn,
+                redis_dsn=settings.redis_url,
+                source_redis_prefix=isolated_broker.key_prefix,
+                elasticsearch_url=settings.elasticsearch_url,
+                source_index_generation=settings.index_generation,
+                source_run_id=str(recovery_evidence["source_run_id"]),
+                checkpoint_thread_id=checkpoint_thread_id,
+                parent_id=parent_id,
+                runtime_config_snapshot_id=snapshot.snapshot_id,
+                app_version=snapshot.app_version,
+            )
+        )
+        summary.update(
+            {
+                "recovery_drill_passed": True,
+                "backup_restore_passed": True,
+                "recovery_evidence": recovery_evidence,
+                "backup_restore_evidence": backup_evidence,
+            }
+        )
         if summary.get("runtime_config_snapshot_id") != snapshot.snapshot_id:
             raise RuntimeError("EvalRunner summary used a different runtime snapshot")
         if summary.get("client_provenance") != HttpQueryClient.provenance:
@@ -874,14 +1059,11 @@ async def run(output: Path) -> dict[str, object]:
         raise
     finally:
         teardown_failures: list[tuple[str, BaseException]] = []
-        stop.set()
-        if worker_task is not None:
-            # Query execution failures are observed through the public Run
-            # before acceptance can pass.  Teardown must still reach durable
-            # cleanup if the background worker exits while another boundary
-            # is already failing.
+        if worker_lifecycle is not None:
             await _record_teardown_error(
-                teardown_failures, "Query Worker", worker_task
+                teardown_failures,
+                "Query Worker lifecycle",
+                worker_lifecycle.stop(),
             )
         if http_client is not None:
             await _record_teardown_error(
@@ -892,12 +1074,6 @@ async def run(output: Path) -> dict[str, object]:
                 teardown_failures,
                 "Query API lifespan",
                 app_lifespan.__aexit__(None, None, None),
-            )
-        if checkpoint_context is not None:
-            await _record_teardown_error(
-                teardown_failures,
-                "Query checkpoint",
-                checkpoint_context.__aexit__(None, None, None),
             )
         if dependencies is not None:
             await _record_teardown_error(
@@ -916,6 +1092,16 @@ async def run(output: Path) -> dict[str, object]:
                 teardown_failures,
                 "acceptance container",
                 container.close(raise_on_error=True),
+            )
+        if source_database_created:
+            await _record_teardown_error(
+                teardown_failures,
+                "acceptance source MySQL database",
+                asyncio.to_thread(
+                    drop_isolated_mysql_database,
+                    admin_mysql_dsn,
+                    source_mysql_database,
+                ),
             )
         await _record_teardown_error(
             teardown_failures,

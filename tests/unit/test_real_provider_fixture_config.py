@@ -54,32 +54,91 @@ def test_real_runtime_exposes_the_seeded_parent_for_api_evidence_assertions() ->
 
 
 class _CleanupResult:
+    def __init__(self, values: list[str] | None = None) -> None:
+        self._values = values or []
+
     def scalars(self) -> list[str]:
-        return []
+        return self._values
 
 
 class _CleanupSession:
+    def __init__(self) -> None:
+        self.statements: list[object] = []
+
     async def execute(self, statement: object) -> _CleanupResult:
-        del statement
-        return _CleanupResult()
+        self.statements.append(statement)
+        return _CleanupResult(["owned-run"]) if getattr(statement, "is_select", False) else _CleanupResult()
 
 
 class _CleanupContext:
+    def __init__(self, session: _CleanupSession | None = None) -> None:
+        self.session = session or _CleanupSession()
+
     async def __aenter__(self) -> _CleanupSession:
-        return _CleanupSession()
+        return self.session
 
     async def __aexit__(self, *args: object) -> None:
         del args
 
 
 class _CleanupFactory:
+    def __init__(self) -> None:
+        self.session = _CleanupSession()
+
     def begin(self) -> _CleanupContext:
-        return _CleanupContext()
+        return _CleanupContext(self.session)
 
 
 class _Redis:
+    def __init__(self) -> None:
+        self.deleted: list[tuple[str, ...]] = []
+
     async def delete(self, *keys: str) -> None:
-        del keys
+        self.deleted.append(keys)
+
+
+@pytest.mark.asyncio
+async def test_shared_fixture_cleanup_keeps_foreign_mysql_rows_and_redis_keys() -> None:
+    """Cleanup predicates must be fixture-owned even when services are shared."""
+    factory = _CleanupFactory()
+    redis = _Redis()
+    container = SimpleNamespace(
+        repositories=SimpleNamespace(session_factory=factory),
+        redis=redis,
+    )
+    settings = SimpleNamespace(default_user_id="fixture-user")
+    broker = SimpleNamespace(
+        query_stream="agenticrag:e2e:fixture-a:query",
+        cleanup_keys=(
+            "agenticrag:e2e:fixture-a:query",
+            "agenticrag:e2e:fixture-a:query:dedupe",
+            "agenticrag:e2e:fixture-a:query:dead",
+            "agenticrag:e2e:fixture-a:query:dead:dedupe",
+        ),
+    )
+
+    await query_services._cleanup_local_fixture_mysql(
+        container, settings, broker  # type: ignore[arg-type]
+    )
+    await query_services._cleanup_local_fixture_redis(
+        container, broker  # type: ignore[arg-type]
+    )
+
+    statements = factory.session.statements
+    outbox_delete = next(
+        statement
+        for statement in statements
+        if getattr(getattr(statement, "table", None), "name", None) == "task_outbox"
+    )
+    outbox_sql = str(outbox_delete)
+    assert "task_outbox.aggregate_id IN" in outbox_sql
+    assert "task_outbox.stream_name" in outbox_sql
+    for statement in statements:
+        table_name = getattr(getattr(statement, "table", None), "name", None)
+        if table_name in {"agent_events", "agent_runs", "parent_chunks", "documents"}:
+            assert f"{table_name}.user_id" in str(statement)
+    assert redis.deleted == [broker.cleanup_keys]
+    assert all("agenticrag:jobs:query" not in key for key in redis.deleted[0])
 
 
 class _FailingIndices:
@@ -202,6 +261,10 @@ async def test_shared_real_query_fixture_does_not_suppress_elasticsearch_cleanup
     )
     fixture.client = _NoopClient()
     fixture._app_lifespan = _NoopLifespan()
+    fixture._isolated_broker = SimpleNamespace(
+        query_stream="agenticrag:e2e:fixture:query",
+        cleanup_keys=("agenticrag:e2e:fixture:query",),
+    )
 
     async def stop_worker() -> None:
         return None
@@ -233,6 +296,10 @@ async def test_shared_fixture_worker_failure_still_closes_checkpoint_mysql_and_r
     fixture._app_lifespan = _NoopLifespan()
     fixture._stop = asyncio.Event()
     fixture._checkpoint_context = _TrackingCheckpointContext(events)
+    fixture._isolated_broker = SimpleNamespace(
+        query_stream="agenticrag:e2e:fixture:query",
+        cleanup_keys=("agenticrag:e2e:fixture:query",),
+    )
 
     async def fail_worker() -> None:
         raise RuntimeError("worker task failed")

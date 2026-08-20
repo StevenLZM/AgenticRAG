@@ -225,7 +225,11 @@ async def test_worker_claims_invokes_stable_checkpoint_and_acks_only_terminal_ru
 
     assert factory.calls == ["query:user-1:thread-1"]
     assert runs.finishes == [RunStatus.COMPLETED]
-    assert runs.answers == [{"status": "audited"}]
+    assert runs.answers == [{
+        "audited": True,
+        "segments": [{"kind": "content", "text": "audited answer", "evidence_ids": []}],
+        "runtime_config_snapshot_id": SNAPSHOT.snapshot_id,
+    }]
     assert broker.acknowledged == ["1-0"]
 
 
@@ -286,7 +290,17 @@ async def test_worker_emits_stable_run_lifecycle_and_latency_events() -> None:
         ) -> dict[str, object]:
             del state, config
             await asyncio.sleep(0.005)
-            return {"termination_reason": "completed"}
+            return {
+                "termination_reason": "completed",
+                "answer": {
+                    "audited": True,
+                    "segments": [{
+                        "kind": "content",
+                        "text": "audited answer",
+                        "evidence_ids": [],
+                    }],
+                },
+            }
 
     worker = QueryWorker(
         runs=runs,
@@ -454,7 +468,22 @@ async def test_worker_persists_safe_evidence_parent_projection_for_api_evaluatio
             del state, config
             return {
                 "termination_reason": "completed",
-                "answer": {"status": "audited"},
+                "answer": {
+                    "audited": True,
+                    "segments": [{
+                        "kind": "content",
+                        "text": "audited answer",
+                        "evidence_ids": ["e1"],
+                        "prompt": "never expose nested prompt",
+                    }],
+                    "evidence_parent_ids": ["forged-parent"],
+                    "prompt": "never expose prompt",
+                    "provider_response": "Authorization: Bearer worker-secret",
+                    "tool_input": {"query": "private"},
+                    "raw": "private",
+                    "unknown": "private",
+                },
+                "route": {"route": "research"},
                 "evidence": [
                     {"parent_id": "parent-1", "content": "private evidence"},
                     {"parent_id": "parent-1", "content": "duplicate"},
@@ -470,14 +499,34 @@ async def test_worker_persists_safe_evidence_parent_projection_for_api_evaluatio
     await worker.run_one()
 
     assert runs.answers == [
-        {"status": "audited", "evidence_parent_ids": ["parent-1"]}
+        {
+            "audited": True,
+            "segments": [{
+                "kind": "content",
+                "text": "audited answer",
+                "evidence_ids": ["e1"],
+            }],
+            "evidence_parent_ids": ["parent-1"],
+            "route": "research",
+            "runtime_config_snapshot_id": SNAPSHOT.snapshot_id,
+        }
     ]
 
 
 class _Graph:
     async def ainvoke(self, state: dict[str, object], config: dict[str, object]) -> dict[str, object]:
         del state, config
-        return {"termination_reason": "completed", "answer": {"status": "audited"}}
+        return {
+            "termination_reason": "completed",
+            "answer": {
+                "audited": True,
+                "segments": [{
+                    "kind": "content",
+                    "text": "audited answer",
+                    "evidence_ids": [],
+                }],
+            },
+        }
 
 
 def _queued_peer(run: QueryRun, run_id: str = "run-2") -> QueryRun:

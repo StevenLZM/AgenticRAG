@@ -38,9 +38,7 @@ from agentic_rag.memory.models import MemoryContext, MemoryRecord, PublicMessage
 from agentic_rag.observability.logging import emit_degradation, event_emission_scope
 from agentic_rag.persistence.elasticsearch import ElasticsearchChildIndexStore
 from agentic_rag.persistence.repositories import (
-    OutboxRecord,
     SqlAlchemyDocumentRepository,
-    SqlAlchemyOutboxRepository,
     SqlAlchemyParentRepository,
     agent_events,
     agent_runs,
@@ -75,7 +73,6 @@ from agentic_rag.runtime.query_composition import (
     close_query_dependencies,
 )
 from agentic_rag.runtime.query_worker import (
-    QUERY_DEAD_STREAM,
     QUERY_STREAM,
     QueryWorker,
     build_graph_factory,
@@ -93,10 +90,19 @@ from agentic_rag.persistence.lifecycle import SqlAlchemyPublicationRepository
 from agentic_rag.persistence.outbox import OutboxDispatcher
 from evals.clients import HttpQueryClient
 from evals.models import EvaluationCase
+from evals.report import write_summary
 from evals.run import EvalRunner
-from scripts.backup_local import run_backup_restore_drill
+from scripts.real_acceptance_evidence import (
+    ServiceBackupResources,
+    create_isolated_mysql_database,
+    drop_isolated_mysql_database,
+    exercise_query_worker_recovery,
+    isolated_mysql_dsn,
+    require_service_backup_admin_dsn,
+    run_service_backup_restore,
+    service_backup_configuration_issue,
+)
 from scripts.run_query_worker import TransactionalQueryOutboxAdapter
-from scripts.run_recovery_drill import run_recovery_drill
 
 
 class FixtureTeardownError(RuntimeError):
@@ -215,35 +221,6 @@ class _Memory:
         return None
 
 
-class _Outbox:
-    def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
-        self._factory = factory
-
-    async def list_pending(
-        self, limit: int, *, aggregate_type: str | None = None
-    ) -> list[OutboxRecord]:
-        async with self._factory() as session:
-            return await SqlAlchemyOutboxRepository(session).list_pending(
-                limit, aggregate_type=aggregate_type
-            )
-
-    async def claim_pending(
-        self, limit: int, *, aggregate_type: str | None = None
-    ) -> list[OutboxRecord]:
-        async with self._factory.begin() as session:
-            return await SqlAlchemyOutboxRepository(session).claim_pending(
-                limit, aggregate_type=aggregate_type
-            )
-
-    async def mark_dispatched(self, outbox_id: str) -> None:
-        async with self._factory.begin() as session:
-            await SqlAlchemyOutboxRepository(session).mark_dispatched(outbox_id)
-
-    async def schedule_retry(self, outbox_id: str) -> None:
-        async with self._factory.begin() as session:
-            await SqlAlchemyOutboxRepository(session).schedule_retry(outbox_id)
-
-
 def _require_local_services(tmp_path: Path) -> Settings:
     if os.getenv("AGENTIC_RAG_RUN_REAL_QUERY_E2E") != "1":
         pytest.skip("set AGENTIC_RAG_RUN_REAL_QUERY_E2E=1 for real Query E2E")
@@ -345,6 +322,14 @@ def _require_real_provider_services(tmp_path: Path) -> Settings:
         if kind == "missing":
             pytest.skip(message)
         pytest.fail(message)
+    backup_issue = service_backup_configuration_issue()
+    if backup_issue is not None:
+        if (
+            "set AGENTIC_RAG_RUN_REAL_BACKUP_RESTORE" in backup_issue
+            or "missing AGENTIC_RAG_TEST_MYSQL_ADMIN_DSN" in backup_issue
+        ):
+            pytest.skip("real Query provider E2E backup/restore unavailable: " + backup_issue)
+        pytest.fail("invalid real Query provider E2E backup/restore configuration: " + backup_issue)
 
     suffix = uuid4().hex
     root = tmp_path / f"real-query-{suffix}"
@@ -543,9 +528,30 @@ class _SessionParents(SqlAlchemyParentRepository):
             return await SqlAlchemyParentRepository(session).get_many(parent_ids, scope)
 
 
-async def _cleanup_local_fixture_mysql(container: AppContainer, settings: Settings) -> None:
+async def _cleanup_local_fixture_mysql(
+    container: AppContainer,
+    settings: Settings,
+    broker: IsolatedQueryBroker,
+) -> None:
+    """Delete only rows owned by this fixture user and private stream."""
     async with container.repositories.session_factory.begin() as session:
-        await session.execute(delete(task_outbox))
+        run_ids = list(
+            (
+                await session.execute(
+                    select(agent_runs.c.id).where(
+                        agent_runs.c.user_id == settings.default_user_id
+                    )
+                )
+            ).scalars()
+        )
+        if run_ids:
+            await session.execute(
+                delete(task_outbox).where(
+                    task_outbox.c.aggregate_type == "query_run",
+                    task_outbox.c.aggregate_id.in_(run_ids),
+                    task_outbox.c.stream_name == broker.query_stream,
+                )
+            )
         await session.execute(
             delete(agent_events).where(agent_events.c.user_id == settings.default_user_id)
         )
@@ -560,13 +566,10 @@ async def _cleanup_local_fixture_mysql(container: AppContainer, settings: Settin
         )
 
 
-async def _cleanup_local_fixture_redis(container: AppContainer) -> None:
-    await container.redis.delete(
-        QUERY_STREAM,
-        f"{QUERY_STREAM}:dedupe",
-        QUERY_DEAD_STREAM,
-        f"{QUERY_DEAD_STREAM}:dedupe",
-    )
+async def _cleanup_local_fixture_redis(
+    container: AppContainer, broker: IsolatedQueryBroker
+) -> None:
+    await container.redis.delete(*broker.cleanup_keys)
 
 
 class RealQueryFixture:
@@ -578,6 +581,7 @@ class RealQueryFixture:
         app: FastAPI,
         client: httpx.AsyncClient,
         app_lifespan: Any,
+        broker: IsolatedQueryBroker,
     ) -> None:
         self.settings = settings
         self.container = container
@@ -589,14 +593,15 @@ class RealQueryFixture:
         self._stop = asyncio.Event()
         self._checkpoint_context: Any = None
         self._dependencies: QueryGraphDependencies | None = None
+        self._isolated_broker = broker
 
     async def start_worker(self) -> None:
         self._dependencies = _dependencies(self.container, self.settings)
         self._checkpoint_context = self.container.checkpoints.open_query()
         checkpointer = await self._checkpoint_context.__aenter__()
         self._worker = QueryWorker(
-            runs=self.container.run_manager.runs,  # type: ignore[union-attr]
-            broker=self.container.broker,
+            runs=TransactionalRunRepository(self.container.repositories.session_factory),
+            broker=self._isolated_broker,
             graph_factory=build_graph_factory(self._dependencies, checkpointer),
             worker_id=f"query-e2e-{uuid4().hex}",
             trace_recorder=self._dependencies.trace_recorder,
@@ -606,8 +611,12 @@ class RealQueryFixture:
             lease_seconds=2,
             run_timeout_seconds=30,
             outbox_dispatcher=OutboxDispatcher(
-                _Outbox(self.container.repositories.session_factory),
-                self.container.broker,
+                TransactionalQueryOutboxAdapter(
+                    self.container.repositories.session_factory,
+                    user_id=self.settings.default_user_id,
+                    stream_name=self._isolated_broker.query_stream,
+                ),
+                self._isolated_broker,
                 aggregate_type="query_run",
             ),
             outbox_interval_seconds=0.05,
@@ -629,13 +638,23 @@ class RealQueryFixture:
             await checkpoint_context.__aexit__(None, None, None)
 
     async def restart_worker(self) -> None:
+        await self._stop_worker_for_restart()
+        await self.start_worker()
+
+    async def _stop_worker_for_restart(self) -> None:
         failures: list[tuple[str, BaseException]] = []
         await _record_fixture_teardown_error(failures, "Query Worker", self.stop_worker())
         await _record_fixture_teardown_error(
             failures, "Query checkpoint", self._close_checkpoint()
         )
+        if self._dependencies is not None:
+            await _record_fixture_teardown_error(
+                failures,
+                "Query dependencies",
+                close_query_dependencies(self._dependencies),
+            )
+            self._dependencies = None
         _raise_fixture_teardown_failures(failures)
-        await self.start_worker()
 
     async def create_query(self, query: str, *, thread_id: str | None = None) -> httpx.Response:
         payload: dict[str, object] = {"query": query, "wait_seconds": 0}
@@ -658,7 +677,7 @@ class RealQueryFixture:
         raise AssertionError(f"query run {run_id} did not reach a terminal state")
 
     async def inject_duplicate_delivery(self, run_id: str) -> None:
-        await self.container.broker.publish(
+        await self._isolated_broker.publish(
             QUERY_STREAM, run_id, datetime.now(UTC), dedupe_key=None
         )
 
@@ -701,10 +720,14 @@ class RealQueryFixture:
         await _record_fixture_teardown_error(
             failures,
             "fixture MySQL state",
-            _cleanup_local_fixture_mysql(self.container, self.settings),
+            _cleanup_local_fixture_mysql(
+                self.container, self.settings, self._isolated_broker
+            ),
         )
         await _record_fixture_teardown_error(
-            failures, "fixture Redis state", _cleanup_local_fixture_redis(self.container)
+            failures,
+            "fixture Redis state",
+            _cleanup_local_fixture_redis(self.container, self._isolated_broker),
         )
         await _record_fixture_teardown_error(
             failures, "fixture container", _strict_container_close(self.container)
@@ -719,6 +742,17 @@ async def real_query_fixture(tmp_path: Path) -> AsyncIterator[RealQueryFixture]:
     migration.set_main_option("sqlalchemy.url", settings.mysql_dsn)
     await asyncio.to_thread(command.upgrade, migration, "head")
     container = build_container(settings)
+    isolated_broker = IsolatedQueryBroker(
+        container.broker,
+        namespace=f"query-fixture-{uuid4().hex}",
+    )
+    container.run_manager = RunManager(
+        session_factory=container.repositories.session_factory,
+        runs=TransactionalRunRepository(
+            container.repositories.session_factory,
+            outbox_stream_name=isolated_broker.query_stream,
+        ),
+    )
     await container.redis.ping()
     await container.elasticsearch.info()
     async with container.mysql_engine.connect() as connection:
@@ -737,6 +771,7 @@ async def real_query_fixture(tmp_path: Path) -> AsyncIterator[RealQueryFixture]:
         app=app,
         client=client,
         app_lifespan=app_lifespan,
+        broker=isolated_broker,
     )
     await fixture.start_worker()
     try:
@@ -766,6 +801,8 @@ class RealQueryRuntime(RealQueryFixture):
         parent_id: str,
         evaluation_output: Path,
         broker: IsolatedQueryBroker,
+        admin_mysql_dsn: str,
+        source_mysql_database: str,
     ) -> None:
         super().__init__(
             settings=settings,
@@ -773,6 +810,7 @@ class RealQueryRuntime(RealQueryFixture):
             app=app,
             client=client,
             app_lifespan=app_lifespan,
+            broker=broker,
         )
         self.snapshot: RuntimeConfigSnapshot = container.runtime_snapshot
         self.seeded_question = (
@@ -780,6 +818,8 @@ class RealQueryRuntime(RealQueryFixture):
         )
         self._parent_id = parent_id
         self._evaluation_output = evaluation_output
+        self._admin_mysql_dsn = admin_mysql_dsn
+        self._source_mysql_database = source_mysql_database
         self._isolated_broker = broker
         self._evaluation_summary: Mapping[str, object] | None = None
         self.memory_boundary: dict[str, bool] = {"read": False, "write": False}
@@ -924,8 +964,6 @@ class RealQueryRuntime(RealQueryFixture):
                 "runtime_config_snapshot_id": self.snapshot.snapshot_id,
             }
         )
-        recovery = await asyncio.to_thread(run_recovery_drill)
-        backup = await asyncio.to_thread(run_backup_restore_drill)
         summary = await EvalRunner(
             HttpQueryClient(
                 "http://real-query",
@@ -937,12 +975,54 @@ class RealQueryRuntime(RealQueryFixture):
             client_provenance=HttpQueryClient.provenance,
         ).run(
             [case],
-            recovery_drill_passed=recovery.gate_passed,
-            backup_restore_passed=backup,
+            recovery_drill_passed=False,
+            backup_restore_passed=False,
+        )
+        recovery_evidence, checkpoint_thread_id = await exercise_query_worker_recovery(
+            client=self.client,
+            container=self.container,
+            broker=self._isolated_broker,
+            user_id=self.settings.default_user_id,
+            snapshot_id=self.snapshot.snapshot_id,
+            parent_id=self._parent_id,
+            stop_worker=self._stop_worker_for_restart,
+            start_worker=self.start_worker,
+        )
+        await self._stop_worker_for_restart()
+        try:
+            backup_evidence = await run_service_backup_restore(
+                ServiceBackupResources(
+                    working_root=self._evaluation_output.parent,
+                    artifact_root=self.settings.artifact_root,
+                    query_checkpoint_path=self.settings.query_checkpoint_path,
+                    source_mysql_dsn=self.settings.mysql_dsn,
+                    source_mysql_database=self._source_mysql_database,
+                    admin_mysql_dsn=self._admin_mysql_dsn,
+                    redis_dsn=self.settings.redis_url,
+                    source_redis_prefix=self._isolated_broker.key_prefix,
+                    elasticsearch_url=self.settings.elasticsearch_url,
+                    source_index_generation=self.settings.index_generation,
+                    source_run_id=str(recovery_evidence["source_run_id"]),
+                    checkpoint_thread_id=checkpoint_thread_id,
+                    parent_id=self._parent_id,
+                    runtime_config_snapshot_id=self.snapshot.snapshot_id,
+                    app_version=self.snapshot.app_version,
+                )
+            )
+        finally:
+            await self.start_worker()
+        summary.update(
+            {
+                "recovery_drill_passed": True,
+                "backup_restore_passed": True,
+                "recovery_evidence": recovery_evidence,
+                "backup_restore_evidence": backup_evidence,
+            }
         )
         summary["memory_provider_available"] = bool(
             getattr(self.container.memory_service, "available", False)
         )
+        write_summary(self._evaluation_output / "summary.json", summary)
         self._evaluation_summary = summary
 
     async def close(self) -> None:
@@ -1082,15 +1162,29 @@ async def _cleanup_real_provider_boundaries(
 async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
     """Opt-in live provider fixture; setup errors fail instead of becoming a pass."""
     settings = _require_real_provider_services(tmp_path)
-    migration = Config(str(Path("alembic.ini").resolve()))
-    migration.set_main_option("sqlalchemy.url", settings.mysql_dsn)
-    await asyncio.to_thread(command.upgrade, migration, "head")
-    container = build_container(settings)
+    admin_mysql_dsn = require_service_backup_admin_dsn()
+    suffix = settings.index_generation.removeprefix("real-query-")
+    source_mysql_database = f"agentic_rag_acceptance_source_{suffix}"
+    await asyncio.to_thread(
+        create_isolated_mysql_database, admin_mysql_dsn, source_mysql_database
+    )
+    settings = settings.model_copy(
+        update={
+            "mysql_dsn": isolated_mysql_dsn(
+                admin_mysql_dsn, source_mysql_database
+            )
+        }
+    )
+    container: AppContainer | None = None
     app_lifespan: Any = None
     client: httpx.AsyncClient | None = None
     runtime: RealQueryRuntime | None = None
     isolated_broker: IsolatedQueryBroker | None = None
     try:
+        migration = Config(str(Path("alembic.ini").resolve()))
+        migration.set_main_option("sqlalchemy.url", settings.mysql_dsn)
+        await asyncio.to_thread(command.upgrade, migration, "head")
+        container = build_container(settings)
         isolated_broker = IsolatedQueryBroker(
             container.broker,
             namespace=settings.index_generation,
@@ -1131,28 +1225,40 @@ async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
             parent_id=parent_id,
             evaluation_output=tmp_path / "evaluation",
             broker=isolated_broker,
+            admin_mysql_dsn=admin_mysql_dsn,
+            source_mysql_database=source_mysql_database,
         )
         await runtime.start_worker()
         await runtime.exercise_memory_boundary()
         await runtime.run_evaluation()
         yield runtime
     finally:
-        if runtime is not None:
-            await runtime.close()
-        else:
-            try:
-                if client is not None:
-                    await client.aclose()
-            finally:
+        try:
+            if runtime is not None:
+                await runtime.close()
+            else:
                 try:
-                    if app_lifespan is not None:
-                        await app_lifespan.__aexit__(None, None, None)
+                    if client is not None:
+                        await client.aclose()
                 finally:
-                    failures: list[tuple[str, BaseException]] = []
-                    await _cleanup_real_provider_boundaries(
-                        failures, container, settings, isolated_broker
-                    )
-                    await _record_fixture_teardown_error(
-                        failures, "fixture container", _strict_container_close(container)
-                    )
-                    _raise_fixture_teardown_failures(failures)
+                    try:
+                        if app_lifespan is not None:
+                            await app_lifespan.__aexit__(None, None, None)
+                    finally:
+                        if container is not None:
+                            failures: list[tuple[str, BaseException]] = []
+                            await _cleanup_real_provider_boundaries(
+                                failures, container, settings, isolated_broker
+                            )
+                            await _record_fixture_teardown_error(
+                                failures,
+                                "fixture container",
+                                _strict_container_close(container),
+                            )
+                            _raise_fixture_teardown_failures(failures)
+        finally:
+            await asyncio.to_thread(
+                drop_isolated_mysql_database,
+                admin_mysql_dsn,
+                source_mysql_database,
+            )

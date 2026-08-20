@@ -23,6 +23,7 @@ from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.outbox import OutboxDispatcher
 from agentic_rag.persistence.redis_queue import StreamBroker, StreamMessage
 from agentic_rag.persistence.repositories import LeaseLost, QueryRun, RunRepository
+from agentic_rag.query.public_answer import project_public_answer
 from agentic_rag.query.state import new_query_state
 from agentic_rag.runtime.concurrency import ConcurrencyManager
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
@@ -340,7 +341,24 @@ class QueryWorker:
             )
             return
         if isinstance(answer, dict):
-            answer = _public_answer_projection(answer, result)
+            if termination == "completed":
+                answer.pop("status", None)
+            else:
+                answer["status"] = termination
+            answer = _public_answer_projection(
+                answer,
+                result,
+                runtime_config_snapshot_id=claim.runtime_config_snapshot_id,
+                require_audited=termination == "completed",
+            )
+            if answer is None:
+                await self._handle_execution_failure(
+                    message,
+                    claim,
+                    "invalid_graph_result",
+                    started_monotonic=started_monotonic,
+                )
+                return
         await self._finish_and_ack(
             message,
             claim,
@@ -657,20 +675,38 @@ def _run_event_type(status: RunStatus) -> str:
 
 
 def _public_answer_projection(
-    answer: dict[str, object], result: dict[str, object]
-) -> dict[str, object]:
-    """Persist only safe retrieval identifiers alongside the audited answer."""
-    projection = dict(answer)
-    if "evidence_parent_ids" not in projection:
-        evidence = result.get("evidence")
-        parent_ids: list[str] = []
-        if isinstance(evidence, list):
-            for item in evidence:
-                if not isinstance(item, dict):
-                    continue
-                parent_id = item.get("parent_id")
-                if isinstance(parent_id, str) and parent_id and parent_id not in parent_ids:
-                    parent_ids.append(parent_id)
-        if parent_ids:
-            projection["evidence_parent_ids"] = parent_ids
-    return projection
+    answer: dict[str, object],
+    result: dict[str, object],
+    *,
+    runtime_config_snapshot_id: str,
+    require_audited: bool,
+) -> dict[str, object] | None:
+    """Persist only the reviewed public projection of a graph answer."""
+    evidence = result.get("evidence")
+    parent_ids: list[str] = []
+    if isinstance(evidence, list):
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            parent_id = item.get("parent_id")
+            if isinstance(parent_id, str) and parent_id and parent_id not in parent_ids:
+                parent_ids.append(parent_id)
+    route_value = result.get("route")
+    if isinstance(route_value, dict):
+        route_value = route_value.get("route")
+    route = route_value if isinstance(route_value, str) else None
+    projected = project_public_answer(
+        answer,
+        evidence_parent_ids=parent_ids,
+        route=route,
+        runtime_config_snapshot_id=(runtime_config_snapshot_id if require_audited else None),
+        require_audited=require_audited,
+    )
+    if projected is None:
+        return None
+    public = projected.model_dump(mode="json", exclude_none=True)
+    if not projected.segments:
+        public.pop("segments", None)
+    if not projected.evidence_parent_ids:
+        public.pop("evidence_parent_ids", None)
+    return public

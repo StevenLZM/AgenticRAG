@@ -462,3 +462,76 @@ async def test_fallback_event_recorder_drops_untrusted_summary_and_identifier() 
     assert event.event_type == "PROGRESS"
     assert event.node_name == "progress"
     assert event.summary == "telemetry event"
+
+
+async def test_sensitive_research_provider_exception_never_reaches_state_events_or_artifacts(
+    tmp_path,
+) -> None:
+    """Checkpointed graph state and durable telemetry retain controlled codes only."""
+    from agentic_rag.observability.logging import AgentEventEmitter
+    from agentic_rag.persistence.artifacts import LocalArtifactStore
+    from agentic_rag.query.graph import build_query_graph
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+
+    secret = "Authorization: Bearer research-secret provider_response=https://private"
+
+    class RoutingThenFailingGateway:
+        async def complete_structured(
+            self, call: object, schema: type[object]
+        ) -> ModelResponse[object]:
+            del schema
+            if getattr(call, "model_role", "") == "light":
+                return ModelResponse(
+                    value=RouteDecision(
+                        route="research",
+                        normalized_query="notice",
+                        reason_code="test",
+                    ),
+                    requested_model="light",
+                    actual_model="light",
+                    input_tokens=1,
+                    output_tokens=1,
+                    attempts=1,
+                    latency_ms=1,
+                )
+            raise TimeoutError(secret)
+
+    gateway = RoutingThenFailingGateway()
+    deps, _memory, retrieval, events = _deps(route="research")
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    emitter = AgentEventEmitter(
+        events,
+        artifacts,
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+    )
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=gateway,
+        retrieval=retrieval,
+        evidence_builder=EvidenceBuilder(),
+    ))
+
+    result = await build_query_graph(replace(
+        deps,
+        gateway=gateway,
+        research_loop=loop,
+        event_emitter=emitter,
+    )).ainvoke(_state())
+
+    assert result["termination_reason"] == "cannot_answer"
+    assert result["research"]["observations"][-1]["error_code"] == "model_unavailable"
+    serialized = json.dumps(result)
+    event_text = json.dumps([
+        {
+            "event_type": event.event_type,
+            "summary": event.summary,
+            "payload_ref": event.payload_ref,
+        }
+        for event in events.events
+    ])
+    artifact_bytes = b"".join(
+        path.read_bytes() for path in (tmp_path / "artifacts").rglob("*") if path.is_file()
+    ).decode("utf-8")
+    for marker in ("research-secret", "provider_response", "https://private"):
+        assert marker not in serialized
+        assert marker not in event_text
+        assert marker not in artifact_bytes

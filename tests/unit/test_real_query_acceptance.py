@@ -16,6 +16,12 @@ from scripts.run_real_query_acceptance import (
     console_acceptance_passed,
     run,
 )
+from scripts.real_acceptance_evidence import (
+    RealAcceptanceEvidenceError,
+    exercise_query_worker_recovery,
+    require_service_backup_admin_dsn,
+    service_backup_configuration_issue,
+)
 
 
 def _summary() -> dict[str, object]:
@@ -44,6 +50,41 @@ def _summary() -> dict[str, object]:
         "unaudited_answer_count": 0,
         "recovery_drill_passed": True,
         "backup_restore_passed": True,
+        "recovery_evidence": {
+            "provider_e2e": True,
+            "source_run_id": "run-recovery",
+            "runtime_config_snapshot_id": "snapshot-current",
+            "worker_restarted": True,
+            "duplicate_delivery_injected": True,
+            "duplicate_delivery_acked": True,
+            "terminal_status": "completed",
+            "terminal_event_count": 1,
+            "final_answer_audited": True,
+        },
+        "backup_restore_evidence": {
+            "provider_e2e": True,
+            "source_run_id": "run-recovery",
+            "runtime_config_snapshot_id": "snapshot-current",
+            "source_scope": {
+                "mysql_database": "agentic_rag_acceptance_source",
+                "redis_prefix": "agenticrag:e2e:source",
+                "index_generation": "real-query-source",
+                "checkpoint_thread_id": "query:user:recovery",
+                "artifact_marker": "artifact://acceptance/run-recovery.json",
+            },
+            "restore_scope": {
+                "mysql_database": "agentic_rag_acceptance_restore",
+                "redis_prefix": "agenticrag:e2e:restore",
+                "index_generation": "real-query-restore",
+            },
+            "services": {
+                "mysql": True,
+                "redis": True,
+                "elasticsearch": True,
+                "artifacts": True,
+                "checkpoints": True,
+            },
+        },
     }
 
 
@@ -65,6 +106,37 @@ def test_console_acceptance_gate_rejects_missing_or_unsafe_live_evidence() -> No
     ):
         altered = {**summary, field: value}
         assert console_acceptance_passed(altered) is False
+
+    # Bare booleans from local-only drills can never satisfy a live gate.
+    assert console_acceptance_passed({
+        key: value
+        for key, value in summary.items()
+        if key not in {"recovery_evidence", "backup_restore_evidence"}
+    }) is False
+
+    bad_recovery = {
+        **summary,
+        "recovery_evidence": {
+            **summary["recovery_evidence"],  # type: ignore[arg-type]
+            "terminal_event_count": 2,
+        },
+    }
+    assert console_acceptance_passed(bad_recovery) is False
+
+    bad_backup = {
+        **summary,
+        "backup_restore_evidence": {
+            **summary["backup_restore_evidence"],  # type: ignore[arg-type]
+            "services": {
+                "mysql": True,
+                "redis": True,
+                "elasticsearch": True,
+                "artifacts": True,
+                "checkpoints": False,
+            },
+        },
+    }
+    assert console_acceptance_passed(bad_backup) is False
 
     unsafe_event = {
         **summary,
@@ -98,6 +170,100 @@ def test_invalidate_previous_summary_removes_stale_pass_before_a_live_attempt(tm
     stale = list(output.glob("summary.stale-*.json"))
     assert len(stale) == 1
     assert stale[0].read_text(encoding="utf-8") == '{"gate_passed": true}'
+
+
+def test_real_backup_configuration_is_explicitly_unavailable_without_isolation_dsn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AGENTIC_RAG_RUN_REAL_BACKUP_RESTORE", raising=False)
+    monkeypatch.delenv("AGENTIC_RAG_TEST_MYSQL_ADMIN_DSN", raising=False)
+
+    assert "AGENTIC_RAG_RUN_REAL_BACKUP_RESTORE" in str(
+        service_backup_configuration_issue()
+    )
+    with pytest.raises(RealAcceptanceEvidenceError, match="unavailable"):
+        require_service_backup_admin_dsn()
+
+
+@pytest.mark.asyncio
+async def test_recovery_evidence_comes_from_current_api_worker_and_duplicate_ack() -> None:
+    calls: list[str] = []
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class Client:
+        async def post(self, path: str, *, json: dict[str, object]) -> Response:
+            assert path == "/v1/query-runs"
+            assert json["wait_seconds"] == 0
+            calls.append("api-create")
+            return Response(202, {"run_id": "run-recovery"})
+
+        async def get(self, path: str) -> Response:
+            assert path == "/v1/query-runs/run-recovery"
+            return Response(200, {
+                "status": "completed",
+                "runtime_config_snapshot_id": "snapshot-current",
+                "answer": {
+                    "audited": True,
+                    "evidence_parent_ids": ["parent-1"],
+                },
+            })
+
+    class Broker:
+        query_stream = "agenticrag:e2e:test:query"
+        query_group = "agenticrag-e2e-test"
+
+        def __init__(self) -> None:
+            self.messages = 0
+
+        async def publish(self, *args: object, **kwargs: object) -> str:
+            del args, kwargs
+            self.messages += 1
+            calls.append(f"publish-{self.messages}")
+            return f"{self.messages}-0"
+
+    class Redis:
+        async def xinfo_groups(self, stream: str) -> list[dict[str, object]]:
+            assert stream == Broker.query_stream
+            return [{
+                "name": Broker.query_group,
+                "last-delivered-id": "2-0",
+                "pending": 0,
+            }]
+
+    class Events:
+        async def list_after(self, *args: object) -> list[object]:
+            del args
+            return [SimpleNamespace(event_type="RUN_COMPLETED")]
+
+    async def stop_worker() -> None:
+        calls.append("worker-stop")
+
+    async def start_worker() -> None:
+        calls.append("worker-start")
+
+    evidence, checkpoint_thread_id = await exercise_query_worker_recovery(
+        client=Client(),
+        container=SimpleNamespace(redis=Redis(), event_repository=Events()),
+        broker=Broker(),
+        user_id="user-1",
+        snapshot_id="snapshot-current",
+        parent_id="parent-1",
+        stop_worker=stop_worker,
+        start_worker=start_worker,
+    )
+
+    assert calls[:4] == ["worker-stop", "api-create", "publish-1", "worker-start"]
+    assert evidence["source_run_id"] == "run-recovery"
+    assert evidence["duplicate_delivery_acked"] is True
+    assert evidence["terminal_event_count"] == 1
+    assert checkpoint_thread_id.startswith("query:user-1:recovery-")
 
 
 @pytest.mark.asyncio

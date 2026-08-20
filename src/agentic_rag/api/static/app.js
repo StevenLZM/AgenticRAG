@@ -25,7 +25,7 @@
     cannot_answer: "现有证据不足以安全回答，系统未展示草稿。",
     refuse: "该请求已被安全拒绝，系统未继续生成回答。",
     clarify: "需要补充问题或上下文后才能继续检索。",
-    "subagents unavailable": "子 Agent 当前不可用，系统将显示已降级的处理状态。",
+    subagent_unavailable: "子 Agent 当前不可用，系统将显示已降级的处理状态。",
     todo_creation_empty: "未生成可执行的 Todo，任务拆分没有继续。"
   };
   const EVENT_NOTICE_CODES = {
@@ -41,6 +41,7 @@
     "lane_failure", "lane_timeout", "retrieval_unavailable", "reranker_unavailable",
     "memory_unavailable", "router_unavailable", "router_schema_invalid",
     "model_unavailable", "model_schema_invalid", "generation_unavailable", "audit_failed",
+    "subagent_unavailable", "research_action_invalid",
     "authorization_unavailable", "provider_outage", "circuit_open", "outbox_retry",
     "lease_lost", "cancelled", "worker_timeout", "worker_dlq", "invalid_input", "unknown"
   ]);
@@ -146,21 +147,49 @@
 
   function provenanceFor(details, run) {
     const provenance = {};
-    if (details.evidence_parent_ids !== undefined) {
-      provenance.evidence_parent_ids = details.evidence_parent_ids;
+    if (Array.isArray(details.evidence_parent_ids)) {
+      provenance.evidence_parent_ids = details.evidence_parent_ids.filter((value) => typeof value === "string");
     }
-    if (details.parent_ids !== undefined) provenance.parent_ids = details.parent_ids;
-    if (details.parentIds !== undefined) provenance.parent_ids = details.parentIds;
-    if (details.route !== undefined) provenance.route = details.route;
-    if (details.runtime_config_snapshot_id !== undefined) {
+    if (["fast_rag", "research"].includes(details.route)) provenance.route = details.route;
+    if (typeof details.runtime_config_snapshot_id === "string") {
       provenance.runtime_config_snapshot_id = details.runtime_config_snapshot_id;
-    } else if (run.runtime_config_snapshot_id !== undefined) {
+    } else if (typeof run.runtime_config_snapshot_id === "string") {
       provenance.runtime_config_snapshot_id = run.runtime_config_snapshot_id;
     }
-    if (details.client_provenance !== undefined) {
+    if (["api", "fixture", "real_query_api", "real_query_graph"].includes(details.client_provenance)) {
       provenance.client_provenance = details.client_provenance;
     }
     return provenance;
+  }
+
+  function answerPresentation(run) {
+    const details = run && run.answer && typeof run.answer === "object" ? run.answer : null;
+    if (!details || details.audited !== true || !Array.isArray(details.segments)) return null;
+    const segments = details.segments.filter((segment) => (
+      segment && typeof segment === "object"
+      && ["content", "heading", "separator", "references"].includes(segment.kind)
+      && typeof segment.text === "string"
+    ));
+    if (!segments.length) return null;
+    const evidenceIds = [];
+    segments.forEach((segment) => {
+      if (!Array.isArray(segment.evidence_ids)) return;
+      segment.evidence_ids.forEach((value) => {
+        if (typeof value === "string" && !evidenceIds.includes(value)) evidenceIds.push(value);
+      });
+    });
+    const parentIds = Array.isArray(details.evidence_parent_ids)
+      ? details.evidence_parent_ids.filter((value) => typeof value === "string") : [];
+    const audit = { audited: true };
+    if (typeof details.citation_coverage === "number" && details.citation_coverage >= 0 && details.citation_coverage <= 1) {
+      audit.citation_coverage = details.citation_coverage;
+    }
+    return {
+      text: segments.map((segment) => segment.text).join("\n"),
+      evidence: { evidence_ids: evidenceIds, evidence_parent_ids: parentIds },
+      audit,
+      provenance: provenanceFor(details, run)
+    };
   }
 
   function renderSafeTerminalNotice(code) {
@@ -210,27 +239,18 @@
 
   function displayAnswer(run) {
     const answer = run.answer;
-    const details = answer && typeof answer === "object" ? answer : run;
     const termination = terminalNoticeCode(run);
+    const presentation = answerPresentation(run);
     if (termination) {
       renderSafeTerminalNotice(termination);
-    } else if (answer !== null && answer !== undefined) {
-      renderObject(elements.answer, answer, "未返回可展示的回答。");
+    } else if (presentation) {
+      renderObject(elements.answer, presentation.text, "未返回可展示的回答。");
     } else if (run.error_code) {
       setText(elements.answer, "任务未完成，请查看执行状态。");
     }
-    renderObject(
-      elements.evidence,
-      details.evidence || details.citations || details.evidence_ids,
-      "服务端响应中暂无可展示的证据。"
-    );
-    const audit = {};
-    if (typeof details.audited === "boolean") audit.audited = details.audited;
-    if (details.citation_coverage !== undefined) audit.citation_coverage = details.citation_coverage;
-    if (details.audit !== undefined) audit.audit = details.audit;
-    renderObject(elements.audit, Object.keys(audit).length ? audit : null, "服务端响应中暂无审计信息。");
-    const provenance = provenanceFor(details, run);
-    renderObject(elements.provenance, Object.keys(provenance).length ? provenance : null, "服务端响应中暂无溯源信息。");
+    renderObject(elements.evidence, presentation && presentation.evidence, "服务端响应中暂无可展示的证据。");
+    renderObject(elements.audit, presentation && presentation.audit, "服务端响应中暂无审计信息。");
+    renderObject(elements.provenance, presentation && presentation.provenance, "服务端响应中暂无溯源信息。");
   }
 
   async function loadRuntimeSummary() {
@@ -489,7 +509,8 @@
     AgenticRagConsole: {
       contract: {
         buildQueryPayload, buildSseHeaders, eventPresentation, noticeCodeForEvent,
-        terminalNoticeCode, memoryErrorPresentation, provenanceFor, degradationAttributes
+        terminalNoticeCode, memoryErrorPresentation, provenanceFor, degradationAttributes,
+        answerPresentation
       }
     }
   });
