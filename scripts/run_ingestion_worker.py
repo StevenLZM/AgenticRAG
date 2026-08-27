@@ -58,6 +58,9 @@ from agentic_rag.safety.content import ContentSafetyScanner  # noqa: E402
 from agentic_rag.safety.uploads import DefaultUploadSafetyScanner  # noqa: E402
 
 
+QWEN_MAX_EMBEDDING_BATCH_SIZE = 10
+
+
 class QwenEmbeddingAdapter:
     def __init__(self, settings: Settings) -> None:
         self._model = settings.embedding_model
@@ -72,12 +75,16 @@ class QwenEmbeddingAdapter:
         )
 
     async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
-        response = await self._client.embeddings.create(
-            model=self._model,
-            input=list(texts),
-            dimensions=self._dimensions,
-        )
-        return [list(item.embedding) for item in response.data]
+        values = list(texts)
+        vectors: list[list[float]] = []
+        for start in range(0, len(values), QWEN_MAX_EMBEDDING_BATCH_SIZE):
+            response = await self._client.embeddings.create(
+                model=self._model,
+                input=values[start : start + QWEN_MAX_EMBEDDING_BATCH_SIZE],
+                dimensions=self._dimensions,
+            )
+            vectors.extend(list(item.embedding) for item in response.data)
+        return vectors
 
     async def embed_query(self, text: str) -> list[float]:
         return (await self.embed_documents([text]))[0]
