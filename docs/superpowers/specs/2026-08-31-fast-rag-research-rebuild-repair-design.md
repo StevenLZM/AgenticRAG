@@ -2,6 +2,8 @@
 
 **Date:** 2026-08-31
 
+**Revised:** 2026-09-02
+
 ## Context
 
 Run `01a056d8-2f55-73ab-9e46-9cdf40545116` started on the FastRAG route for the question `刘泽明工作经历`, packed three parent fragments, failed the evidence-sufficiency gate, and escalated into the Research Agent loop. The Research loop completed one delegated retrieval, then exhausted model retries and returned `cannot_answer` after 221.906 seconds.
@@ -9,7 +11,7 @@ Run `01a056d8-2f55-73ab-9e46-9cdf40545116` started on the FastRAG route for the 
 The incident has four independent but compounding causes:
 
 1. Parent headings exist in MySQL and Elasticsearch but are dropped when a stored parent is hydrated into `ParentEvidence` and packed into prompt evidence. Employer and job-title facts therefore help retrieval but are invisible to the evidence grader and answer generator.
-2. The canonical PDF reading order places right-column date ranges after unrelated left-column content. Parent chunking then flushes on every paragraph/list transition, producing tiny fragments such as `业绩：获` and separating dates, headings, duties, and continuations.
+2. Docling emits visually aligned left-hand headings and right-hand date ranges as separate layout blocks. In the reproduced PDF, its body graph places the date after nested duty and list groups; the assembler's depth-first body traversal preserves that graph order, so the Chunker never receives the heading and date as adjacent input. Parent chunking then flushes on every paragraph/list transition, producing tiny fragments such as `业绩：获` and further separating dates, headings, duties, and continuations.
 3. The Evidence Builder uses literal full-question substring matching for target coverage and caps generic searches at three parents per document. A name-heavy profile block can displace work-history evidence even when the reranker found the relevant section.
 4. Delegated evidence is added to a local Research list but not to the next supervisor prompt. Delegated results do not carry raw retrieval batches to the graph's post-Research Evidence Builder. Research structured calls also receive only generic JSON mode without a complete action schema, causing schema-repair calls that multiply the 30-second provider timeout.
 
@@ -20,11 +22,15 @@ The incident has four independent but compounding causes:
 - If Research is required, every successful delegated retrieval must be visible to the next supervisor action and must remain rebuildable from server-derived retrieval batches.
 - Structured model calls must receive an exact schema contract and remain within a bounded total retry-and-repair deadline.
 - The local dataset must be rebuilt from preserved source artifacts after deleting the old physical Elasticsearch index.
+- Every source type and page layout must use one canonical-ordering pipeline and one Parent/Child Chunker; the repair must not select a special resume or two-column Chunker.
+- A document that does not meet the conservative layout-association contract must preserve its canonical block sequence exactly.
 - No SQL schema migration is required.
 
 ## Non-goals
 
 - General-purpose resume understanding or an LLM-based document-layout repair system.
+- A document-type classifier, a resume-specific Chunker, or separate single-column and two-column chunking implementations.
+- Replacing Docling's reading order with a global `y`/`x` bounding-box sort. Large paragraphs, tables, sidebars, and true multi-column articles make that ordering unsafe.
 - A production zero-downtime, dual-index rollout.
 - Hard deletion of source artifacts, query history, or database audit records.
 - A general PII-redaction subsystem. The rebuild must not log or expose personal contact fields, but broader document-level PII policy is separate work.
@@ -36,39 +42,54 @@ The repair uses a destructive local rebuild with an explicit backup boundary:
 1. Stop Query and Ingestion workers and verify that no query run or ingestion job is active.
 2. Create and verify a local backup using the existing backup tooling.
 3. Copy each active document source artifact into a rebuild staging directory outside its document artifact scope. Deduplicate the staging inventory by `(user_id, content_hash)` so repeated uploads of the same resume are restored once.
-4. Soft-delete the existing active documents and run deletion reconciliation to completion. This deactivates old MySQL parents and removes their document-scoped artifacts, so the staging copy is mandatory.
-5. Delete only the resolved physical index `agenticrag-children-index-v2` and remove or verify the active alias. Wildcards and unresolved environment-variable targets are forbidden.
-6. Deploy the repair with `ingestion_pipeline_version=ingestion-v2` and `index_generation=index-v3`.
-7. Re-upload the staged source files, wait for every ingestion job to publish, then start the Query worker.
-8. Run structural, retrieval, query, and latency acceptance checks. If any hard gate fails, stop queries and restore the verified backup.
+4. Run the repaired ingestion pipeline in dry-run mode over every staged source before changing durable state. Record every reordered block and trigger reason, Parent count, Parent token distribution, and structural-boundary change. Abort if a non-triggering source is reordered or any change cannot be explained by this design.
+5. Soft-delete the existing active documents and run deletion reconciliation to completion. This deactivates old MySQL parents and removes their document-scoped artifacts, so the staging copy is mandatory.
+6. Delete only the resolved physical index `agenticrag-children-index-v2` and remove or verify the active alias. Wildcards and unresolved environment-variable targets are forbidden.
+7. Deploy the repair with `ingestion_pipeline_version=ingestion-v2` and `index_generation=index-v3`.
+8. Re-upload the staged source files, wait for every ingestion job to publish, then start the Query worker.
+9. Run structural, retrieval, query, and latency acceptance checks. If any hard gate fails, stop queries and restore the verified backup.
 
 Although the old index is deleted, the new index uses `index-v3` rather than reusing `index-v2`. Chunk identity, contextualized text, and embeddings have changed, so a new generation prevents stale checkpoints and evidence from appearing compatible with rebuilt data.
 
 ## Architecture
 
-### 1. Layout-aware canonical ordering
+### 1. Unified canonical reading-order normalization
 
-Add a deterministic layout-association pass to `GlobalAssembler` before heading-hierarchy repair. The pass handles a narrowly defined PDF pattern: a short date-range paragraph in a right column aligned with a heading in the left column.
+The repair does not add another Chunker. All documents continue through the same pipeline:
+
+```text
+Docling layout blocks
+-> canonical reading-order normalization
+-> one section-aware ParentBuilder
+-> one HybridChunker-based ChildBuilder
+```
+
+PDF files do not contain logical rows. Docling first converts positioned glyphs into blocks and groups, then emits a body graph. In the reproduced page, the left-hand employer heading and the right-hand date range have the same vertical bounds, but the date is a later body sibling after nested duty/list groups. `_body_reading_order()` visits those groups depth first, and `_normalize_reading_order()` sorts by the resulting graph order rather than by visual row. The date is therefore already behind the duties before `ParentBuilder` runs.
+
+Add a deterministic, local relationship pass to `GlobalAssembler` after Docling order normalization and before heading-hierarchy repair. Docling's order remains the baseline. The pass adds only a high-confidence precedence relation for a standalone right-hand date-range block that is visually aligned with an existing left-hand heading; it does not globally sort blocks by bounding-box coordinates.
 
 A date block is relocated immediately after a heading only when all of the following are true:
 
 - both blocks have a single-page bounding box on the same page;
+- the left block is already classified as a heading and the right block is standalone body text, not table, form, furniture, or picture content;
 - the candidate text matches the repository-owned date-range grammar;
 - the date block is geometrically to the right of the heading;
 - their vertical overlap exceeds the configured deterministic threshold;
-- there is exactly one best heading candidate within the tolerance.
+- there is exactly one best heading candidate within the tolerance;
+- the current Docling order separates the pair, so a rewrite is actually necessary;
+- the page contains at least two compatible heading/date alignments in a consistent right-hand metadata band. A single aligned pair does not trigger the pass.
 
-Ambiguous or missing geometry leaves the source order unchanged. The pass never fabricates text, removes provenance, or crosses pages. The canonical source references and bounding boxes remain attached to their original blocks.
+Ambiguous or missing geometry leaves the source order unchanged. When no relation is emitted, the candidate IDs, text, provenance, and sequence must be identical to the pre-pass input. The pass is idempotent, never fabricates text, removes provenance, crosses pages, or uses company names, resume detection, an LLM, or query-specific hints. Canonical source references and bounding boxes remain attached to their original blocks.
 
-This associates the observed dates with the headings on the same visual row: education dates with their institutions, the 2024-present range with the first employer, the 2019-2024 range with the Jingdong heading, and project dates with their project headings.
+This associates the observed dates with the headings on the same visual row while preserving Docling's original order everywhere else. The Chunker consumes only the normalized canonical sequence and has no knowledge of columns or document type.
 
 ### 2. Section-coherent Parent chunks
 
-Change `ParentBuilder` so a transition among regular prose types (`paragraph`, `list_item`, `formula`, and `other`) does not automatically flush an undersized Parent. Adjacent regular pieces under the same heading are coalesced until the normal target limits require a split. A coalesced Parent has `content_type="mixed"` and retains every source span in order.
+Keep one `ParentBuilder` for PDF, DOCX, Markdown, single-column, and multi-column inputs. Do not condition Parent behavior on whether the layout-association pass changed a page. A transition among regular prose types (`paragraph`, `list_item`, `formula`, and `other`) no longer automatically flushes an undersized Parent. Adjacent regular pieces under the same heading are coalesced until the normal target limits require a split. A coalesced Parent has `content_type="mixed"` and retains every source span in order.
 
 Tables, code, and logs remain structural atoms and preserve the existing fail-closed row fallback. Headings still form hard section boundaries. Parent and Child token limits, source-resolution invariants, deterministic IDs, and page provenance remain unchanged.
 
-The result must keep `业绩：获` with its continuation and keep a job's aligned date, duties, and accomplishments in the same reasoning unit whenever the token budget allows.
+This general rule may change Parent boundaries for non-two-column documents that contain paragraph/list transitions; that is intentional and must be evaluated as a general semantic-chunking change, not hidden behind a resume-specific branch. It must not change source text, canonical order, heading membership, structural boundaries, or provenance. The reproduced result must keep `业绩：获` with its continuation and keep a job's aligned date, duties, and accomplishments in the same reasoning unit whenever the token budget allows.
 
 ### 3. Preserve heading provenance through evidence packing
 
@@ -123,19 +144,20 @@ The graph must not wrap the entire Research loop in misleading `retrieval.tool` 
 
 ## Failure Handling
 
-- Layout association fails open to original ordering only for ambiguous geometry; all provenance validation continues to fail closed.
+- Layout association fails open to the exact original candidate sequence for ambiguous geometry, isolated right-aligned dates, or inconsistent column bands; all provenance validation continues to fail closed.
 - Evidence with a heading or manifest mismatch is rejected before prompt construction.
 - Mixed index generations, missing delegated batches, or an over-budget evidence merge terminate Research with a safe typed reason and no answer.
 - Model timeout or invalid schema returns `model_unavailable` or `research_action_invalid` without exposing provider text.
-- Rebuild preflight aborts before deletion if source staging, backup verification, service quiescence, or exact index resolution fails.
+- Rebuild preflight aborts before deletion if source staging, backup verification, service quiescence, exact index resolution, or the old/new ingestion dry-run diff fails.
 - Rebuild validation failure keeps Query traffic stopped until the backup is restored or the defect is corrected and ingestion is rerun.
 
 ## Testing Strategy
 
 ### Unit tests
 
-- Canonical assembler associates right-column date ranges with the uniquely aligned heading and leaves ambiguous layouts unchanged.
-- ParentBuilder coalesces paragraph/list transitions into one mixed Parent without crossing headings or structural atoms; every AST locator still resolves exactly.
+- Canonical assembler reproduces the observed Docling body-tree failure: depth-first group traversal places a same-row date after nested duties, and the relationship pass restores only the high-confidence heading/date adjacency.
+- Single-column prose, ordinary right-aligned report dates, tables, forms, sidebars, ambiguous alignments, and true multi-column articles preserve their exact pre-pass candidate sequence. Applying the pass twice produces the same sequence.
+- One ParentBuilder coalesces paragraph/list transitions into one mixed Parent across supported source types without crossing headings or structural atoms; every AST locator still resolves exactly and no layout-specific branch exists.
 - Parent hydration and Evidence Builder preserve heading paths, render them as untrusted data, and reject heading-manifest mismatches.
 - Evidence coverage follows retrieval target provenance; a single-document result may pack six parents while multi-document diversity remains capped.
 - Research action two receives delegated evidence text and manifest IDs from action one.
@@ -146,6 +168,7 @@ The graph must not wrap the entire Research loop in misleading `retrieval.tool` 
 
 - MySQL Parent hydration round-trips `heading_path` from the existing column.
 - The ingestion pipeline fixture produces coherent job-history Parents and index-v3 Child documents with matching headings and provenance.
+- A differential corpus covering single-column PDF, DOCX, Markdown, tables, reports with dates, and multi-column articles shows zero unexpected canonical reordering and no retrieval/audit regression.
 - The real graph completes a delegate-only Research path without `research_batches_missing`.
 - Elasticsearch alias and physical-index checks reject an unexpected generation.
 
@@ -155,6 +178,7 @@ The graph must not wrap the entire Research loop in misleading `retrieval.tool` 
 - Every active document version has `pipeline_version=ingestion-v2` and `index_generation=index-v3`.
 - Manifest parent/child counts match MySQL and Elasticsearch counts.
 - Only one active document exists per staged `(user_id, content_hash)`.
+- The pre-deletion dry-run report lists every reordered block and reason, shows no unexpected reorder for non-triggering sources, and proves exact source-span coverage before and after Parent construction.
 - The rebuilt resume places each visually aligned date range in the corresponding section and contains no split `业绩：获` continuation.
 - `刘泽明工作经历` completes on FastRAG with an audited answer citing employer/title/date evidence and emits no Research-loop event.
 - `刘泽明教育经历` remains audited and correct.
@@ -163,19 +187,19 @@ The graph must not wrap the entire Research loop in misleading `retrieval.tool` 
 
 ## Implementation Order
 
-1. Add failing layout and mixed-Parent regression fixtures.
-2. Implement canonical layout association and regular-piece coalescing.
+1. Add failing Docling body-order, layout no-op, idempotence, and unified mixed-Parent regression fixtures.
+2. Implement conservative canonical relationship association and the single regular-piece coalescing rule.
 3. Add failing heading-provenance and evidence-selection tests, then implement the query-model changes.
 4. Add failing Research state-flow tests, then implement batch and packed-context propagation.
 5. Add failing schema-budget and observability tests, then implement the model-gateway and span changes.
-6. Add the guarded local rebuild command and operational documentation.
+6. Add the guarded local rebuild command, mandatory old/new ingestion dry-run diff, and operational documentation.
 7. Run unit, integration, security, and real-service acceptance suites.
 8. Execute the approved backup-delete-reingest runbook against the local environment.
 
 ## File Responsibility Map
 
-- `src/agentic_rag/ingestion/assembler.py`: deterministic layout association.
-- `src/agentic_rag/ingestion/chunker.py`: section-coherent mixed Parent construction.
+- `src/agentic_rag/ingestion/assembler.py`: Docling-baseline canonical ordering plus conservative, idempotent relationship association.
+- `src/agentic_rag/ingestion/chunker.py`: one section-coherent mixed Parent implementation for every source and layout.
 - `src/agentic_rag/persistence/repositories.py`: hydrate existing heading metadata.
 - `src/agentic_rag/retrieval/models.py` and `src/agentic_rag/retrieval/parents.py`: preserve heading and target provenance.
 - `src/agentic_rag/query/evidence_builder.py` and `src/agentic_rag/safety/context.py`: pack, render, and authorize heading-aware evidence.
