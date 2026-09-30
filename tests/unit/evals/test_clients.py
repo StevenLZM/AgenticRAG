@@ -93,8 +93,10 @@ class _Response:
 class _Http:
     def __init__(self) -> None:
         self.status_calls = 0
+        self.post_calls = 0
 
     async def post(self, path: str, **_: object) -> _Response:
+        self.post_calls += 1
         assert path == "/v1/query-runs"
         return _Response({"run_id": "run-1"}, status_code=202)
 
@@ -109,7 +111,7 @@ class _Http:
                     "thread_id": "thread-1",
                     "runtime_config_snapshot_id": SNAPSHOT.snapshot_id,
                     "answer": {
-                        "segments": [],
+                        "segments": [{"kind": "content", "text": "answer", "evidence_ids": []}],
                         "audited": True,
                         "evidence_parent_ids": ["parent-1"],
                     },
@@ -125,12 +127,116 @@ class _Http:
         )
 
 
+class Collector:
+    async def collect(self, **bindings):
+        assert bindings["run_id"] == "run-1" and bindings["user_id"] == CASE.user_id
+        return {"answer": {"segments": [{"kind": "content", "text": "answer", "evidence_ids": []}],
+                           "audited": True, "evidence_parent_ids": ["parent-1"]},
+                    "route": "research", "contexts": ["observed context"],
+                    "ranked_parent_ids": ["retrieved-not-cited"], "retrieval_rounds": [],
+                    "ranking_scope": "single-retrieval", "final_context_parent_ids": ["retrieved-not-cited"]}
+
+
 @pytest.mark.asyncio
-async def test_http_client_polls_public_api_and_preserves_snapshot_provenance() -> None:
+async def test_http_client_polls_public_api_and_preserves_snapshot_provenance(tmp_path) -> None:
     result = await HttpQueryClient(
-        "http://api.test", http_client=_Http(), poll_interval_seconds=0.001
+        "http://api.test", http_client=_Http(), poll_interval_seconds=0.001, collector=Collector(), ledger_dir=tmp_path
     ).query(CASE)
 
     assert result["client_provenance"] == "real_query_api"
     assert result["evidence_parent_ids"] == ["parent-1"]
+    assert result["route"] == "research"
+    assert result["contexts"] == ["observed context"]
+    assert result["ranked_parent_ids"] == ["retrieved-not-cited"]
     assert result["events"][0]["event_key"] == "api:run-1:1"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_poll_interruption_resumes_same_run_without_second_post(tmp_path):
+    class InterruptedHttp(_Http):
+        async def get(self, path, **kwargs):
+            if self.status_calls == 0:
+                self.status_calls += 1
+                raise TimeoutError("lost poll")
+            return await super().get(path, **kwargs)
+    http = InterruptedHttp()
+    client = HttpQueryClient("http://api.test", http_client=http, collector=Collector(), ledger_dir=tmp_path)
+    with pytest.raises(TimeoutError):
+        await client.query(CASE)
+    result = await client.query(CASE)
+    assert result["run_id"] == "run-1" and http.post_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_uncertain_submission_is_never_automatically_repeated(tmp_path):
+    class LostPost(_Http):
+        async def post(self, *args, **kwargs):
+            self.post_calls += 1
+            raise TimeoutError("lost response")
+    http = LostPost()
+    client = HttpQueryClient("http://api.test", http_client=http, collector=Collector(), ledger_dir=tmp_path)
+    with pytest.raises(TimeoutError):
+        await client.query(CASE)
+    with pytest.raises(Exception, match="uncertain"):
+        await client.query(CASE)
+    assert http.post_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_http_answer_must_equal_collected_answer(tmp_path):
+    class WrongCollector(Collector):
+        async def collect(self, **kwargs):
+            result = await super().collect(**kwargs)
+            result["answer"] = {"status": "refuse"}
+            return result
+    client = HttpQueryClient("http://api.test", http_client=_Http(), collector=WrongCollector(),
+                             ledger_dir=tmp_path, poll_interval_seconds=0.001)
+    with pytest.raises(Exception, match="answer"):
+        await client.query(CASE)
+
+
+@pytest.mark.asyncio
+async def test_http_default_null_fields_do_not_change_answer_identity(tmp_path):
+    class DefaultFieldsHttp(_Http):
+        async def get(self, path, **kwargs):
+            response = await super().get(path, **kwargs)
+            if "answer" in response._payload:
+                response._payload["answer"].update(status=None, client_provenance=None, citation_coverage=None)
+            return response
+    result = await HttpQueryClient("http://api.test", http_client=DefaultFieldsHttp(), collector=Collector(),
+                                  ledger_dir=tmp_path, poll_interval_seconds=0.001).query(CASE)
+    assert result["run_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_query_cannot_duplicate_submission(tmp_path):
+    import asyncio
+    started, release = asyncio.Event(), asyncio.Event()
+    class BlockingHttp(_Http):
+        async def post(self, *args, **kwargs):
+            started.set()
+            await release.wait()
+            return await super().post(*args, **kwargs)
+    http = BlockingHttp()
+    client = HttpQueryClient("http://api.test", http_client=http, collector=Collector(), ledger_dir=tmp_path,
+                             poll_interval_seconds=0.001)
+    task = asyncio.create_task(client.query(CASE))
+    await started.wait()
+    try:
+        with pytest.raises(Exception, match="in use"):
+            await client.query(CASE)
+    finally:
+        release.set()
+        await task
+    assert http.post_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_changed_case_does_not_reuse_existing_run(tmp_path):
+    http = _Http()
+    client = HttpQueryClient("http://api.test", http_client=http, collector=Collector(), ledger_dir=tmp_path,
+                             poll_interval_seconds=0.001)
+    await client.query(CASE)
+    with pytest.raises(Exception, match="binding changed"):
+        await client.query(CASE.model_copy(update={"question": "a different question"}))
+    assert http.post_calls == 1

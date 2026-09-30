@@ -433,6 +433,13 @@ class QueryWorker:
         state = new_query_state(
             run_id=claim.id, question=claim.question, scope=UserScope(user_id=claim.user_id),
             snapshot=RuntimeConfigSnapshot.model_validate(claim.runtime_config_snapshot),
+            # Memory extraction consumes public messages, not request.question.
+            # Keep provenance stable when this run is invoked again.
+            messages=[{
+                "id": f"query:{claim.id}:user",
+                "role": "user",
+                "content": claim.question,
+            }],
         )
         config: dict[str, object] = {"configurable": {"thread_id": claim.checkpoint_thread_id}}
         task = asyncio.create_task(graph.ainvoke(dict(state), config))  # type: ignore[union-attr]
@@ -700,7 +707,7 @@ def _public_answer_projection(
         evidence_parent_ids=parent_ids,
         route=route,
         runtime_config_snapshot_id=(runtime_config_snapshot_id if require_audited else None),
-        require_audited=require_audited,
+        require_audited=require_audited and route != "chat",
     )
     if projected is None:
         return None

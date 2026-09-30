@@ -11,6 +11,7 @@ from agentic_rag.domain.models import UserScope
 from agentic_rag.query.evidence_builder import EvidenceItem, EvidenceManifestEntry, PackedEvidence
 from agentic_rag.query.todos import TodoItem
 from agentic_rag.query.tools import ResearchContext
+from agentic_rag.retrieval.models import EvidenceBatch
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
@@ -38,6 +39,12 @@ def _packed(
         )},
         rendered_context=f"[{evidence_id}] {content}", token_count=len(content), index_generation=generation,
     )
+
+
+def _batch_for(evidence_id: str) -> EvidenceBatch:
+    """Minimal raw retrieval batch paired with one child pack."""
+    del evidence_id
+    return EvidenceBatch(query="question", parents=())
 
 
 def _todo(todo_id: str, *, dependencies: tuple[str, ...] = (), status: str = "pending") -> TodoItem:
@@ -186,6 +193,25 @@ async def test_child_state_isolated_and_keeps_server_owned_scope_and_manifest() 
     assert result.child_states[0].memory_summary == "read only"
     assert result.child_states[0].evidence_manifest == {"old": {"document_id": "d"}}
     assert observed[0] is result.child_states[0]
+
+
+async def test_dispatcher_preserves_raw_retrieval_batch_from_child_worker() -> None:
+    from agentic_rag.query.subagents import SubagentDispatcher
+    from agentic_rag.runtime.concurrency import ConcurrencyManager
+
+    class Worker:
+        async def __call__(self, state: object, tools: object) -> tuple[EvidenceBatch, PackedEvidence]:
+            del tools
+            return _batch_for(state.todo_id), _packed(f"e-{state.todo_id}")
+
+    dispatcher = SubagentDispatcher(
+        tools=object(), concurrency=ConcurrencyManager(), worker=Worker()
+    )
+
+    result = await dispatcher.delegate([_todo("one")], CONTEXT)
+
+    assert result.results[0].batch is not None
+    assert result.results[0].batch.query == "question"
 
 
 async def test_parent_cancellation_cleans_up_children() -> None:

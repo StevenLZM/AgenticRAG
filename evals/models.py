@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StringConstraints, field_validator, model_validator
 from typing_extensions import Annotated
 
 
@@ -55,14 +55,24 @@ class EvaluationCase(BaseModel):
         str,
         StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=8_000),
     ]
+    answerable: StrictBool = True
     reference_answer: Annotated[
         str,
-        StringConstraints(strict=True, strip_whitespace=True, min_length=1, max_length=20_000),
+        StringConstraints(strict=True, strip_whitespace=True, max_length=20_000),
     ]
-    reference_parent_ids: tuple[SafeIdentifier, ...] = Field(min_length=1, max_length=128)
+    reference_parent_ids: tuple[SafeIdentifier, ...] = Field(max_length=128)
     expected_route: Literal["fast_rag", "research"]
     tags: tuple[SafeIdentifier, ...] = Field(min_length=1, max_length=32)
     runtime_config_snapshot_id: SafeIdentifier
+
+    @model_validator(mode="after")
+    def _answerability_matches_gold(self) -> EvaluationCase:
+        if self.answerable:
+            if not self.reference_answer or not self.reference_parent_ids:
+                raise ValueError("answerable cases require a reference answer and parent IDs")
+        elif self.reference_parent_ids:
+            raise ValueError("unanswerable cases must not have gold parent IDs")
+        return self
 
     @field_validator("reference_parent_ids")
     @classmethod

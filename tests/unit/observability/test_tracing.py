@@ -115,6 +115,7 @@ def test_privacy_sanitizers_fail_closed_for_raw_prompt_and_tool_fields() -> None
             "hidden_reasoning": "private reasoning",
             "messages": [{"content": "private prompt"}],
             "provider_payload": {"response": "private"},
+            "provider_request_id": "sk-secret-provider-token",
             "input_tokens": 8,
         }
     )

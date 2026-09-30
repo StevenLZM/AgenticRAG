@@ -23,8 +23,8 @@ def build_summary(
     baseline_ids: Mapping[str, str] | None = None,
     recovery_drill_passed: bool = False,
     backup_restore_passed: bool = False,
-    evaluation_mode: str = "fixture",
-    client_provenance: str = "fixture",
+    evaluation_mode: str = "contract",
+    client_provenance: str = "contract_test",
 ) -> dict[str, object]:
     """Aggregate immutable case rows without exposing prompts or raw payloads.
 
@@ -33,14 +33,12 @@ def build_summary(
     default report comparable across reruns.
     """
 
-    if evaluation_mode not in {"fixture", "graph", "api"}:
-        raise ValueError("evaluation_mode must be fixture, graph or api")
+    if evaluation_mode not in {"contract", "api"}:
+        raise ValueError("evaluation_mode must be contract or api")
     if not isinstance(client_provenance, str) or not client_provenance.strip():
         raise ValueError("client_provenance must be non-empty")
-    if evaluation_mode == "fixture" and client_provenance != "fixture":
-        raise ValueError("fixture mode must use fixture provenance")
-    if evaluation_mode != "fixture" and client_provenance == "fixture":
-        raise ValueError("real evaluation modes require real client provenance")
+    if client_provenance == "fixture":
+        raise ValueError("fixture provenance is not supported")
     rows = sorted(list(results), key=lambda item: item.case_id)
     snapshots = sorted({item.runtime_config_snapshot_id for item in rows})
     allowed = _normalize_baselines(baseline_ids)
@@ -59,6 +57,7 @@ def build_summary(
         "runtime_config_snapshot_id": snapshots[0] if len(snapshots) == 1 else None,
         "runtime_config_snapshot_ids": snapshots,
         "metrics": metrics,
+        "metric_sample_counts": {name: sum(name in row.deterministic_metrics for row in rows) for name in metrics},
         "ragas": ragas,
         "user_leak_count": _sum_integer_metric(rows, "leakage"),
         "citation_coverage": _citation_coverage(rows),
@@ -67,7 +66,9 @@ def build_summary(
         "backup_restore_passed": backup_restore_passed,
         "evaluation_mode": evaluation_mode,
         "client_provenance": client_provenance,
-        "real_query_count": len(rows) if evaluation_mode in {"graph", "api"} else 0,
+        # Task 5 must derive this from collector-verified HTTP run evidence.
+        # A caller's mode/provenance string is not an attestation.
+        "real_query_count": 0,
         "ragas_status": ragas.get("status", "unavailable"),
     }
     if allowed:
@@ -169,9 +170,21 @@ def _ragas_summary(rows: Sequence[EvalCaseResult]) -> dict[str, object]:
                 continue
             totals[name] = totals.get(name, 0.0) + float(value)
             counts[name] = counts.get(name, 0) + 1
-    status = "unavailable" if not statuses or all(value == "unavailable" for value in statuses) else "available"
+    status_counts = {name: statuses.count(name) for name in ("available", "unavailable", "failed")}
+    if not statuses or status_counts["unavailable"] == len(statuses):
+        status = "unavailable"
+    elif status_counts["available"] == len(statuses):
+        status = "available"
+    elif status_counts["failed"] == len(statuses):
+        status = "failed"
+    else:
+        status = "partial"
     result: dict[str, object] = {
         "status": status,
+        "available_cases": status_counts["available"],
+        "unavailable_cases": status_counts["unavailable"],
+        "failed_cases": status_counts["failed"],
+        "metric_sample_counts": dict(sorted(counts.items())),
         "metrics": {
             name: _integer_if_whole(totals[name] / counts[name])
             for name in sorted(totals)

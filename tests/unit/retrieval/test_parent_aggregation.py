@@ -88,6 +88,85 @@ def test_parent_aggregation_honors_parent_limit() -> None:
     assert [parent.parent_id for parent in parents] == ["parent-a", "parent-b"]
 
 
+def test_parent_aggregation_uses_rerank_score_instead_of_raw_retrieval_score() -> None:
+    parents = aggregate_parents(
+        [
+            ChildHit(
+                child_id="a-child",
+                parent_id="parent-a",
+                user_id="user-1",
+                document_id="document-a",
+                document_version_id="version-a",
+                content="a",
+                ast_locator="locator-a",
+                lane="dense",
+                lane_rank=1,
+                score=0.99,
+                rrf_score=0.03,
+                rerank_score=0.10,
+            ),
+            ChildHit(
+                child_id="b-child",
+                parent_id="parent-b",
+                user_id="user-1",
+                document_id="document-b",
+                document_version_id="version-b",
+                content="b",
+                ast_locator="locator-b",
+                lane="dense",
+                lane_rank=2,
+                score=0.10,
+                rrf_score=0.02,
+                rerank_score=0.90,
+            ),
+        ]
+    )
+
+    assert [parent.parent_id for parent in parents] == ["parent-b", "parent-a"]
+    assert parents[0].retrieval_score == 0.10
+    assert parents[0].rrf_score == 0.02
+    assert parents[0].rerank_score == 0.90
+
+
+def test_parent_aggregation_falls_back_to_rrf_when_reranking_degrades() -> None:
+    parents = aggregate_parents(
+        [
+            ChildHit(
+                child_id="a-child",
+                parent_id="parent-a",
+                user_id="user-1",
+                document_id="document-a",
+                document_version_id="version-a",
+                content="a",
+                ast_locator="locator-a",
+                lane="dense",
+                lane_rank=1,
+                score=0.99,
+                rrf_score=0.01,
+                rerank_score=None,
+            ),
+            ChildHit(
+                child_id="b-child",
+                parent_id="parent-b",
+                user_id="user-1",
+                document_id="document-b",
+                document_version_id="version-b",
+                content="b",
+                ast_locator="locator-b",
+                lane="dense",
+                lane_rank=2,
+                score=0.10,
+                rrf_score=0.02,
+                rerank_score=None,
+            ),
+        ]
+    )
+
+    assert [parent.parent_id for parent in parents] == ["parent-b", "parent-a"]
+    assert parents[0].rerank_score is None
+    assert parents[0].rrf_score == 0.02
+
+
 class RecordingParents:
     def __init__(self, rows: list[ParentChunk]) -> None:
         self.rows = rows
@@ -100,7 +179,12 @@ class RecordingParents:
         return self.rows
 
 
-def parent(parent_id: str, *, user_id: str = "user-1") -> ParentChunk:
+def parent(
+    parent_id: str,
+    *,
+    user_id: str = "user-1",
+    heading_path: tuple[str, ...] = (),
+) -> ParentChunk:
     return ParentChunk(
         id=parent_id,
         user_id=user_id,
@@ -109,6 +193,7 @@ def parent(parent_id: str, *, user_id: str = "user-1") -> ParentChunk:
         ordinal=0,
         content=f"full content for {parent_id}",
         status="active",
+        heading_path=heading_path,
     )
 
 
@@ -134,6 +219,16 @@ async def test_parent_fetch_deduplicates_lookup_and_preserves_requested_order() 
         "full content for parent-a",
     ]
     assert all(item.child_hits == () for item in evidence)
+
+
+async def test_parent_fetch_carries_server_owned_heading_path_into_evidence() -> None:
+    fetcher = ParentFetcher(
+        RecordingParents([parent("parent-a", heading_path=("合同", "付款"))])
+    )
+
+    evidence = await fetcher.fetch(["parent-a"], UserScope(user_id="user-1"))
+
+    assert evidence[0].heading_path == ("合同", "付款")
 
 
 async def test_parent_hydrate_fills_content_without_losing_aggregation_provenance() -> None:

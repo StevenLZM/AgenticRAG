@@ -5,6 +5,7 @@ from pathlib import Path
 
 OPERATIONS = Path("docs/local-operations.md")
 PROGRESS = Path("docs/development-progress.md")
+ISSUES = Path("docs/issue-log.md")
 ROADMAP = Path(
     "docs/superpowers/plans/2026-08-04-agentic-rag-implementation-roadmap.md"
 )
@@ -38,6 +39,11 @@ def test_chinese_operations_docs_cover_query_runtime_and_console_contracts() -> 
         "当前 snapshot",
         "client provenance",
         "备份",
+        "ingestion-v2",
+        "index-v3",
+        "rebuild_preflight.py",
+        "source-span",
+        "dry-run",
     )
     required_commands_and_paths = (
         "python scripts/run_api.py",
@@ -68,6 +74,9 @@ def test_progress_and_roadmap_record_mainline_completion_and_release_work() -> N
         "Mem0",
         "恢复",
         "备份",
+        "ingestion-v2",
+        "index-v3",
+        "rebuild_preflight.py",
         "生产鉴权/RBAC",
         "reranker 分数标定",
     ):
@@ -116,3 +125,40 @@ def test_docs_keep_process_api_acceptance_and_checkpoint_boundaries_accurate() -
         assert "EvalRunner console gate" not in document
         assert "通用验证器" in document
         assert "不单独校验" in document
+
+
+def test_progress_and_issue_log_keep_a_reproducible_handoff_snapshot() -> None:
+    """Keep the next development session anchored to evidence and open gates."""
+    progress = PROGRESS.read_text(encoding="utf-8")
+    issues = ISSUES.read_text(encoding="utf-8")
+
+    assert "[问题与修改日志](./issue-log.md)" in progress
+    for term in (
+        "2026-08-28",
+        "679f4f2",
+        "工作树存在未提交改动",
+        "642 passed",
+        "SubagentDispatcher",
+        "research_attempt_count",
+        "Evaluation PASS",
+        "生产鉴权/RBAC",
+        "reranker 分数标定",
+    ):
+        assert term in progress
+
+    for term in (
+        "01a045b2-2bc0-73a9-abbc-c8dd9edd06af",
+        "provider_outage",
+        "agent_events",
+        "Query Outbox",
+        "Query Worker",
+        "Elasticsearch 活动 Alias",
+        "MySQL UTC",
+        "SubagentDispatcher",
+        "Todo 初始创建",
+        "research_attempt_count",
+        "LLM 诊断字段",
+        "生产鉴权/RBAC",
+        "reranker 分数标定",
+    ):
+        assert term in issues

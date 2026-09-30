@@ -9,6 +9,7 @@ explicitly enabled but malformed or failed gate is a test failure.
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -98,7 +99,11 @@ def test_real_query_release_gate() -> None:
     assert summary.get("evaluation_mode") in {"graph", "api"}
     assert type(summary.get("real_query_count")) is int
     assert summary["real_query_count"] > 0
-    assert verify_acceptance(summary) == 0
+    from evals.verification import verify_saved_evaluation
+    run_dir = os.environ.get("AGENTIC_RAG_EVAL_RUN_DIR", "").strip()
+    assert run_dir, "release gate requires AGENTIC_RAG_EVAL_RUN_DIR for live verification"
+    verified = asyncio.run(verify_saved_evaluation(Path(run_dir)))
+    assert verify_acceptance(summary, verified_summary=verified) == 0
 
     records = _load_records(telemetry_path)
     degradation_records = [

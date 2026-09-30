@@ -147,6 +147,22 @@ def state() -> dict[str, object]:
     return {"request": REQUEST, "scope": SCOPE, "snapshot": SNAPSHOT}
 
 
+async def test_batch_keeps_separate_observed_rankings(deps: RetrievalDependencies) -> None:
+    class ReverseReranker:
+        async def rerank(self, query, candidates, *, limit):
+            return RerankResult(hits=list(reversed(candidates))[:limit], degraded=False, model_version="contract")
+
+    batch = await RetrievalService(replace(deps, reranker=ReverseReranker())).retrieve(REQUEST, SCOPE, SNAPSHOT)
+    trace = batch.model_dump(mode="json").get("observation")
+    assert trace is not None
+    assert trace["user_id"] == "user-1"
+    assert trace["snapshot_id"] == SNAPSHOT.snapshot_id
+    assert trace["stages"]["dense"][0]["child_id"] == "dense"
+    assert trace["stages"]["bm25"][0]["child_id"] == "bm25"
+    assert trace["stages"]["rerank"] == list(reversed(trace["stages"]["rrf"]))
+    assert trace["hydrated_parent_ids"] == [p.parent_id for p in batch.parents]
+
+
 async def test_service_runs_fixed_pipeline_and_retains_parent_provenance(
     deps: RetrievalDependencies,
 ) -> None:

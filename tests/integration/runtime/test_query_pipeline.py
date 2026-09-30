@@ -115,8 +115,8 @@ class _ScriptedGateway:
     def __init__(self) -> None:
         self._actions = iter(
             (
-                {"action": "create_todos", "titles": ["Find notice period"]},
-                {"action": "delegate_research", "todo_ids": ["todo-2"]},
+                {"action": "create_todos", "items": [{"key": "notice", "title": "Find notice period"}]},
+                {"action": "delegate_research", "todo_ids": ["todo-1"]},
                 {"action": "submit_evidence"},
             )
         )

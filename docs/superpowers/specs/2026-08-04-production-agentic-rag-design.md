@@ -340,7 +340,7 @@ pending | in_progress | completed | blocked | skipped
 规则：
 
 - Agent 可以在循环内首次创建计划，也可以根据证据动态修改计划。
-- Todo 可以新增、拆分、合并、重排、跳过或标记阻塞。
+- Todo 可追加、重试或跳过；当前简单 DAG 不支持直接改写已有边或合并任务，详细契约见 [AgentLoop Todo DAG](./2026-09-08-research-agentloop-todo-dag-design.md)。
 - `completed` 必须包含 Evidence ID 或明确的非检索结果引用。
 - 依赖项完成前不能进入 `in_progress`。
 - Todo Reducer 拒绝依赖环和非法状态转换。
@@ -351,14 +351,14 @@ pending | in_progress | completed | blocked | skipped
 
 ### 6.2 并行 Research Subagent
 
-- Supervisor 仅在多个 Todo 相互独立时使用 LangGraph `Send` 并行启动 Subagent。
-- Subagent 使用同一个受限 Research Loop，但只接收自己的问题、Filter、记忆摘要和 Evidence Manifest。
-- Subagent 可以调用 `retrieve_evidence` 与 `calculator`，不能生成最终用户答案。
+- Supervisor 仅在多个 Todo 均 ready 时，通过 `SubagentDispatcher` 的 asyncio 任务并行启动检索 worker。
+- 当前 Subagent 是受限检索 worker，接收解析后的查询、Filter、记忆摘要、当前 Evidence Manifest 和依赖结果，不再调用一个独立 LLM Loop。
+- Calculator 由 Supervisor 按 Todo 调用；Subagent 不能生成最终用户答案。
 - Subagent 返回结构化 Evidence 和 Todo 结果，由 Evidence Reducer 去重合并。
 - Subagent 使用 per-invocation 状态命名空间，不共享可变 Graph State；Reducer 按稳定 Evidence ID 确定性合并。
 - 单次 Run 默认最多并行 3 个 Subagent。Join 超时后保留已完成结果，将未完成 Todo 标记为 `blocked`，由 Supervisor 决定继续、改写或结束。
 - Supervisor 结束、Run 取消或总超时后，所有未完成 Subagent 必须收到取消信号，不能脱离父 Run 继续执行。
-- 单个 Run 内部的 Supervisor 与 Subagent 直接通过 LangGraph 调度，不经过 Redis；Redis Query Stream 只负责把整个 Run 分配给 Query Worker。
+- 单个 Run 内部的 Supervisor 通过 asyncio 委派 Subagent，不经过 Redis；LangGraph 在每个 Supervisor 动作之间保存 checkpoint，Redis Query Stream 只负责把整个 Run 分配给 Query Worker。
 
 ### 6.3 Context Compact
 
@@ -977,7 +977,7 @@ MySQL 使用唯一键或 Upsert，ES 使用确定性 ID。Checkpoint 落盘前�
 ### 14.1 默认安全上限
 
 ```text
-max_research_rounds = 4
+max_research_rounds = 6
 max_answer_revisions = 1
 node_retry_attempts = 2
 graph_recursion_limit = 50

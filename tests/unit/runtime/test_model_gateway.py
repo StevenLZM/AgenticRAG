@@ -128,6 +128,15 @@ class APIConnectionError(Exception):
     """A transport-shaped SDK error that does not inherit ConnectionError."""
 
 
+class ProviderUnavailableError(Exception):
+    """A status-shaped provider error used to verify safe diagnostics."""
+
+    def __init__(self, message: str, *, status_code: int, request_id: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.request_id = request_id
+
+
 async def test_structured_call_repairs_invalid_schema_without_returning_partial() -> None:
     client = FakeClient(
         [
@@ -185,6 +194,71 @@ async def test_sdk_connection_error_is_retried_without_retrying_value_errors() -
     assert result.attempts == 2
 
 
+async def test_transient_retry_emits_safe_provider_diagnostics() -> None:
+    from agentic_rag.observability.logging import event_emission_scope
+
+    error = ProviderUnavailableError(
+        "temporary provider response", status_code=503, request_id="req_123"
+    )
+    client = FakeClient([error, "hello"])
+    client.timeout = 30.0
+    emitter = DiagnosticEmitter(SNAPSHOT.snapshot_id)
+
+    async with event_emission_scope(
+        emitter, "run-1", "graph.node.fast_rag.llm", user_id="user-1"
+    ):
+        result = await ModelGateway(
+            client,
+            sleep=lambda _: _no_sleep(),
+        ).complete(ROUTE_CALL)
+
+    assert result.value == "hello"
+    retry = next(item for item in emitter.calls if item["event_type"] == "MODEL_RETRY")
+    assert retry["attributes"] == {
+        "attempt": 1,
+        "component": "llm",
+        "reason": "provider_outage",
+        "retryable": True,
+        "outcome": "degraded",
+        "error_class": "ProviderUnavailableError",
+        "http_status": 503,
+        "provider_request_id": "req_123",
+        "requested_model": "light-model",
+        "protocol": "auto",
+        "client_timeout_seconds": 30.0,
+        "operation": "graph.node.fast_rag.llm",
+    }
+
+
+async def test_retry_exhaustion_preserves_provider_diagnostics() -> None:
+    from agentic_rag.observability.logging import event_emission_scope
+
+    error = ProviderUnavailableError(
+        "provider unavailable", status_code=429, request_id="req_429"
+    )
+    emitter = DiagnosticEmitter(SNAPSHOT.snapshot_id)
+
+    with pytest.raises(ProviderUnavailableError):
+        async with event_emission_scope(
+            emitter, "run-1", "graph.node.research_agent_loop.llm", user_id="user-1"
+        ):
+            await ModelGateway(
+                FakeClient([error]),
+                max_retries=0,
+                client_timeout_seconds=30.0,
+                sleep=lambda _: _no_sleep(),
+            ).complete(ROUTE_CALL.model_copy(update={"model_role": "main"}))
+
+    exhausted = next(
+        item for item in emitter.calls if item["event_type"] == "MODEL_RETRY_EXHAUSTED"
+    )
+    assert exhausted["attributes"]["error_class"] == "ProviderUnavailableError"
+    assert exhausted["attributes"]["http_status"] == 429
+    assert exhausted["attributes"]["provider_request_id"] == "req_429"
+    assert exhausted["attributes"]["requested_model"] == "main-model"
+    assert exhausted["attributes"]["operation"] == "graph.node.research_agent_loop.llm"
+
+
 async def test_non_transient_failure_is_not_retried() -> None:
     client = FakeClient([ValueError("bad request")])
 
@@ -219,6 +293,28 @@ async def test_gateway_explicit_protocol_selects_requested_api(protocol: str) ->
     assert len(client.responses.calls) == (1 if protocol == "responses" else 0)
 
 
+@pytest.mark.parametrize(
+    ("protocol", "parameter"),
+    [("chat", "max_tokens"), ("responses", "max_output_tokens")],
+)
+async def test_gateway_forwards_output_token_cap_to_selected_protocol(
+    protocol: str, parameter: str
+) -> None:
+    client = DualProtocolClient(["chat response"], ["responses response"])
+    call = ROUTE_CALL.model_copy(
+        update={"protocol": protocol, "max_output_tokens": 321}
+    )
+
+    await ModelGateway(client, sleep=lambda _: _no_sleep()).complete(call)
+
+    calls = (
+        client.chat.completions.calls
+        if protocol == "chat"
+        else client.responses.calls
+    )
+    assert calls[0][parameter] == 321
+
+
 async def test_gateway_auto_prefers_chat_when_both_protocols_are_available() -> None:
     client = DualProtocolClient(["chat response"], ["responses response"])
 
@@ -241,6 +337,22 @@ async def test_structured_chat_call_requests_json_object() -> None:
     )
 
     assert client.chat.completions.calls[0]["response_format"] == {"type": "json_object"}
+
+
+async def test_structured_call_includes_exact_pydantic_schema_contract() -> None:
+    client = FakeClient(
+        ['{"route":"fast_rag","normalized_query":"q","reason_code":"simple"}']
+    )
+
+    await ModelGateway(client, sleep=lambda _: _no_sleep()).complete_structured(
+        ROUTE_CALL, RouteDecision
+    )
+
+    contract = str(client.responses.calls[0]["input"])
+    schema = RouteDecision.model_json_schema()
+    assert "normalized_query" in contract
+    assert schema["title"] in contract
+    assert '"type": "object"' in contract
 
 
 async def test_structured_chat_adds_json_instruction_for_provider_json_mode() -> None:
@@ -292,6 +404,59 @@ async def test_schema_exhaustion_diagnostic_contains_only_safe_metadata() -> Non
     assert diagnostic["attributes"]["output_length"] == len(raw_output)
     assert diagnostic["attributes"]["output_sha256"]
     assert raw_output not in json.dumps(diagnostic, ensure_ascii=False)
+
+
+async def test_structured_repair_allows_only_one_provider_attempt() -> None:
+    client = FakeClient(
+        [
+            '{"route":"unknown"}',
+            asyncio.TimeoutError(),
+            '{"route":"fast_rag","normalized_query":"q","reason_code":"simple"}',
+        ]
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await ModelGateway(
+            client, max_retries=2, sleep=lambda _: _no_sleep()
+        ).complete_structured(ROUTE_CALL, RouteDecision)
+
+    assert len(client.responses.calls) == 2
+
+
+async def test_structured_repair_is_skipped_when_total_budget_is_exhausted() -> None:
+    from agentic_rag.observability.logging import event_emission_scope
+
+    class Clock:
+        value = 0.0
+
+        def __call__(self) -> float:
+            return self.value
+
+    clock = Clock()
+
+    class ExpiringResponses(FakeResponsesApi):
+        async def create(self, **kwargs: object) -> _Response:
+            response = await super().create(**kwargs)
+            clock.value = 2.0
+            return response
+
+    client = FakeClient(["not valid"])
+    client.responses = ExpiringResponses(["not valid"])
+    emitter = DiagnosticEmitter(SNAPSHOT.snapshot_id)
+    call = ROUTE_CALL.model_copy(update={"timeout_seconds": 1.0})
+
+    with pytest.raises(TimeoutError):
+        async with event_emission_scope(emitter, "run-1", "answer", user_id="user-1"):
+            await ModelGateway(
+                client, max_retries=0, clock=clock, sleep=lambda _: _no_sleep()
+            ).complete_structured(call, RouteDecision)
+
+    assert len(client.responses.calls) == 1
+    assert any(item["event_type"] == "MODEL_REPAIR_SKIPPED" for item in emitter.calls)
+    assert any(item["event_type"] == "MODEL_TOTAL_DEADLINE_EXHAUSTED" for item in emitter.calls)
+    skipped = next(item for item in emitter.calls if item["event_type"] == "MODEL_REPAIR_SKIPPED")
+    assert skipped["attributes"]["phase"] == "repair"
+    assert skipped["attributes"]["skip_reason"] == "insufficient_budget"
 
 
 @pytest.mark.parametrize(

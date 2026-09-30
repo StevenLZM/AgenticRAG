@@ -119,3 +119,50 @@ async def test_metrics_deduplicate_replayed_degradation_event(tmp_path: Path) ->
 
     assert projection.metrics["degraded_component_count"] == 1
 
+
+@pytest.mark.asyncio
+async def test_llm_degradation_event_key_and_attributes_include_operation() -> None:
+    repository = RecordingEventRepository()
+    emitter = AgentEventEmitter(repository, None, runtime_config_snapshot_id="snapshot-1")
+
+    async with event_emission_scope(
+        emitter, "run-1", "graph.node.route.llm", user_id="user-1"
+    ):
+        await emit_degradation(
+            component="llm",
+            reason="provider_outage",
+            run_id="run-1",
+            snapshot_id="snapshot-1",
+            attempt=1,
+            retryable=True,
+            outcome="degraded",
+            attributes={"requested_model": "light-model"},
+        )
+        await emit_degradation(
+            component="llm",
+            reason="provider_outage",
+            run_id="run-1",
+            snapshot_id="snapshot-1",
+            attempt=1,
+            retryable=True,
+            outcome="degraded",
+            attributes={"requested_model": "light-model"},
+        )
+    async with event_emission_scope(
+        emitter, "run-1", "graph.node.research_agent_loop.llm", user_id="user-1"
+    ):
+        await emit_degradation(
+            component="llm",
+            reason="provider_outage",
+            run_id="run-1",
+            snapshot_id="snapshot-1",
+            attempt=1,
+            retryable=True,
+            outcome="degraded",
+            attributes={"requested_model": "main-model"},
+        )
+
+    assert len(repository.events) == 3
+    assert repository.events[0].event_key != repository.events[1].event_key
+    assert repository.events[0].event_key != repository.events[2].event_key
+    assert repository.events[0].payload_ref is None

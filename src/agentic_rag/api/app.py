@@ -30,7 +30,9 @@ class ConsoleStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope: Any):
         if path not in self._allowed_assets:
             raise HTTPException(status_code=404)
-        return await super().get_response(path, scope)
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def create_app(settings: Settings, *, container: Any | None = None) -> FastAPI:

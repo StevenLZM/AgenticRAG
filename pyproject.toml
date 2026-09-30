@@ -32,7 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["httpx", "mypy", "pytest", "pytest-asyncio", "ruff"]
-eval = ["datasets", "ragas"]
+eval = ["ragas==0.4.2", "langchain-community==0.4.1"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -50,4 +50,4 @@ include = ["agentic_rag*", "evals*", "scripts*"]
 
 [tool.setuptools.package-data]
 agentic_rag = ["api/static/*"]
-evals = ["datasets/*.jsonl"]
+evals = ["datasets/*.jsonl", "datasets/real_corpus/*.json", "datasets/real_corpus/assets/*"]

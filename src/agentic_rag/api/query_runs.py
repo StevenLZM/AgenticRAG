@@ -18,7 +18,7 @@ from agentic_rag.observability.logging import sanitize_attributes, sanitize_summ
 from agentic_rag.persistence.repositories import ActiveRunConflict, AgentEvent, QueryRun
 from agentic_rag.query.public_answer import PublicAnswer, project_public_answer
 from agentic_rag.runtime.ids import new_id
-from agentic_rag.runtime.models import RuntimeConfigSnapshot
+from agentic_rag.runtime.models import EvaluationMetadata, RuntimeConfigSnapshot
 
 
 QueryText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32_000)]
@@ -33,6 +33,7 @@ class QueryRequest(BaseModel):
     query: QueryText
     thread_id: ThreadText | None = None
     wait_seconds: int = Field(default=30, ge=0, le=30)
+    evaluation: EvaluationMetadata | None = None
 
     @model_validator(mode="after")
     def _normalize(self) -> "QueryRequest":
@@ -84,6 +85,9 @@ class QueryRunsResponse(BaseModel):
 query_runs_router = APIRouter(prefix="/v1", tags=["query"])
 TERMINAL_STATUSES = {RunStatus.CANCELLED, RunStatus.COMPLETED, RunStatus.FAILED}
 _PUBLIC_EVENT_TYPES = {
+    "RUN_STARTED",
+    "RUN_COMPLETED",
+    "RUN_FAILED",
     "MEMORY_LOADED",
     "QUERY_ROUTED",
     "FAST_RAG_COMPLETED",
@@ -130,7 +134,20 @@ _PUBLIC_DEGRADATION_EVENT_TYPES = {
     "AUDIT_REFUSED",
 }
 _PUBLIC_DEGRADATION_ATTRIBUTE_FIELDS = frozenset(
-    {"attempt", "component", "reason", "outcome", "retryable"}
+    {
+        "attempt",
+        "component",
+        "reason",
+        "outcome",
+        "retryable",
+        "operation",
+        "requested_model",
+        "protocol",
+        "client_timeout_seconds",
+        "error_class",
+        "http_status",
+        "provider_request_id",
+    }
 )
 
 
@@ -193,7 +210,7 @@ def _snapshot(request: Request) -> RuntimeConfigSnapshot:
             retrieval_config_version="retrieval-v1",
             index_generation=str(getattr(settings, "index_generation", "index-v1")),
             memory_config_version="memory-v1",
-            max_research_rounds=int(getattr(settings, "max_research_rounds", 4)),
+            max_research_rounds=int(getattr(settings, "max_research_rounds", 6)),
             max_answer_revisions=int(getattr(settings, "max_answer_revisions", 1)),
             query_run_timeout_seconds=int(getattr(settings, "query_run_timeout_seconds", 300)),
             max_evidence_tokens=int(getattr(settings, "max_evidence_tokens", 12_000)),
@@ -224,9 +241,20 @@ def _active_conflict_location(error: ActiveRunConflict) -> str | None:
 
 async def _create_run(request: Request, payload: QueryRequest) -> QueryRun:
     manager = _dependency(request, "run_manager")
+    snapshot = _snapshot(request)
+    if payload.evaluation is not None:
+        settings = request.app.state.container.settings
+        if not getattr(settings, "allow_evaluation_requests", False):
+            raise ApiException(status_code=403, error_code="EVALUATION_DISABLED",
+                               message="Evaluation requests are disabled.", retryable=False)
+        # An experiment cannot join an ordinary conversation, nor select a user.
+        if payload.thread_id is None or not payload.thread_id.startswith("eval-v2-"):
+            raise ApiException(status_code=422, error_code="EVALUATION_SESSION_REQUIRED",
+                               message="An isolated evaluation thread is required.", retryable=False)
+        snapshot = snapshot.model_copy(update={"evaluation": payload.evaluation})
     try:
         return await manager.create(
-            _scope(request), _thread_id(payload), payload.query, _snapshot(request)
+            _scope(request), _thread_id(payload), payload.query, snapshot
         )
     except ActiveRunConflict:
         # RunManager resolves a race-safe server-owned existing ID where the
@@ -336,6 +364,8 @@ def _sse_event(event: AgentEvent, *, artifacts: object | None = None) -> str:
         "created_at": (event.created_at or datetime.now(UTC)).isoformat(),
     }
     attributes = _safe_degradation_attributes(event, artifacts)
+    if event_type == "QUERY_ROUTED" and event.summary in {"chat", "fast_rag", "research"}:
+        payload["route"] = event.summary
     if attributes:
         payload["attributes"] = attributes
     return f"id: {event.id}\nevent: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"

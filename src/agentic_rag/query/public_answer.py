@@ -25,7 +25,7 @@ PublicTerminalStatus = Literal[
     "audit_failed",
     "research_round_limit",
 ]
-PublicRoute = Literal["fast_rag", "research"]
+PublicRoute = Literal["chat", "fast_rag", "research"]
 PublicClientProvenance = Literal["api", "fixture", "real_query_api", "real_query_graph"]
 
 
@@ -58,7 +58,12 @@ class PublicAnswer(BaseModel):
 
     @model_validator(mode="after")
     def _audited_segments_only(self) -> "PublicAnswer":
-        if self.segments and self.audited is not True:
+        if self.route == "chat":
+            if self.audited is not None or self.evidence_parent_ids or self.citation_coverage is not None:
+                raise ValueError("chat must not claim document audits or citations")
+            if any(s.evidence_ids or s.kind != "content" for s in self.segments):
+                raise ValueError("chat permits only uncited content")
+        elif self.segments and self.audited is not True:
             raise ValueError("public answer segments must be audited")
         if self.status is None and not self.segments:
             raise ValueError("public answer must contain audited segments or a safe status")

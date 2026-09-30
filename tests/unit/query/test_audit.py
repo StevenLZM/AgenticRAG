@@ -33,7 +33,9 @@ SNAPSHOT = RuntimeConfigSnapshot(
 )
 
 
-def packed_evidence(*, index_generation: str = "index-current") -> PackedEvidence:
+def packed_evidence(
+    *, index_generation: str = "index-current", heading_path: tuple[str, ...] = ()
+) -> PackedEvidence:
     item = EvidenceItem(
         evidence_id="evidence-1",
         parent_id="parent-1",
@@ -42,6 +44,7 @@ def packed_evidence(*, index_generation: str = "index-current") -> PackedEvidenc
         ast_locator="#/paragraphs/1",
         content="The contract term is three years.",
         covered_target_ids=(),
+        heading_path=heading_path,
     )
     entry = EvidenceManifestEntry(
         evidence_id=item.evidence_id,
@@ -49,6 +52,7 @@ def packed_evidence(*, index_generation: str = "index-current") -> PackedEvidenc
         document_id=item.document_id,
         document_version_id=item.document_version_id,
         ast_locator=item.ast_locator,
+        heading_path=heading_path,
     )
     return PackedEvidence(
         items=(item,),
@@ -59,7 +63,13 @@ def packed_evidence(*, index_generation: str = "index-current") -> PackedEvidenc
     )
 
 
-def authorization(*, user_id: str = "user-1", index_generation: str = "index-current") -> dict[str, object]:
+def authorization(
+    *,
+    user_id: str = "user-1",
+    index_generation: str = "index-current",
+    ast_locator: str = "#/paragraphs/1",
+    heading_path: tuple[str, ...] = (),
+) -> dict[str, object]:
     return {
         "evidence-1": {
             "user_id": user_id,
@@ -68,9 +78,39 @@ def authorization(*, user_id: str = "user-1", index_generation: str = "index-cur
             "parent_id": "parent-1",
             "document_id": "document-1",
             "document_version_id": "version-1",
-            "ast_locator": "#/paragraphs/1",
+            "ast_locator": ast_locator,
+            "heading_path": heading_path,
         }
     }
+
+
+def _structured_locator(
+    *,
+    segment_ordinal: int,
+    char_from: int,
+    char_to: int,
+    parent_char_from: int,
+    parent_char_to: int,
+) -> str:
+    return json.dumps(
+        {
+            "spans": [
+                {
+                    "block_id": "block-1",
+                    "canonical_path": "#/text_blocks/1",
+                    "char_from": char_from,
+                    "char_to": char_to,
+                    "parent_char_from": parent_char_from,
+                    "parent_char_to": parent_char_to,
+                }
+            ],
+            "segment_ordinal": segment_ordinal,
+            "parent_char_from": parent_char_from,
+            "parent_char_to": parent_char_to,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def test_answer_segment_is_immutable_bounded_and_forbids_unknown_fields() -> None:
@@ -102,7 +142,9 @@ def test_citation_validator_requires_evidence_for_every_content_segment() -> Non
     assert "missing_evidence" in result.reasons
 
 
-def test_citation_validator_rejects_invented_and_cross_scope_or_stale_evidence() -> None:
+def test_citation_validator_rejects_invented_and_cross_scope_or_stale_evidence() -> (
+    None
+):
     from agentic_rag.query.audit import CitationValidator
     from agentic_rag.query.generation import AnswerDraft, AnswerSegment
 
@@ -110,7 +152,9 @@ def test_citation_validator_rejects_invented_and_cross_scope_or_stale_evidence()
     draft = AnswerDraft(
         segments=(
             AnswerSegment(
-                kind="content", text="The term is three years.", evidence_ids=("evidence-1",)
+                kind="content",
+                text="The term is three years.",
+                evidence_ids=("evidence-1",),
             ),
         )
     )
@@ -121,11 +165,37 @@ def test_citation_validator_rejects_invented_and_cross_scope_or_stale_evidence()
         draft, packed_evidence(), SCOPE, SNAPSHOT, authorization(index_generation="old")
     ).passed
     invented = draft.model_copy(
-        update={"segments": (draft.segments[0].model_copy(update={"evidence_ids": ("invented",)}),)}
+        update={
+            "segments": (
+                draft.segments[0].model_copy(update={"evidence_ids": ("invented",)}),
+            )
+        }
     )
     assert not validator.validate(
         invented, packed_evidence(), SCOPE, SNAPSHOT, authorization()
     ).passed
+
+
+def test_citation_validator_requires_heading_path_to_match_repository_authorization() -> None:
+    from agentic_rag.query.audit import CitationValidator
+    from agentic_rag.query.generation import AnswerDraft, AnswerSegment
+
+    result = CitationValidator().validate(
+        AnswerDraft(
+            segments=(
+                AnswerSegment(
+                    kind="content", text="期限为三年", evidence_ids=("evidence-1",)
+                ),
+            )
+        ),
+        packed_evidence(heading_path=("合同", "期限")),
+        SCOPE,
+        SNAPSHOT,
+        authorization(heading_path=("合同", "其他")),
+    )
+
+    assert result.passed is False
+    assert "evidence_not_authorized" in result.reasons
 
 
 def test_citation_validator_rejects_conflicting_manifest_metadata() -> None:
@@ -146,7 +216,13 @@ def test_citation_validator_rejects_conflicting_manifest_metadata() -> None:
         }
     )
     result = CitationValidator().validate(
-        AnswerDraft(segments=(AnswerSegment(kind="content", text="term", evidence_ids=("evidence-1",)),)),
+        AnswerDraft(
+            segments=(
+                AnswerSegment(
+                    kind="content", text="term", evidence_ids=("evidence-1",)
+                ),
+            )
+        ),
         evidence,
         SCOPE,
         SNAPSHOT,
@@ -156,12 +232,128 @@ def test_citation_validator_rejects_conflicting_manifest_metadata() -> None:
     assert "manifest_mismatch" in result.reasons
 
 
+def test_citation_validator_accepts_child_locator_within_authorized_parent() -> None:
+    from agentic_rag.query.audit import CitationValidator
+    from agentic_rag.query.generation import AnswerDraft, AnswerSegment
+
+    parent_locator = _structured_locator(
+        segment_ordinal=1,
+        char_from=0,
+        char_to=30,
+        parent_char_from=0,
+        parent_char_to=30,
+    )
+    child_locator = _structured_locator(
+        segment_ordinal=0,
+        char_from=5,
+        char_to=15,
+        parent_char_from=5,
+        parent_char_to=15,
+    )
+    evidence = packed_evidence().model_copy(
+        update={
+            "items": (
+                packed_evidence()
+                .items[0]
+                .model_copy(update={"ast_locator": child_locator}),
+            ),
+            "manifest": {
+                "evidence-1": EvidenceManifestEntry(
+                    evidence_id="evidence-1",
+                    parent_id="parent-1",
+                    document_id="document-1",
+                    document_version_id="version-1",
+                    ast_locator=child_locator,
+                )
+            },
+        }
+    )
+    result = CitationValidator().validate(
+        AnswerDraft(
+            segments=(
+                AnswerSegment(
+                    kind="content",
+                    text="The term is three years.",
+                    evidence_ids=("evidence-1",),
+                ),
+            )
+        ),
+        evidence,
+        SCOPE,
+        SNAPSHOT,
+        authorization(ast_locator=parent_locator),
+    )
+
+    assert result.passed is True
+
+
+def test_citation_validator_rejects_child_locator_outside_authorized_parent() -> None:
+    from agentic_rag.query.audit import CitationValidator
+    from agentic_rag.query.generation import AnswerDraft, AnswerSegment
+
+    parent_locator = _structured_locator(
+        segment_ordinal=1,
+        char_from=0,
+        char_to=30,
+        parent_char_from=0,
+        parent_char_to=30,
+    )
+    child_locator = _structured_locator(
+        segment_ordinal=0,
+        char_from=25,
+        char_to=40,
+        parent_char_from=25,
+        parent_char_to=40,
+    )
+    evidence = packed_evidence().model_copy(
+        update={
+            "items": (
+                packed_evidence()
+                .items[0]
+                .model_copy(update={"ast_locator": child_locator}),
+            ),
+            "manifest": {
+                "evidence-1": EvidenceManifestEntry(
+                    evidence_id="evidence-1",
+                    parent_id="parent-1",
+                    document_id="document-1",
+                    document_version_id="version-1",
+                    ast_locator=child_locator,
+                )
+            },
+        }
+    )
+    result = CitationValidator().validate(
+        AnswerDraft(
+            segments=(
+                AnswerSegment(
+                    kind="content",
+                    text="The term is three years.",
+                    evidence_ids=("evidence-1",),
+                ),
+            )
+        ),
+        evidence,
+        SCOPE,
+        SNAPSHOT,
+        authorization(ast_locator=parent_locator),
+    )
+
+    assert result.passed is False
+    assert result.reasons == ("evidence_not_authorized",)
+
+
 class FakeAuthorizationResolver:
     def __init__(self, record: Mapping[str, object]) -> None:
         self.record = record
         self.calls = 0
 
-    async def resolve(self, manifest: Mapping[str, object], scope: UserScope, snapshot: RuntimeConfigSnapshot) -> Mapping[str, object]:
+    async def resolve(
+        self,
+        manifest: Mapping[str, object],
+        scope: UserScope,
+        snapshot: RuntimeConfigSnapshot,
+    ) -> Mapping[str, object]:
         self.calls += 1
         return {"evidence-1": self.record}
 
@@ -177,14 +369,30 @@ class MalformedAuthorizationResolver:
 
 
 @pytest.mark.asyncio
-async def test_malformed_authorization_resolver_fails_closed_before_answer_publication() -> None:
-    from agentic_rag.query.audit import FaithfulnessAuditor, CitationValidator, generate_with_mandatory_audits
+async def test_malformed_authorization_resolver_fails_closed_before_answer_publication() -> (
+    None
+):
+    from agentic_rag.query.audit import (
+        FaithfulnessAuditor,
+        CitationValidator,
+        generate_with_mandatory_audits,
+    )
     from agentic_rag.query.generation import AnswerGenerator
 
-    gateway = FakeGateway([
-        {"segments": [{"kind": "content", "text": "The term is three years.", "evidence_ids": ["evidence-1"]}]},
-        {"passed": True, "unsupported_claim_ids": [], "reasons": []},
-    ])
+    gateway = FakeGateway(
+        [
+            {
+                "segments": [
+                    {
+                        "kind": "content",
+                        "text": "The term is three years.",
+                        "evidence_ids": ["evidence-1"],
+                    }
+                ]
+            },
+            {"passed": True, "unsupported_claim_ids": [], "reasons": []},
+        ]
+    )
     result = await generate_with_mandatory_audits(
         question="What is the term?",
         state={"revision_count": 0, "audit_results": [], "errors": []},
@@ -214,14 +422,28 @@ async def test_malformed_authorization_resolver_fails_closed_before_answer_publi
 async def test_generation_requires_repository_recheck_even_when_mapping_claims_current(
     record: Mapping[str, object],
 ) -> None:
-    from agentic_rag.query.audit import FaithfulnessAuditor, CitationValidator, generate_with_mandatory_audits
+    from agentic_rag.query.audit import (
+        FaithfulnessAuditor,
+        CitationValidator,
+        generate_with_mandatory_audits,
+    )
     from agentic_rag.query.generation import AnswerGenerator
 
     resolver = FakeAuthorizationResolver(record)
-    gateway = FakeGateway([
-        {"segments": [{"kind": "content", "text": "The term is three years.", "evidence_ids": ["evidence-1"]}]},
-        {"passed": True, "unsupported_claim_ids": [], "reasons": []},
-    ])
+    gateway = FakeGateway(
+        [
+            {
+                "segments": [
+                    {
+                        "kind": "content",
+                        "text": "The term is three years.",
+                        "evidence_ids": ["evidence-1"],
+                    }
+                ]
+            },
+            {"passed": True, "unsupported_claim_ids": [], "reasons": []},
+        ]
+    )
     no_revision = SNAPSHOT.model_copy(update={"max_answer_revisions": 0})
     result = await generate_with_mandatory_audits(
         question="What is the term?",
@@ -258,13 +480,25 @@ async def test_mandatory_audit_runs_faithfulness_before_citation() -> None:
             return FaithfulnessAudit(passed=True)
 
     class TrackingCitation:
-        async def validate_async(self, *args: object, **kwargs: object) -> CitationValidation:
+        async def validate_async(
+            self, *args: object, **kwargs: object
+        ) -> CitationValidation:
             calls.append("citation")
             return CitationValidation(passed=True)
 
-    gateway = FakeGateway([
-        {"segments": [{"kind": "content", "text": "The term is three years.", "evidence_ids": ["evidence-1"]}]},
-    ])
+    gateway = FakeGateway(
+        [
+            {
+                "segments": [
+                    {
+                        "kind": "content",
+                        "text": "The term is three years.",
+                        "evidence_ids": ["evidence-1"],
+                    }
+                ]
+            },
+        ]
+    )
     result = await generate_with_mandatory_audits(
         question="What is the term?",
         state={"revision_count": 0, "audit_results": [], "errors": []},
@@ -310,7 +544,9 @@ async def test_evidence_grader_fails_closed_without_evidence() -> None:
 
     gateway = FakeGateway([{"decision": "sufficient", "gaps": []}])
     empty = packed_evidence().model_copy(update={"items": (), "manifest": {}})
-    grade = await EvidenceGrader(gateway).grade("What is the term?", empty, scope=SCOPE, snapshot=SNAPSHOT)
+    grade = await EvidenceGrader(gateway).grade(
+        "What is the term?", empty, scope=SCOPE, snapshot=SNAPSHOT
+    )
 
     assert grade.decision == "insufficient"
     assert gateway.calls == []
@@ -331,6 +567,62 @@ async def test_evidence_grader_receives_bounded_rendered_evidence_context() -> N
 
 
 @pytest.mark.asyncio
+async def test_model_facing_manifest_is_compact_and_audit_outputs_are_capped() -> None:
+    from agentic_rag.query.audit import EvidenceGrader, FaithfulnessAuditor
+    from agentic_rag.query.generation import AnswerDraft, AnswerGenerator, AnswerSegment
+
+    gateway = FakeGateway(
+        [
+            {"decision": "sufficient", "gaps": []},
+            {
+                "segments": [
+                    {
+                        "kind": "content",
+                        "text": "The contract term is three years.",
+                        "evidence_ids": ["evidence-1"],
+                    }
+                ]
+            },
+            {"passed": True, "unsupported_claim_ids": [], "reasons": []},
+        ]
+    )
+    evidence = packed_evidence(heading_path=("Contract", "Term"))
+    draft = AnswerDraft(
+        segments=(
+            AnswerSegment(
+                kind="content",
+                text="The contract term is three years.",
+                evidence_ids=("evidence-1",),
+            ),
+        )
+    )
+
+    await EvidenceGrader(gateway).grade(
+        "What is the term?", evidence, scope=SCOPE, snapshot=SNAPSHOT
+    )
+    await AnswerGenerator(gateway).generate("What is the term?", evidence, SNAPSHOT)
+    await FaithfulnessAuditor(gateway).audit(
+        "What is the term?", draft, evidence, scope=SCOPE, snapshot=SNAPSHOT
+    )
+
+    expected_manifest = {
+        "evidence-1": {
+            "evidence_id": "evidence-1",
+            "parent_id": "parent-1",
+            "document_id": "document-1",
+            "document_version_id": "version-1",
+            "heading_path": ["Contract", "Term"],
+        }
+    }
+    payloads = [json.loads(call.messages[-1]["content"]) for call in gateway.calls]
+    assert all(payload["evidence_manifest"] == expected_manifest for payload in payloads)
+    assert evidence.manifest["evidence-1"].ast_locator == "#/paragraphs/1"
+    assert gateway.calls[0].max_output_tokens == 99_999
+    assert gateway.calls[1].max_output_tokens is None
+    assert gateway.calls[2].max_output_tokens == 99_999
+
+
+@pytest.mark.asyncio
 async def test_generation_and_audit_repair_once_then_refuses_without_draft() -> None:
     from agentic_rag.query.audit import (
         CitationValidator,
@@ -339,12 +631,38 @@ async def test_generation_and_audit_repair_once_then_refuses_without_draft() -> 
     )
     from agentic_rag.query.generation import AnswerGenerator
 
-    gateway = FakeGateway([
-        {"segments": [{"kind": "content", "text": "Unsupported claim", "evidence_ids": ["evidence-1"]}]},
-        {"passed": False, "unsupported_claim_ids": ["claim-1"], "reasons": ["unsupported"]},
-        {"segments": [{"kind": "content", "text": "Still unsupported", "evidence_ids": ["evidence-1"]}]},
-        {"passed": False, "unsupported_claim_ids": ["claim-2"], "reasons": ["still unsupported"]},
-    ])
+    gateway = FakeGateway(
+        [
+            {
+                "segments": [
+                    {
+                        "kind": "content",
+                        "text": "Unsupported claim",
+                        "evidence_ids": ["evidence-1"],
+                    }
+                ]
+            },
+            {
+                "passed": False,
+                "unsupported_claim_ids": ["claim-1"],
+                "reasons": ["unsupported"],
+            },
+            {
+                "segments": [
+                    {
+                        "kind": "content",
+                        "text": "Still unsupported",
+                        "evidence_ids": ["evidence-1"],
+                    }
+                ]
+            },
+            {
+                "passed": False,
+                "unsupported_claim_ids": ["claim-2"],
+                "reasons": ["still unsupported"],
+            },
+        ]
+    )
     result = await generate_with_mandatory_audits(
         question="What is the term?",
         state={"revision_count": 0, "audit_results": [], "errors": []},
@@ -364,8 +682,13 @@ async def test_generation_and_audit_repair_once_then_refuses_without_draft() -> 
 
 
 @pytest.mark.asyncio
-async def test_generation_operational_failure_refuses_but_cancellation_propagates() -> None:
-    from agentic_rag.query.generation import AnswerGenerator, AnswerGenerationUnavailable
+async def test_generation_operational_failure_refuses_but_cancellation_propagates() -> (
+    None
+):
+    from agentic_rag.query.generation import (
+        AnswerGenerator,
+        AnswerGenerationUnavailable,
+    )
 
     generator = AnswerGenerator(FakeGateway([OSError("provider unavailable")]))
     with pytest.raises(AnswerGenerationUnavailable):

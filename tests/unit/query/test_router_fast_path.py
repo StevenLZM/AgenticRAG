@@ -170,6 +170,7 @@ async def test_memory_loads_once_before_router_and_fast_path_never_reloads() -> 
     assert "# ROLE" in call.messages[0]["content"]
     assert len(retrieval.calls) == 1
     assert state["next_node"] == "generate"
+    assert state["retrieval_batches"][0]["target_ids"] == ["query:run-1"]
     assert json.loads(json.dumps(state)) == state
 
 

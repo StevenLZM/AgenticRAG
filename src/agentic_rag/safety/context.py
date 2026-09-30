@@ -15,16 +15,20 @@ class DataEnvelope(BaseModel):
     source_label: str
     evidence_id: str
     content: str
+    heading_path: tuple[str, ...] = ()
 
     def render(self) -> str:
         """Return data-only JSON, never instruction-shaped Markdown."""
+        payload: dict[str, object] = {
+            "trust": "untrusted_data",
+            "source": self.source_label,
+            "evidence_id": self.evidence_id,
+            "content": self.content,
+        }
+        if self.heading_path:
+            payload["heading_path"] = list(self.heading_path)
         return json.dumps(
-            {
-                "trust": "untrusted_data",
-                "source": self.source_label,
-                "evidence_id": self.evidence_id,
-                "content": self.content,
-            },
+            payload,
             ensure_ascii=False,
             separators=(",", ":"),
         )

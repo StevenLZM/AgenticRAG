@@ -52,6 +52,20 @@ metadata = MetaData()
 ast_locator_type = Text().with_variant(mysql.LONGTEXT(), "mysql")
 DEFAULT_QUERY_OUTBOX_STREAM = "agenticrag:jobs:query"
 
+
+def _coerce_heading_path(value: object) -> tuple[str, ...]:
+    """Normalize the JSON heading path returned by a SQL driver.
+
+    The schema stores a JSON array.  Drivers and test doubles may expose that
+    array as either a list or tuple; malformed values fail closed to an empty
+    path rather than becoming prompt metadata.
+    """
+    if not isinstance(value, (list, tuple)):
+        return ()
+    if not all(isinstance(part, str) for part in value):
+        return ()
+    return tuple(value)
+
 documents = Table(
     "documents",
     metadata,
@@ -443,6 +457,7 @@ class ParentChunk:
     ordinal: int
     content: str
     status: str
+    heading_path: tuple[str, ...] = ()
     ast_locator: str | None = None
     index_generation: str | None = None
 
@@ -561,6 +576,13 @@ class IngestionJobRepository(Protocol):
 
 @runtime_checkable
 class DocumentRepository(Protocol):
+    async def create_reprocessing_version(
+        self, scope: UserScope, *, document_id: str, document_version_id: str,
+        content_hash: str, filename: str, parser_version: str, pipeline_version: str,
+        embedding_version: str, index_generation: str, version_status: DocumentVersionStatus,
+        transaction: AsyncSession,
+    ) -> DocumentVersion: ...
+
     async def create(
         self,
         scope: UserScope,
@@ -1064,6 +1086,41 @@ class SqlAlchemyIngestionJobRepository(_SqlAlchemyRepository):
 
 
 class SqlAlchemyDocumentRepository(_SqlAlchemyRepository):
+    async def create_reprocessing_version(
+        self, scope: UserScope, *, document_id: str, document_version_id: str,
+        content_hash: str, filename: str, parser_version: str, pipeline_version: str,
+        embedding_version: str, index_generation: str, version_status: DocumentVersionStatus,
+        transaction: AsyncSession,
+    ) -> DocumentVersion:
+        session = self._session(transaction)
+        row = (await session.execute(select(documents).where(
+            documents.c.id == document_id, documents.c.user_id == scope.user_id,
+            documents.c.status == DocumentStatus.ACTIVE.value, documents.c.deletion_status.is_(None),
+        ).with_for_update())).mappings().one_or_none()
+        if row is None or row["active_version_id"] is None:
+            raise ValueError("document not available for reprocessing")
+        if row["content_hash"] != content_hash or row["filename"] != filename:
+            raise ValueError("reprocessing must preserve the original file")
+        pending = await session.scalar(select(document_versions.c.id).where(
+            document_versions.c.document_id == document_id,
+            document_versions.c.status.in_(("uploaded", "building", "quarantined")),
+        ).limit(1))
+        if pending is not None:
+            raise ValueError("document already has a pending reprocessing version")
+        maximum = await session.scalar(select(func.max(document_versions.c.version_no)).where(
+            document_versions.c.document_id == document_id))
+        version = DocumentVersion(id=document_version_id, document_id=document_id,
+                                  version_no=int(maximum or 0) + 1, status=version_status)
+        await session.execute(insert(document_versions).values(
+            id=version.id, document_id=document_id, version_no=version.version_no,
+            parser_version=parser_version, pipeline_version=pipeline_version,
+            embedding_version=embedding_version, index_generation=index_generation,
+            parent_count=0, child_count=0, status=version_status.value, created_at=_now(),
+        ))
+        # Keep the active pointer and old artifacts untouched until VersionPublisher
+        # verifies and publishes the new version. Failure must not hide the old doc.
+        return version
+
     async def create(
         self,
         scope: UserScope,
@@ -1223,6 +1280,7 @@ class SqlAlchemyParentRepository(_SqlAlchemyRepository):
                 ordinal=row["ordinal"],
                 content=row["content"],
                 status=row["status"],
+                heading_path=_coerce_heading_path(row.get("heading_path")),
                 ast_locator=row["ast_locator"],
                 index_generation=row["index_generation"],
             )

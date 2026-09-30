@@ -27,8 +27,59 @@ SNAPSHOT = RuntimeConfigSnapshot(
 )
 
 
+async def test_chat_skips_retrieval_and_reaches_original_memory_finalize() -> None:
+    from agentic_rag.query.graph import build_query_graph, query_checkpoint_config
+    from agentic_rag.runtime.query_worker import _public_answer_projection
+
+    deps, memory, retrieval, _ = _deps(route="chat")
+    deps.gateway.answer_values[:] = [{"text": "了解，你偏好上海的工作。"}]
+    state = _state()
+    state["request"]["question"] = "我偏好上海的工作"
+    state["messages"] = [{"id": "u1", "role": "user", "content": "我偏好上海的工作"}]
+    result = await build_query_graph(deps).ainvoke(state, query_checkpoint_config(state))
+    assert retrieval.calls == 0
+    assert result["research_attempt_count"] == 0
+    assert result["audit_results"] == []
+    assert memory.stored[0][1][0].content == "我偏好上海的工作"
+    answer = _public_answer_projection(
+        result["answer"], result, runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        require_audited=True,
+    )
+    assert answer is not None
+    assert answer["route"] == "chat"
+    assert answer["segments"][0]["text"] == "了解，你偏好上海的工作。"
+    assert answer.get("audited") is None
+
+
 async def _no_sleep(_: float) -> None:
     return None
+
+
+async def test_mixed_request_keeps_original_preference_for_memory_after_retrieval() -> None:
+    from agentic_rag.query.graph import build_query_graph, query_checkpoint_config
+
+    deps, memory, retrieval, _ = _deps()
+    state = _state()
+    original = "我偏好上海的工作，结合简历分析适合哪些岗位"
+    state["request"]["question"] = original
+    state["messages"] = [{"id": "u1", "role": "user", "content": original}]
+    await build_query_graph(deps).ainvoke(state, query_checkpoint_config(state))
+    assert retrieval.calls == 1
+    assert len(memory.stored) == 1
+    assert memory.stored[0][1][0].content == original
+
+
+async def test_invalid_chat_reply_still_finalizes_memory_without_publishing_text() -> None:
+    from agentic_rag.query.graph import build_query_graph, query_checkpoint_config
+
+    deps, memory, retrieval, _ = _deps(route="chat")
+    deps.gateway.answer_values[:] = [{"text": "", "evidence_ids": ["invented"]}]
+    state = _state()
+    result = await build_query_graph(deps).ainvoke(state, query_checkpoint_config(state))
+    assert result["termination_reason"] == "cannot_answer"
+    assert not result["answer"].get("segments")
+    assert retrieval.calls == 0
+    assert len(memory.stored) == 1
 
 
 class _UsageResponses:
@@ -257,6 +308,7 @@ async def test_real_query_graph_emits_safe_projection_attributes() -> None:
 
     assert result["termination_reason"] == "completed"
     by_type = {call["event_type"]: call for call in emitter.calls}
+    assert by_type["QUERY_ROUTED"]["summary"] == "fast_rag"
     assert by_type["FAST_RAG_COMPLETED"]["attributes"]["retrieval_rounds"] >= 1
     assert "claim_count" in by_type["CITATION_VALIDATED"]["attributes"]
     assert by_type["ANSWER_FINALIZED"]["attributes"]["termination_reason"] == "completed"
@@ -330,8 +382,8 @@ async def test_graph_skips_emitter_with_a_different_runtime_snapshot() -> None:
     assert emitter.calls == []
 
 
-async def test_research_delegate_records_tool_lane_span() -> None:
-    """The real research-loop delegate is inside a Tool lane span."""
+async def test_research_loop_does_not_bundle_all_work_in_outer_tool_lanes() -> None:
+    """Research-loop work is represented by its node, not misleading outer lanes."""
     from agentic_rag.observability.tracing import TraceRecorder
     from agentic_rag.query.graph import build_query_graph
 
@@ -340,7 +392,10 @@ async def test_research_delegate_records_tool_lane_span() -> None:
     result = await build_query_graph(deps).ainvoke(_state())
 
     assert result["termination_reason"] == "completed"
-    assert any(span.name == "tool" for span in recorder.events)
+    names = {span.name for span in recorder.events}
+    assert "graph.node.research_agent_loop" in names
+    assert "tool" not in names
+    assert "retrieval" not in names
 
 
 async def test_insufficient_fast_evidence_escalates_to_research_before_audits() -> None:
@@ -354,7 +409,7 @@ async def test_insufficient_fast_evidence_escalates_to_research_before_audits() 
     assert events.types.count("EVIDENCE_GRADED") == 2
 
 
-async def test_graph_reentry_preserves_research_budget_and_never_issues_fifth_action() -> None:
+async def test_graph_reentry_preserves_research_budget_and_never_issues_third_action() -> None:
     """An insufficient grade re-enters the real loop with its checkpointed action count."""
     from agentic_rag.query.graph import build_query_graph
     from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
@@ -362,10 +417,10 @@ async def test_graph_reentry_preserves_research_budget_and_never_issues_fifth_ac
     gateway = FakeGateway(
         RouteDecision(route="research", normalized_query="notice", reason_code="test"),
         answer_values=[
-            {"action": "retrieve_evidence", "query": "notice"},
-            {"action": "retrieve_evidence", "query": "notice"},
-            {"action": "retrieve_evidence", "query": "notice"},
+            {"action": "retrieve_evidence", "todo_id": "todo-1", "query": "notice"},
             {"action": "submit_evidence"},
+            {"action": "retrieve_evidence", "query": "redundant"},
+            {"action": "retrieve_evidence", "query": "redundant"},
         ],
     )
     deps, _memory, retrieval, _events = _deps(route="research", grades=["insufficient"])
@@ -375,11 +430,15 @@ async def test_graph_reentry_preserves_research_budget_and_never_issues_fifth_ac
         evidence_builder=EvidenceBuilder(),
     ))
 
-    result = await build_query_graph(replace(deps, gateway=gateway, research_loop=loop)).ainvoke(_state())
+    state = _state()
+    state["runtime_config_snapshot"]["max_research_rounds"] = 2
+    state["research"] = {"todos": [{"id": "todo-1", "title": "notice", "owner": "supervisor"}]}
+    result = await build_query_graph(replace(deps, gateway=gateway, research_loop=loop)).ainvoke(state)
 
     assert result["termination_reason"] == "research_round_limit"
-    assert result["research_attempt_count"] == 4
-    assert gateway.answer_values == []
+    assert result["research_attempt_count"] == 2
+    assert retrieval.calls == 1
+    assert len(gateway.answer_values) == 2
 
 
 @pytest.mark.parametrize("decision", ["clarify", "refuse"])

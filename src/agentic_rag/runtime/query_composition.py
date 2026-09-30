@@ -28,6 +28,7 @@ from agentic_rag.query.subagents import (
     SubagentTools,
 )
 from agentic_rag.query.tools import ResearchContext, ResearchToolset, RetrievalPort
+from agentic_rag.retrieval.models import EvidenceBatch
 from agentic_rag.retrieval.adapters.elasticsearch import (
     ElasticsearchBm25Index,
     ElasticsearchVectorIndex,
@@ -48,6 +49,7 @@ class QueryCompositionError(RuntimeError):
 
 
 _PROMPTS = (
+    "chat_v1",
     "router_v1",
     "evidence_grader_v1",
     "research_agent_v1",
@@ -144,7 +146,7 @@ def build_subagent_dispatcher(
     async def child_worker(
         child: ChildResearchState,
         child_tools: SubagentTools,
-    ) -> PackedEvidence:
+    ) -> tuple[EvidenceBatch, PackedEvidence]:
         child_scope = UserScope.model_validate(dict(child.scope))
         context = ResearchContext(scope=child_scope, snapshot=snapshot)
         return await child_tools.retrieve_evidence(
@@ -196,9 +198,20 @@ async def build_query_dependencies(
     if memory is None:
         raise QueryCompositionError("Query Worker container is missing memory boundary")
 
-    deepseek = AsyncOpenAI(api_key=deepseek_key, base_url=settings.deepseek_base_url, timeout=30.0, max_retries=0)
+    # The SDK transport must outlive the gateway's per-operation deadline so
+    # timeout classification and the single retry budget stay in our boundary.
+    deepseek_timeout = max(float(snapshot.query_run_timeout_seconds) + 5.0, 5.0)
+    deepseek = AsyncOpenAI(
+        api_key=deepseek_key,
+        base_url=settings.deepseek_base_url,
+        timeout=deepseek_timeout,
+        max_retries=0,
+    )
     qwen = AsyncOpenAI(api_key=qwen_key, base_url=settings.qwen_embedding_base_url, timeout=30.0, max_retries=0)
     try:
+        # ModelGateway derives the diagnostic client timeout from the configured
+        # provider client when the SDK exposes it.  Keep construction positional
+        # for lightweight test doubles and alternate gateway adapters.
         gateway = ModelGateway(deepseek)
         embedding = _OpenAIEmbedding(qwen, settings.embedding_model, settings.embedding_dimensions)
         cross_encoder = cross_encoder_type(settings.reranker_model)

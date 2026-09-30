@@ -26,6 +26,28 @@ def test_public_answer_schema_rejects_unknown_and_raw_provider_fields() -> None:
         )
 
 
+@pytest.mark.parametrize("extra", [
+    {"audited": True}, {"evidence_parent_ids": ["p1"]},
+    {"citation_coverage": 1},
+    {"segments": [{"kind": "content", "text": "hello", "evidence_ids": ["e1"]}]},
+])
+def test_chat_cannot_claim_document_audit_or_citations(extra: dict[str, object]) -> None:
+    from agentic_rag.query.public_answer import project_public_answer
+
+    assert project_public_answer({
+        "route": "chat", "segments": [{"kind": "content", "text": "hello"}],
+        **extra,
+    }) is None
+
+
+def test_chat_does_not_bypass_explicit_audited_projection() -> None:
+    from agentic_rag.query.public_answer import project_public_answer
+
+    answer = {"route": "chat", "segments": [{"kind": "content", "text": "hello"}]}
+    assert project_public_answer(answer) is not None
+    assert project_public_answer(answer, require_audited=True) is None
+
+
 def test_public_answer_projection_keeps_only_reviewed_fields() -> None:
     from agentic_rag.query.public_answer import project_public_answer
 

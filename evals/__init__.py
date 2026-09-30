@@ -35,7 +35,6 @@ __all__ = [
     "EvaluationCase",
     "EvalCaseResult",
     "EvalRunner",
-    "FixtureQueryClient",
     "IngestionFidelityCase",
     "MixedSnapshotError",
     "SecurityCase",
@@ -64,7 +63,7 @@ __all__ = [
 def __getattr__(name: str) -> object:
     """Lazily expose runner classes without importing ``evals.run`` for the CLI."""
 
-    if name in {"EvalCaseResult", "EvalRunner", "FixtureQueryClient", "SnapshotMismatchError"}:
+    if name in {"EvalCaseResult", "EvalRunner", "SnapshotMismatchError"}:
         from evals import run
 
         return getattr(run, name)

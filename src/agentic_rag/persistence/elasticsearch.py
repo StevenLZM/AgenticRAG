@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+import logging
 from typing import Any, cast
 
 from elasticsearch import AsyncElasticsearch
-from elasticsearch.exceptions import BadRequestError
+from elasticsearch.exceptions import BadRequestError, NotFoundError
 
 from agentic_rag.ingestion.indexer import (
     EMBEDDING_DIMENSIONS,
@@ -15,6 +16,7 @@ from agentic_rag.ingestion.indexer import (
     StagingContext,
 )
 from agentic_rag.models.indexing import (
+    ACTIVE_CHILD_INDEX_ALIAS,
     DEFAULT_INDEX_GENERATION,
     LEGACY_INDEX_GENERATIONS,
     validate_index_generation,
@@ -27,6 +29,9 @@ class ChildIndexWriteError(RuntimeError):
 
 class ChildIndexMappingError(ChildIndexWriteError):
     """Raised before bulk when a generation index has an incompatible schema."""
+
+
+logger = logging.getLogger(__name__)
 
 
 class ElasticsearchChildIndexStore:
@@ -52,6 +57,99 @@ class ElasticsearchChildIndexStore:
     def index_name(index_generation: str) -> str:
         validate_index_generation(index_generation)
         return f"agenticrag-children-{index_generation}"
+
+    async def ensure_active_alias(self, index_generation: str) -> bool:
+        """Repair a missing active alias without changing an existing generation.
+
+        Startup recovery may create the alias when the configured physical index is
+        already present.  An alias pointing at another generation is an operator or
+        rollout mismatch and therefore fails closed instead of being silently moved.
+        """
+        index = self.index_name(index_generation)
+        if not bool(await self._client.indices.exists(index=index)):
+            logger.warning(
+                "elasticsearch_active_alias_pending",
+                extra={
+                    "component": "elasticsearch",
+                    "alias": ACTIVE_CHILD_INDEX_ALIAS,
+                    "index": index,
+                    "outcome": "pending",
+                    "retryable": True,
+                },
+            )
+            return False
+
+        await self._ensure_index(index_generation)
+        targets = await self._read_active_alias_targets()
+        if not targets:
+            await self._client.indices.put_alias(
+                index=index,
+                name=ACTIVE_CHILD_INDEX_ALIAS,
+            )
+            await self._verify_active_alias(index)
+            logger.warning(
+                "elasticsearch_active_alias_repaired",
+                extra={
+                    "component": "elasticsearch",
+                    "alias": ACTIVE_CHILD_INDEX_ALIAS,
+                    "index": index,
+                    "outcome": "recovered",
+                    "retryable": False,
+                },
+            )
+            return True
+        if targets != (index,):
+            raise ChildIndexWriteError(
+                "active alias points at an unexpected index generation: "
+                f"expected {index!r}, found {', '.join(targets)}"
+            )
+        return False
+
+    async def switch_active_alias(self, index_generation: str) -> bool:
+        """Atomically point the active alias at a validated physical generation."""
+        index = self.index_name(index_generation)
+        if not bool(await self._client.indices.exists(index=index)):
+            raise ChildIndexWriteError(
+                f"cannot switch active alias to missing index {index!r}"
+            )
+        await self._ensure_index(index_generation)
+        targets = await self._read_active_alias_targets()
+        if targets == (index,):
+            return False
+
+        actions: list[Mapping[str, Any]] = [
+            {
+                "remove": {
+                    "index": target,
+                    "alias": ACTIVE_CHILD_INDEX_ALIAS,
+                }
+            }
+            for target in targets
+        ]
+        actions.append(
+            {
+                "add": {
+                    "index": index,
+                    "alias": ACTIVE_CHILD_INDEX_ALIAS,
+                }
+            }
+        )
+        response = await self._client.indices.update_aliases(actions=actions)
+        body = cast(Mapping[str, Any], response.body)
+        if body.get("acknowledged") is False:
+            raise ChildIndexWriteError("Elasticsearch active alias switch was not acknowledged")
+        await self._verify_active_alias(index)
+        logger.info(
+            "elasticsearch_active_alias_switched",
+            extra={
+                "component": "elasticsearch",
+                "alias": ACTIVE_CHILD_INDEX_ALIAS,
+                "index": index,
+                "outcome": "switched",
+                "retryable": False,
+            },
+        )
+        return True
 
     async def stage(
         self,
@@ -207,6 +305,24 @@ class ElasticsearchChildIndexStore:
                     f"existing index {index!r} has an incompatible strict mapping: "
                     + "; ".join(differences)
                 )
+
+    async def _read_active_alias_targets(self) -> tuple[str, ...]:
+        try:
+            response = await self._client.indices.get_alias(
+                name=ACTIVE_CHILD_INDEX_ALIAS
+            )
+        except NotFoundError:
+            return ()
+        body = cast(Mapping[str, Any], response.body)
+        return tuple(sorted(str(index) for index in body))
+
+    async def _verify_active_alias(self, expected_index: str) -> None:
+        targets = await self._read_active_alias_targets()
+        if targets != (expected_index,):
+            raise ChildIndexWriteError(
+                "Elasticsearch active alias verification failed: "
+                f"expected {expected_index!r}, found {', '.join(targets) or '<none>'}"
+            )
 
     @staticmethod
     def _validate_metadata(context: StagingContext, child: EmbeddedChild) -> None:

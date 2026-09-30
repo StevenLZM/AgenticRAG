@@ -74,10 +74,13 @@ async def run_fast_rag(
             "next_node": "research_agent",
         }
     target = EvidenceCoverageTarget(target_id=f"query:{state['run_id']}", description=question)
+    if target.target_id not in batch.target_ids:
+        batch = batch.model_copy(update={"target_ids": (*batch.target_ids, target.target_id)})
     packed = dependencies.evidence_builder.build([batch], [target], scope, snapshot)
     base = {
         "evidence": [item.model_dump(mode="json") for item in packed.items],
         "packed_context": packed.model_dump(mode="json"),
+        "retrieval_batches": [batch.model_dump(mode="json")],
     }
     try:
         grade = _grade(

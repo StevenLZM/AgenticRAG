@@ -160,6 +160,10 @@ async def test_worker_entrypoint_receives_the_composed_concurrency_budget(
     async def close_dependencies(*_: object) -> None:
         return None
 
+    async def ensure_active_child_alias(container: object, settings: object) -> None:
+        recorded["alias_container"] = container
+        recorded["alias_settings"] = settings
+
     monkeypatch.setattr(worker_entrypoint, "build_container", lambda _: FakeContainer())
     monkeypatch.setattr(worker_entrypoint, "build_graph_factory", lambda *_: object())
     monkeypatch.setattr(worker_entrypoint, "TransactionalRunRepository", lambda _: object())
@@ -168,10 +172,45 @@ async def test_worker_entrypoint_receives_the_composed_concurrency_budget(
     )
     monkeypatch.setattr(worker_entrypoint, "QueryWorker", RecordingWorker)
     monkeypatch.setattr(worker_entrypoint, "close_query_dependencies", close_dependencies)
+    monkeypatch.setattr(
+        worker_entrypoint,
+        "ensure_active_child_alias",
+        ensure_active_child_alias,
+        raising=False,
+    )
 
-    await worker_entrypoint.run(_settings(), dependencies_factory=dependencies_factory)  # type: ignore[arg-type]
+    settings = _settings()
+    await worker_entrypoint.run(settings, dependencies_factory=dependencies_factory)  # type: ignore[arg-type]
 
     assert recorded["concurrency"] is shared_concurrency
+    assert recorded["alias_settings"] is settings
+
+
+async def test_query_worker_alias_startup_uses_current_index_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.run_query_worker as worker_entrypoint
+
+    calls: list[tuple[object, str]] = []
+
+    class RecordingAliasStore:
+        def __init__(self, client: object) -> None:
+            self._client = client
+
+        async def ensure_active_alias(self, index_generation: str) -> bool:
+            calls.append((self._client, index_generation))
+            return True
+
+    client = object()
+    monkeypatch.setattr(
+        worker_entrypoint, "ElasticsearchChildIndexStore", RecordingAliasStore
+    )
+
+    settings = _settings(index_generation="runtime-index")
+    container = SimpleNamespace(elasticsearch=client)
+    await worker_entrypoint.ensure_active_child_alias(container, settings)
+
+    assert calls == [(client, "runtime-index")]
 
 
 def _settings(**overrides: object) -> Settings:

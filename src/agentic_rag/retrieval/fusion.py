@@ -49,4 +49,9 @@ def rrf_fuse(
         hits,
         key=lambda child_id: (-scores[child_id], best_ranks[child_id], child_id),
     )
-    return [hits[child_id] for child_id in child_ids[:limit]]
+    return [
+        hits[child_id].model_copy(
+            update={"rrf_score": scores[child_id], "rerank_score": None}
+        )
+        for child_id in child_ids[:limit]
+    ]

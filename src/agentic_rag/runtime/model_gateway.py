@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agentic_rag.observability.logging import emit_degradation, emit_model_usage
 from agentic_rag.runtime.circuit import CircuitOpenError, CircuitState
@@ -25,6 +26,7 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 T = TypeVar("T")
 Sleep = Callable[[float], Awaitable[None]]
+Clock = Callable[[], float]
 
 
 class ModelCall(BaseModel):
@@ -38,6 +40,7 @@ class ModelCall(BaseModel):
     snapshot: RuntimeConfigSnapshot
     timeout_seconds: float | None = None
     temperature: float | None = None
+    max_output_tokens: int | None = Field(default=None, ge=1)
 
     @property
     def requested_model(self) -> str:
@@ -94,20 +97,45 @@ class ModelGateway:
         sleep: Sleep = asyncio.sleep,
         random_source: Callable[[], float] = random.random,
         circuit: CircuitState | None = None,
+        client_timeout_seconds: float | None = None,
+        clock: Clock = time.monotonic,
     ) -> None:
         if max_retries < 0 or max_retries > 2:
             raise ValueError("max_retries must be between 0 and 2")
+        if client_timeout_seconds is None:
+            configured_timeout = _get(client, "timeout")
+            if (
+                not isinstance(configured_timeout, bool)
+                and isinstance(configured_timeout, (int, float))
+                and math.isfinite(float(configured_timeout))
+                and configured_timeout > 0
+            ):
+                client_timeout_seconds = float(configured_timeout)
+        if client_timeout_seconds is not None and (
+            isinstance(client_timeout_seconds, bool)
+            or not isinstance(client_timeout_seconds, (int, float))
+            or not math.isfinite(float(client_timeout_seconds))
+            or client_timeout_seconds <= 0
+        ):
+            raise ValueError("client_timeout_seconds must be positive when supplied")
         self._client = client
         self._max_retries = max_retries
         self._backoff_base_seconds = backoff_base_seconds
         self._sleep = sleep
         self._random = random_source
         self._circuit = circuit or CircuitState()
+        self._clock = clock
+        self._client_timeout_seconds = (
+            float(client_timeout_seconds) if client_timeout_seconds is not None else None
+        )
 
     async def complete(self, call: ModelCall) -> ModelResponse[str]:
         """Return plain text, retrying only transient provider failures."""
         started = time.perf_counter()
-        response, attempts = await self._request_with_retries(call, structured=False)
+        deadline = self._operation_deadline(call)
+        response, attempts = await self._request_with_retries(
+            call, structured=False, deadline=deadline, phase="initial"
+        )
         result = ModelResponse[str](
             value=_extract_text(response),
             requested_model=call.requested_model,
@@ -130,23 +158,40 @@ class ModelGateway:
     ) -> ModelResponse[T]:
         """Parse an entire structured result or fail closed after one repair."""
         started = time.perf_counter()
-        response, attempts = await self._request_with_retries(call, structured=True)
+        deadline = self._operation_deadline(call)
+        response, attempts = await self._request_with_retries(
+            call, structured=True, schema=schema, deadline=deadline, phase="initial"
+        )
         input_tokens = _usage_value(response, "input_tokens", "prompt_tokens")
         output_tokens = _usage_value(response, "output_tokens", "completion_tokens")
         text = _extract_text(response)
         try:
             value = _validate_schema(schema, text)
         except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as error:
+            remaining_after_initial = self._remaining(deadline)
+            if remaining_after_initial is not None and remaining_after_initial <= 0:
+                await self._emit_repair_skipped(call, attempt=attempts)
+                await self._emit_deadline(call, phase="repair", attempt=attempts)
+                raise TimeoutError("model structured operation deadline exhausted") from error
             repair_call = call.model_copy(
                 update={"messages": _repair_messages(call.messages, text, str(error))}
             )
             repair_response, repair_attempts = await self._request_with_retries(
-                repair_call, structured=True
+                repair_call,
+                structured=True,
+                schema=schema,
+                deadline=deadline,
+                phase="repair",
+                max_retries=0,
             )
             attempts += repair_attempts
             response = repair_response
             input_tokens += _usage_value(response, "input_tokens", "prompt_tokens")
             output_tokens += _usage_value(response, "output_tokens", "completion_tokens")
+            remaining_after_repair = self._remaining(deadline)
+            if remaining_after_repair is not None and remaining_after_repair <= 0:
+                await self._emit_deadline(call, phase="repair", attempt=attempts)
+                raise TimeoutError("model structured operation deadline exhausted")
             try:
                 value = _validate_schema(schema, _extract_text(response))
             except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as repair_error:
@@ -161,6 +206,7 @@ class ModelGateway:
                     event_type="MODEL_REPAIR_EXHAUSTED",
                     attributes={
                         "schema_name": _safe_schema_name(schema),
+                        "phase": "repair",
                         "protocol": call.effective_protocol,
                         "requested_model": call.requested_model,
                         "actual_model": _as_string(_get(response, "model"))
@@ -193,9 +239,21 @@ class ModelGateway:
         return result
 
     async def _request_with_retries(
-        self, call: ModelCall, *, structured: bool
+        self,
+        call: ModelCall,
+        *,
+        structured: bool,
+        schema: type[object] | None = None,
+        deadline: float | None = None,
+        phase: Literal["initial", "repair"] = "initial",
+        max_retries: int | None = None,
     ) -> tuple[object, int]:
-        for attempt in range(1, self._max_retries + 2):
+        retry_limit = self._max_retries if max_retries is None else max_retries
+        for attempt in range(1, retry_limit + 2):
+            remaining = self._remaining(deadline)
+            if remaining is not None and remaining <= 0:
+                await self._emit_deadline(call, phase=phase, attempt=attempt)
+                raise TimeoutError("model operation deadline exhausted")
             if not self._circuit.allow_call():
                 await emit_degradation(
                     component="llm",
@@ -206,18 +264,31 @@ class ModelGateway:
                     retryable=True,
                     outcome="degraded",
                     event_type="CIRCUIT_OPEN",
+                    attributes=self._model_diagnostic_attributes(call, phase=phase),
                 )
                 raise CircuitOpenError("model provider circuit is open")
             try:
                 response = await asyncio.wait_for(
-                    self._create(call, structured=structured),
-                    timeout=call.effective_timeout_seconds,
+                    self._create(call, structured=structured, schema=schema),
+                    timeout=(
+                        remaining
+                        if remaining is not None
+                        else call.effective_timeout_seconds
+                    ),
                 )
                 self._circuit.record_success()
                 return response, attempt
             except CircuitOpenError:
                 raise
             except BaseException as error:
+                remaining_after_failure = self._remaining(deadline)
+                if (
+                    remaining is not None
+                    and remaining_after_failure is not None
+                    and remaining_after_failure <= 0
+                ):
+                    await self._emit_deadline(call, phase=phase, attempt=attempt)
+                    raise TimeoutError("model operation deadline exhausted") from error
                 if isinstance(error, ModelProtocolError):
                     await emit_degradation(
                         component="llm",
@@ -228,10 +299,28 @@ class ModelGateway:
                         retryable=False,
                         outcome="degraded",
                         event_type="MODEL_PROTOCOL_ERROR",
+                        attributes=self._model_diagnostic_attributes(
+                            call, error, phase=phase
+                        ),
                     )
                     raise
-                if not _is_transient(error) or attempt > self._max_retries:
-                    if _is_transient(error) and attempt > self._max_retries:
+                if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+                    await emit_degradation(
+                        component="llm",
+                        reason="provider_timeout",
+                        run_id=None,
+                        snapshot_id=call.snapshot.snapshot_id,
+                        attempt=attempt,
+                        retryable=True,
+                        outcome="degraded",
+                        event_type="MODEL_PROVIDER_TIMEOUT",
+                        attributes=self._model_diagnostic_attributes(
+                            call, error, phase=phase
+                        ),
+                    )
+                transient = _is_transient(error)
+                if not transient or attempt > retry_limit:
+                    if transient and attempt > retry_limit:
                         self._circuit.record_failure()
                         await emit_degradation(
                             component="llm",
@@ -242,6 +331,9 @@ class ModelGateway:
                             retryable=True,
                             outcome="degraded",
                             event_type="MODEL_RETRY_EXHAUSTED",
+                            attributes=self._model_diagnostic_attributes(
+                                call, error, phase=phase
+                            ),
                         )
                     raise
                 # Jitter prevents synchronized reattempts across independent runs.
@@ -255,6 +347,9 @@ class ModelGateway:
                     retryable=True,
                     outcome="degraded",
                     event_type="MODEL_RETRY",
+                    attributes=self._model_diagnostic_attributes(
+                        call, error, phase=phase
+                    ),
                 )
                 if opened:
                     await emit_degradation(
@@ -266,13 +361,96 @@ class ModelGateway:
                         retryable=True,
                         outcome="degraded",
                         event_type="CIRCUIT_OPEN",
+                        attributes=self._model_diagnostic_attributes(
+                            call, error, phase=phase
+                        ),
                     )
                     raise CircuitOpenError("model provider circuit opened") from error
                 delay = self._backoff_base_seconds * (2 ** (attempt - 1))
-                await self._sleep(delay * (0.5 + self._random()))
+                if remaining is not None:
+                    remaining_after_failure = self._remaining(deadline)
+                    if remaining_after_failure is None or remaining_after_failure <= 0:
+                        await self._emit_deadline(call, phase=phase, attempt=attempt)
+                        raise TimeoutError("model operation deadline exhausted") from error
+                    sleep_for = delay * (0.5 + self._random())
+                    if sleep_for >= remaining_after_failure:
+                        await self._sleep(min(sleep_for, remaining_after_failure))
+                        await self._emit_deadline(call, phase=phase, attempt=attempt)
+                        raise TimeoutError("model operation deadline exhausted") from error
+                else:
+                    sleep_for = delay * (0.5 + self._random())
+                await self._sleep(sleep_for)
         raise AssertionError("retry loop must either return or raise")
 
-    async def _create(self, call: ModelCall, *, structured: bool = False) -> object:
+    async def _emit_deadline(
+        self, call: ModelCall, *, phase: Literal["initial", "repair"], attempt: int
+    ) -> None:
+        await emit_degradation(
+            component="llm",
+            reason="model_total_deadline_exhausted",
+            run_id=None,
+            snapshot_id=call.snapshot.snapshot_id,
+            attempt=attempt,
+            retryable=True,
+            outcome="degraded",
+            event_type="MODEL_TOTAL_DEADLINE_EXHAUSTED",
+            attributes={
+                **self._model_diagnostic_attributes(call, phase=phase),
+                "phase": phase,
+                "total_timeout_seconds": call.effective_timeout_seconds,
+            },
+        )
+
+    async def _emit_repair_skipped(self, call: ModelCall, *, attempt: int) -> None:
+        """Record that no budget remained for the one permitted schema repair."""
+        await emit_degradation(
+            component="llm",
+            reason="model_schema_invalid",
+            run_id=None,
+            snapshot_id=call.snapshot.snapshot_id,
+            attempt=attempt,
+            retryable=False,
+            outcome="refused",
+            event_type="MODEL_REPAIR_SKIPPED",
+            attributes={
+                **self._model_diagnostic_attributes(call, phase="repair"),
+                "phase": "repair",
+                "skip_reason": "insufficient_budget",
+            },
+        )
+
+    def _operation_deadline(self, call: ModelCall) -> float:
+        return self._clock() + call.effective_timeout_seconds
+
+    def _remaining(self, deadline: float | None) -> float | None:
+        return None if deadline is None else deadline - self._clock()
+
+    def _model_diagnostic_attributes(
+        self,
+        call: ModelCall,
+        error: BaseException | None = None,
+        *,
+        phase: Literal["initial", "repair"] = "initial",
+    ) -> dict[str, object]:
+        attributes: dict[str, object] = {
+            "requested_model": call.requested_model,
+            "protocol": call.effective_protocol,
+        }
+        if self._client_timeout_seconds is not None:
+            attributes["client_timeout_seconds"] = self._client_timeout_seconds
+        if error is not None:
+            attributes.update(_provider_error_attributes(error))
+        if phase != "initial":
+            attributes["phase"] = phase
+        return attributes
+
+    async def _create(
+        self,
+        call: ModelCall,
+        *,
+        structured: bool = False,
+        schema: type[object] | None = None,
+    ) -> object:
         responses = _get(self._client, "responses")
         chat = _get(self._client, "chat")
         completions = _get(chat, "completions") if chat is not None else None
@@ -284,26 +462,34 @@ class ModelGateway:
             kwargs: dict[str, object] = {
                 "model": call.requested_model,
                 "messages": list(
-                    _structured_messages(call.messages) if structured else call.messages
+                    _structured_messages(call.messages, schema)
+                    if structured
+                    else call.messages
                 ),
             }
             if structured:
                 kwargs["response_format"] = {"type": "json_object"}
             if call.temperature is not None:
                 kwargs["temperature"] = call.temperature
+            if call.max_output_tokens is not None:
+                kwargs["max_tokens"] = call.max_output_tokens
             return await cast(Any, _get(completions, "create"))(**kwargs)
 
         if protocol in {"auto", "responses"} and responses_available:
             kwargs = {
                 "model": call.requested_model,
                 "input": list(
-                    _structured_messages(call.messages) if structured else call.messages
+                    _structured_messages(call.messages, schema)
+                    if structured
+                    else call.messages
                 ),
             }
             if structured:
                 kwargs["text"] = {"format": {"type": "json_object"}}
             if call.temperature is not None:
                 kwargs["temperature"] = call.temperature
+            if call.max_output_tokens is not None:
+                kwargs["max_output_tokens"] = call.max_output_tokens
             return await cast(Any, _get(responses, "create"))(**kwargs)
 
         raise ModelProtocolError(
@@ -356,6 +542,15 @@ def _validate_schema(schema: type[T], text: str) -> T:
     return cast(T, schema(**parsed))
 
 
+def _operation_deadline(call: ModelCall) -> float:
+    """Return one monotonic deadline shared by retries and schema repair."""
+    return time.monotonic() + call.effective_timeout_seconds
+
+
+def _remaining(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - time.monotonic()
+
+
 def _normalize_structured_text(text: str) -> str:
     """Remove only a complete Markdown JSON fence; keep schema validation strict."""
     candidate = text.strip()
@@ -370,21 +565,46 @@ def _normalize_structured_text(text: str) -> str:
 
 def _structured_messages(
     messages: Sequence[dict[str, Any]],
+    schema: type[object] | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Ensure provider JSON-mode preconditions without changing business prompts."""
+    """Add a server-owned exact schema contract and JSON-mode precondition."""
+    structured = tuple(messages)
+    if schema is not None:
+        schema_json = _schema_json(schema)
+        structured = (
+            {
+                "role": "system",
+                "content": (
+                    "Return exactly one JSON object conforming to this server-owned "
+                    f"JSON Schema ({_safe_schema_name(schema)}). Do not add fields or prose.\n"
+                    + json.dumps(schema_json, ensure_ascii=False, sort_keys=True)
+                ),
+            },
+            *structured,
+        )
     if any(
         isinstance(message.get("content"), str)
         and "json" in message["content"].casefold()
-        for message in messages
+        for message in structured
     ):
-        return tuple(messages)
+        return structured
     return (
-        *messages,
+        *structured,
         {
             "role": "system",
             "content": "Return a valid JSON object only.",
         },
     )
+
+
+def _schema_json(schema: type[object]) -> Mapping[str, object]:
+    model_json_schema = _get(schema, "model_json_schema")
+    if not callable(model_json_schema):
+        raise TypeError("structured schema must expose model_json_schema")
+    value = model_json_schema()
+    if not isinstance(value, Mapping):
+        raise TypeError("structured schema JSON Schema must be an object")
+    return cast(Mapping[str, object], value)
 
 
 def _safe_schema_name(schema: object) -> str:
@@ -436,6 +656,42 @@ def _is_transient(error: BaseException) -> bool:
         if context is not None:
             pending.append(context)
     return False
+
+
+def _provider_error_attributes(error: BaseException) -> dict[str, object]:
+    """Extract bounded provider diagnostics without retaining exception text."""
+    attributes: dict[str, object] = {"error_class": type(error).__name__}
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        status_code = _get(current, "status_code")
+        response = _get(current, "response")
+        if not isinstance(status_code, int):
+            status_code = _get(response, "status_code")
+        if "http_status" not in attributes and isinstance(status_code, int):
+            attributes["http_status"] = status_code
+        if "provider_request_id" not in attributes:
+            request_id = _get(current, "request_id")
+            if not isinstance(request_id, str):
+                request_id = _get(current, "provider_request_id")
+            if not isinstance(request_id, str):
+                headers = _get(response, "headers")
+                getter = _get(headers, "get")
+                if callable(getter):
+                    request_id = getter("x-request-id")
+            if isinstance(request_id, str) and request_id:
+                attributes["provider_request_id"] = request_id
+        cause = current.__cause__
+        context = current.__context__
+        if cause is not None:
+            pending.append(cause)
+        if context is not None:
+            pending.append(context)
+    return attributes
 
 
 def _get(value: object | None, key: str) -> object | None:

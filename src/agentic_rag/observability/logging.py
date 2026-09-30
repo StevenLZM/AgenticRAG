@@ -50,6 +50,9 @@ _SAFE_SUMMARIES = frozenset(
         "queue_waited",
         "retrieval_completed",
         "citation_validated",
+        "chat",
+        "fast_rag",
+        "research",
     }
 )
 _EVENT_KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -74,6 +77,7 @@ _NUMERIC_ATTRIBUTES = frozenset(
         "attempts",
         "latency_ms",
         "output_length",
+        "client_timeout_seconds",
     }
 )
 _MODEL_TEXT_ATTRIBUTES = frozenset(
@@ -83,7 +87,11 @@ _MODEL_TEXT_ATTRIBUTES = frozenset(
         "requested_model",
         "actual_model",
         "error_class",
+        "operation",
+        "provider_request_id",
         "output_sha256",
+        "skip_reason",
+        "phase",
     }
 )
 _SAFE_MODEL_TEXT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -151,6 +159,8 @@ _DEGRADATION_REASONS = frozenset(
         "subagent_unavailable",
         "research_action_invalid",
         "model_schema_invalid",
+        "model_total_deadline_exhausted",
+        "provider_timeout",
         "generation_unavailable",
         "audit_failed",
         "authorization_unavailable",
@@ -180,7 +190,9 @@ def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(attributes, Mapping):
         return result
     for key, value in attributes.items():
-        if key in _NUMERIC_ATTRIBUTES and _safe_number(value):
+        if key == "http_status" and type(value) is int and 100 <= value <= 599:
+            result[key] = value
+        elif key in _NUMERIC_ATTRIBUTES and _safe_number(value):
             result[key] = value
         elif key == "attempt" and _safe_number(value) and int(value) == value:
             result[key] = int(value)
@@ -202,6 +214,7 @@ def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
             key in _MODEL_TEXT_ATTRIBUTES
             and isinstance(value, str)
             and _SAFE_MODEL_TEXT.fullmatch(value)
+            and _SENSITIVE_VALUE.search(value) is None
         ):
             result[key] = value
     return result
@@ -418,6 +431,21 @@ async def emit_degradation(
     if _EVENT_TYPE.fullmatch(resolved_event_type) is None:
         resolved_event_type = "COMPONENT_DEGRADED"
     safe_attributes = sanitize_attributes(attributes)
+    safe_operation = (
+        safe_attributes.get("operation")
+        if isinstance(safe_attributes.get("operation"), str)
+        else None
+    )
+    if safe_operation is not None and _NODE_NAME.fullmatch(safe_operation) is None:
+        safe_operation = None
+    if safe_component == "llm" and scope is not None:
+        safe_operation = scope.operation
+    safe_sequence = 0
+    if safe_component == "llm" and scope is not None:
+        scope.sequence += 1
+        safe_sequence = scope.sequence
+    if safe_component == "llm" and safe_operation is not None:
+        safe_attributes = {**safe_attributes, "operation": safe_operation}
     logger.warning(
         "degradation component=%s reason=%s outcome=%s retryable=%s attempt=%s run_id=%s snapshot_id=%s attributes=%s",
         safe_component,
@@ -439,6 +467,7 @@ async def emit_degradation(
             user_id=scope.user_id or "unknown",
             event_type=resolved_event_type,
             summary=safe_outcome,
+            node_name=safe_operation if safe_component == "llm" else None,
             event_key=stable_event_key(
                 safe_run,
                 "degradation",
@@ -447,6 +476,8 @@ async def emit_degradation(
                 safe_reason,
                 str(safe_attempt),
                 safe_outcome,
+                safe_operation or "",
+                str(safe_sequence),
             ),
             attributes={
                 "attempt": safe_attempt,

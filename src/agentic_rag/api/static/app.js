@@ -2,6 +2,7 @@
   "use strict";
 
   const PUBLIC_EVENT_TYPES = new Set([
+    "RUN_STARTED", "RUN_COMPLETED", "RUN_FAILED",
     "MEMORY_LOADED", "QUERY_ROUTED", "FAST_RAG_COMPLETED",
     "RESEARCH_LOOP_COMPLETED", "RETRIEVAL_COMPLETED", "EVIDENCE_GRADED",
     "FAITHFULNESS_AUDITED", "CITATION_VALIDATED", "ANSWER_GENERATED",
@@ -46,6 +47,7 @@
     "lease_lost", "cancelled", "worker_timeout", "worker_dlq", "invalid_input", "unknown"
   ]);
   const SAFE_DEGRADATION_OUTCOMES = new Set(["degraded", "refused", "dlq"]);
+  const SAFE_MODEL_TEXT = /^[A-Za-z0-9_.:-]{1,128}$/;
   const TERMINAL_NOTICE_CODES = new Set([
     "research_action_invalid", "research_round_limit", "audit_failed",
     "cannot_answer", "refuse", "clarify"
@@ -55,6 +57,16 @@
   let activeRunId = null;
   let lastEventId = 0;
   let streamCancelled = false;
+  let activeRoute = null;
+  let answerSettled = false;
+  const ROUTE_LABELS = {chat: "聊天", fast_rag: "快速检索", research: "深入研究"};
+  const ROUTE_WAITING = {
+    chat: "正在生成聊天回复…", fast_rag: "正在检索资料…", research: "正在深入研究…"
+  };
+
+  function safeRoute(route) {
+    return typeof route === "string" && Object.hasOwn(ROUTE_LABELS, route) ? route : null;
+  }
 
   function byId(id) {
     return document.getElementById(id);
@@ -89,7 +101,7 @@
 
   function buildQueryPayload(question) {
     const query = String(question || "").trim();
-    return query ? { query, wait_seconds: 30 } : null;
+    return query ? { query, wait_seconds: 0 } : null;
   }
 
   function buildSseHeaders(cursor) {
@@ -114,11 +126,25 @@
     if (SAFE_DEGRADATION_OUTCOMES.has(raw.outcome)) attributes.outcome = raw.outcome;
     if (typeof raw.retryable === "boolean") attributes.retryable = raw.retryable;
     if (Number.isInteger(raw.attempt) && raw.attempt >= 0) attributes.attempt = raw.attempt;
+    ["operation", "requested_model", "protocol", "error_class", "provider_request_id"].forEach((key) => {
+      if (typeof raw[key] === "string" && SAFE_MODEL_TEXT.test(raw[key])) {
+        attributes[key] = raw[key];
+      }
+    });
+    if (Number.isInteger(raw.http_status) && raw.http_status >= 100 && raw.http_status <= 599) {
+      attributes.http_status = raw.http_status;
+    }
+    if (typeof raw.client_timeout_seconds === "number"
+      && Number.isFinite(raw.client_timeout_seconds)
+      && raw.client_timeout_seconds >= 0) {
+      attributes.client_timeout_seconds = raw.client_timeout_seconds;
+    }
     return attributes;
   }
 
   function eventPresentation(event) {
     const known = PUBLIC_EVENT_TYPES.has(event.event_type);
+    if (!known) return null;
     const attributes = known ? degradationAttributes(event) : {};
     const presentation = {
       label: known ? event.event_type : "进度更新",
@@ -126,6 +152,10 @@
       noticeCode: noticeCodeForEvent(event.event_type)
     };
     if (Object.keys(attributes).length) presentation.attributes = attributes;
+    if (event.event_type === "QUERY_ROUTED" && safeRoute(event.route)) {
+      presentation.label = "路由选择";
+      presentation.summary = ROUTE_LABELS[event.route];
+    }
     return presentation;
   }
 
@@ -150,7 +180,7 @@
     if (Array.isArray(details.evidence_parent_ids)) {
       provenance.evidence_parent_ids = details.evidence_parent_ids.filter((value) => typeof value === "string");
     }
-    if (["fast_rag", "research"].includes(details.route)) provenance.route = details.route;
+    if (["chat", "fast_rag", "research"].includes(details.route)) provenance.route = details.route;
     if (typeof details.runtime_config_snapshot_id === "string") {
       provenance.runtime_config_snapshot_id = details.runtime_config_snapshot_id;
     } else if (typeof run.runtime_config_snapshot_id === "string") {
@@ -164,7 +194,13 @@
 
   function answerPresentation(run) {
     const details = run && run.answer && typeof run.answer === "object" ? run.answer : null;
-    if (!details || details.audited !== true || !Array.isArray(details.segments)) return null;
+    if (!details || !Array.isArray(details.segments)) return null;
+    const isChat = details.route === "chat";
+    if (isChat) {
+      if (details.audited != null || details.citation_coverage != null
+        || (details.evidence_parent_ids || []).length
+        || details.segments.some(s => !s || s.kind !== "content" || (s.evidence_ids || []).length)) return null;
+    } else if (details.audited !== true) return null;
     const segments = details.segments.filter((segment) => (
       segment && typeof segment === "object"
       && ["content", "heading", "separator", "references"].includes(segment.kind)
@@ -180,7 +216,7 @@
     });
     const parentIds = Array.isArray(details.evidence_parent_ids)
       ? details.evidence_parent_ids.filter((value) => typeof value === "string") : [];
-    const audit = { audited: true };
+    const audit = isChat ? {} : { audited: true };
     if (typeof details.citation_coverage === "number" && details.citation_coverage >= 0 && details.citation_coverage <= 1) {
       audit.citation_coverage = details.citation_coverage;
     }
@@ -193,6 +229,7 @@
   }
 
   function renderSafeTerminalNotice(code) {
+    answerSettled = true;
     showNotice(code);
     setText(elements.answer, NOTICES[code]);
   }
@@ -210,6 +247,11 @@
 
   function appendTimeline(event) {
     const presentation = eventPresentation(event);
+    if (!presentation) return;
+    if (event.event_type === "QUERY_ROUTED" && safeRoute(event.route)) {
+      activeRoute = event.route;
+      if (!answerSettled) setText(elements.answer, ROUTE_WAITING[activeRoute]);
+    }
     const item = document.createElement("li");
     const detail = presentation.attributes
       ? `（${Object.entries(presentation.attributes).map(([key, value]) => `${key}=${value}`).join(", ")}）`
@@ -241,15 +283,22 @@
     const answer = run.answer;
     const termination = terminalNoticeCode(run);
     const presentation = answerPresentation(run);
+    activeRoute = safeRoute(answer && answer.route) || activeRoute;
+    answerSettled = !!presentation || !!termination || ["completed", "failed", "cancelled"].includes(run.status);
     if (termination) {
       renderSafeTerminalNotice(termination);
     } else if (presentation) {
       renderObject(elements.answer, presentation.text, "未返回可展示的回答。");
     } else if (run.error_code) {
       setText(elements.answer, "任务未完成，请查看执行状态。");
+    } else if (answerSettled) {
+      setText(elements.answer, run.status === "cancelled" ? "任务已取消。" : "任务已结束，暂无可展示的回答。");
+    } else {
+      setText(elements.answer, ROUTE_WAITING[activeRoute] || "正在处理消息…");
     }
-    renderObject(elements.evidence, presentation && presentation.evidence, "服务端响应中暂无可展示的证据。");
-    renderObject(elements.audit, presentation && presentation.audit, "服务端响应中暂无审计信息。");
+    const isChat = presentation && presentation.provenance.route === "chat";
+    renderObject(elements.evidence, isChat ? "不适用：聊天回复不引用文档证据。" : presentation && presentation.evidence, "服务端响应中暂无可展示的证据。");
+    renderObject(elements.audit, isChat ? "不适用：聊天回复不进行文档证据审计。" : presentation && presentation.audit, "服务端响应中暂无审计信息。");
     renderObject(elements.provenance, presentation && presentation.provenance, "服务端响应中暂无溯源信息。");
   }
 
@@ -294,8 +343,11 @@
       return null;
     }
     clearNotice();
+    activeRunId = null;
+    activeRoute = null;
+    answerSettled = false;
     elements.timeline.replaceChildren();
-    setText(elements.answer, "正在创建检索任务…");
+    displayAnswer({status: "queued"});
     lastEventId = 0;
     streamCancelled = false;
     try {
@@ -344,6 +396,10 @@
         let buffer = "";
         for (;;) {
           const { value, done } = await reader.read();
+          if (streamCancelled || activeRunId !== runId) {
+            await reader.cancel();
+            return null;
+          }
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           const blocks = buffer.split("\n\n");

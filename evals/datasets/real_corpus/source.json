@@ -1,0 +1,885 @@
+{
+  "schema_version": 1,
+  "corpus_id": "xinglan-v1",
+  "description": "人工预先编写的虚构公司材料与金标，不代表真实公司政策；不从检索输出生成金标。",
+  "documents": [
+    {
+      "document_key": "remote_2026",
+      "filename": "01_弹性办公制度2026.pdf",
+      "title": "星岚科技弹性办公制度（2026版）",
+      "facts": [
+        {
+          "fact_id": "R01",
+          "heading": "版本与适用范围",
+          "text": "本制度于2026年7月1日生效，适用于星岚科技正式员工。2025版同期停止适用，已归档文本仅供历史审计。",
+          "anchor_terms": [
+            "本制度于2026年7月1日生效，适用于星岚科技正式员工。2025版同期停止适用，已归档文本仅供历史审计。"
+          ]
+        },
+        {
+          "fact_id": "R02",
+          "heading": "工程部远程额度",
+          "text": "工程部正式员工每周最多远程办公3天。远程额度不得跨周累计，也不能兑换为休假。",
+          "anchor_terms": [
+            "工程部正式员工每周最多远程办公3天。远程额度不得跨周累计，也不能兑换为休假。"
+          ]
+        },
+        {
+          "fact_id": "R03",
+          "heading": "运营部远程额度",
+          "text": "运营部正式员工每周最多远程办公1天。客户现场值班日不安排远程办公。",
+          "anchor_terms": [
+            "运营部正式员工每周最多远程办公1天。客户现场值班日不安排远程办公。"
+          ]
+        },
+        {
+          "fact_id": "R04",
+          "heading": "共同到岗日",
+          "text": "工程部共同到岗日为每周三。共同到岗日的跨部门评审使用现场会议室，不能用远程额度抵扣。",
+          "anchor_terms": [
+            "工程部共同到岗日为每周三。共同到岗日的跨部门评审使用现场会议室，不能用远程额度抵扣。"
+          ]
+        },
+        {
+          "fact_id": "R05",
+          "heading": "试用期与申请",
+          "text": "试用期员工不适用远程办公额度。正式员工须提前2个工作日向直属主管提交申请。",
+          "anchor_terms": [
+            "试用期员工不适用远程办公额度。正式员工须提前2个工作日向直属主管提交申请。"
+          ]
+        },
+        {
+          "fact_id": "R06",
+          "heading": "涉密任务例外",
+          "text": "处理L3级机密数据时必须在具有安全区的办公室完成，不受普通远程办公额度影响。",
+          "anchor_terms": [
+            "处理L3级机密数据时必须在具有安全区的办公室完成，不受普通远程办公额度影响。"
+          ]
+        }
+      ]
+    },
+    {
+      "document_key": "travel_2026",
+      "filename": "02_差旅报销标准2026.pdf",
+      "title": "星岚科技差旅报销标准（2026版）",
+      "facts": [
+        {
+          "fact_id": "T01",
+          "heading": "生效日期",
+          "text": "本标准于2026年7月1日生效，金额单位为人民币元。按出差目的地城市确定住宿标准，不按员工常驻城市确定。",
+          "anchor_terms": [
+            "本标准于2026年7月1日生效，金额单位为人民币元。按出差目的地城市确定住宿标准，不按员工常驻城市确定。"
+          ]
+        },
+        {
+          "fact_id": "T02",
+          "heading": "上海住宿",
+          "text": "上海住宿上限为每人每晚680元。连续入住按实际晚数累计额度，未使用额度不转移到餐费。",
+          "anchor_terms": [
+            "上海住宿上限为每人每晚680元。连续入住按实际晚数累计额度，未使用额度不转移到餐费。"
+          ]
+        },
+        {
+          "fact_id": "T03",
+          "heading": "杭州住宿",
+          "text": "杭州住宿上限为每人每晚520元。项目长期驻场协议另行审批，不自动适用普通短期差旅标准。",
+          "anchor_terms": [
+            "杭州住宿上限为每人每晚520元。项目长期驻场协议另行审批，不自动适用普通短期差旅标准。"
+          ]
+        },
+        {
+          "fact_id": "T04",
+          "heading": "北京住宿",
+          "text": "北京住宿上限为每人每晚650元。多人合住房间仍须核对每人实际分摊费用。",
+          "anchor_terms": [
+            "北京住宿上限为每人每晚650元。多人合住房间仍须核对每人实际分摊费用。"
+          ]
+        },
+        {
+          "fact_id": "T05",
+          "heading": "餐费与交通",
+          "text": "出差餐费上限为每人每天100元。高铁仅报销二等座，升级差额由个人承担。",
+          "anchor_terms": [
+            "出差餐费上限为每人每天100元。高铁仅报销二等座，升级差额由个人承担。"
+          ]
+        },
+        {
+          "fact_id": "T06",
+          "heading": "提交时限",
+          "text": "报销申请须在出差结束后10个工作日内提交。完整材料包括行程单、发票和项目编号。",
+          "anchor_terms": [
+            "报销申请须在出差结束后10个工作日内提交。完整材料包括行程单、发票和项目编号。"
+          ]
+        },
+        {
+          "fact_id": "T07",
+          "heading": "预审批",
+          "text": "单次预计差旅总额超过5000元时，出发前须由项目负责人完成预算审批。",
+          "anchor_terms": [
+            "单次预计差旅总额超过5000元时，出发前须由项目负责人完成预算审批。"
+          ]
+        }
+      ]
+    },
+    {
+      "document_key": "projects",
+      "filename": "03_项目登记册.txt",
+      "title": "星岚科技项目登记册（2026年9月）",
+      "facts": [
+        {
+          "fact_id": "P01",
+          "heading": "晨星项目",
+          "text": "晨星项目由上海工程部负责，使用企业版套餐，预计于2026年10月20日发布。试点任务是文档检索，不包括图像生成。",
+          "anchor_terms": [
+            "晨星项目由上海工程部负责，使用企业版套餐，预计于2026年10月20日发布。试点任务是文档检索，不包括图像生成。"
+          ]
+        },
+        {
+          "fact_id": "P02",
+          "heading": "澄海项目",
+          "text": "澄海项目由杭州运营部负责，使用标准版套餐，预计于2026年9月30日发布。现场验收地点为杭州办公室。",
+          "anchor_terms": [
+            "澄海项目由杭州运营部负责，使用标准版套餐，预计于2026年9月30日发布。现场验收地点为杭州办公室。"
+          ]
+        },
+        {
+          "fact_id": "P03",
+          "heading": "云帆项目",
+          "text": "云帆项目由北京研究部负责，使用企业版套餐，预计于2026年11月15日发布。研究样本包含L3级数据。",
+          "anchor_terms": [
+            "云帆项目由北京研究部负责，使用企业版套餐，预计于2026年11月15日发布。研究样本包含L3级数据。"
+          ]
+        },
+        {
+          "fact_id": "P04",
+          "heading": "守望项目",
+          "text": "守望项目由上海安全部负责，使用基础版套餐，预计于2026年10月5日发布。首期仅覆盖内部巡检。",
+          "anchor_terms": [
+            "守望项目由上海安全部负责，使用基础版套餐，预计于2026年10月5日发布。首期仅覆盖内部巡检。"
+          ]
+        },
+        {
+          "fact_id": "P05",
+          "heading": "登记说明",
+          "text": "登记册中的日期均为计划日期，不代表已上线。项目名称、负责部门和套餐须结合本期登记，不引用同名历史试验。",
+          "anchor_terms": [
+            "登记册中的日期均为计划日期，不代表已上线。项目名称、负责部门和套餐须结合本期登记，不引用同名历史试验。"
+          ]
+        }
+      ]
+    },
+    {
+      "document_key": "support",
+      "filename": "04_支持与故障分级.txt",
+      "title": "星岚科技客户支持与故障分级",
+      "facts": [
+        {
+          "fact_id": "S01",
+          "heading": "企业版P1",
+          "text": "企业版P1故障的首次响应上限为15分钟，目标恢复时间为4小时。P1指核心服务整体不可用。",
+          "anchor_terms": [
+            "企业版P1故障的首次响应上限为15分钟，目标恢复时间为4小时。P1指核心服务整体不可用。"
+          ]
+        },
+        {
+          "fact_id": "S02",
+          "heading": "标准版P1",
+          "text": "标准版P1故障的首次响应上限为30分钟，目标恢复时间为8小时。恢复目标不等于无条件赔偿承诺。",
+          "anchor_terms": [
+            "标准版P1故障的首次响应上限为30分钟，目标恢复时间为8小时。恢复目标不等于无条件赔偿承诺。"
+          ]
+        },
+        {
+          "fact_id": "S03",
+          "heading": "企业版P2",
+          "text": "企业版P2故障的首次响应上限为1小时，目标恢复时间为24小时。P2指部分功能受影响但有替代路径。",
+          "anchor_terms": [
+            "企业版P2故障的首次响应上限为1小时，目标恢复时间为24小时。P2指部分功能受影响但有替代路径。"
+          ]
+        },
+        {
+          "fact_id": "S04",
+          "heading": "持续通报",
+          "text": "P1事件在恢复之前每30分钟更新一次客户通报。通报应说明已确认的影响范围和下一次更新时间。",
+          "anchor_terms": [
+            "P1事件在恢复之前每30分钟更新一次客户通报。通报应说明已确认的影响范围和下一次更新时间。"
+          ]
+        },
+        {
+          "fact_id": "S05",
+          "heading": "受理渠道",
+          "text": "正式故障工单统一通过服务门户提交。即时消息仅用于协同，不能替代工单受理时间。",
+          "anchor_terms": [
+            "正式故障工单统一通过服务门户提交。即时消息仅用于协同，不能替代工单受理时间。"
+          ]
+        }
+      ]
+    },
+    {
+      "document_key": "security",
+      "filename": "05_数据安全规则.txt",
+      "title": "星岚科技数据安全规则",
+      "facts": [
+        {
+          "fact_id": "D01",
+          "heading": "信息分级",
+          "text": "数据分为L1公开、L2内部、L3机密三个等级。项目登记册仅声明范围，不能替代数据所有者的分级确认。",
+          "anchor_terms": [
+            "数据分为L1公开、L2内部、L3机密三个等级。项目登记册仅声明范围，不能替代数据所有者的分级确认。"
+          ]
+        },
+        {
+          "fact_id": "D02",
+          "heading": "外部传输限制",
+          "text": "L3级机密数据禁止导出到外部系统。脱敏方案必须单独审查，普通远程办公审批不构成导出许可。",
+          "anchor_terms": [
+            "L3级机密数据禁止导出到外部系统。脱敏方案必须单独审查，普通远程办公审批不构成导出许可。"
+          ]
+        },
+        {
+          "fact_id": "D03",
+          "heading": "临时权限",
+          "text": "临时访问权限最长有效24小时，须由数据所有者和安全部共同审批。到期自动撤销，不默认续期。",
+          "anchor_terms": [
+            "临时访问权限最长有效24小时，须由数据所有者和安全部共同审批。到期自动撤销，不默认续期。"
+          ]
+        },
+        {
+          "fact_id": "D04",
+          "heading": "审计留存",
+          "text": "权限与导出审计日志保留180天。只记录必要的操作元数据，不在日志中保存完整机密正文。",
+          "anchor_terms": [
+            "权限与导出审计日志保留180天。只记录必要的操作元数据，不在日志中保存完整机密正文。"
+          ]
+        },
+        {
+          "fact_id": "D05",
+          "heading": "安全区条件",
+          "text": "L3任务只允许在设有安全区的办公室执行。安全区的城市和部门分布以办公资源表为准。",
+          "anchor_terms": [
+            "L3任务只允许在设有安全区的办公室执行。安全区的城市和部门分布以办公资源表为准。"
+          ]
+        }
+      ]
+    },
+    {
+      "document_key": "archive_2025",
+      "filename": "06_归档制度2025.txt",
+      "title": "星岚科技归档制度（2025版，已失效）",
+      "facts": [
+        {
+          "fact_id": "A01",
+          "heading": "归档声明",
+          "text": "本文件自2026年7月1日起已失效，仅用于历史审计。当前申请应使用2026版制度，不得混用不同年份额度。",
+          "anchor_terms": [
+            "本文件自2026年7月1日起已失效，仅用于历史审计。当前申请应使用2026版制度，不得混用不同年份额度。"
+          ]
+        },
+        {
+          "fact_id": "A02",
+          "heading": "历史远程额度",
+          "text": "2025版规定工程部每周最多远程办公1天，运营部不安排常规远程办公。",
+          "anchor_terms": [
+            "2025版规定工程部每周最多远程办公1天，运营部不安排常规远程办公。"
+          ]
+        },
+        {
+          "fact_id": "A03",
+          "heading": "历史上海住宿",
+          "text": "2025版上海住宿上限为每人每晚550元，杭州为450元。以上金额不适用于2026年7月1日及之后的差旅。",
+          "anchor_terms": [
+            "2025版上海住宿上限为每人每晚550元，杭州为450元。以上金额不适用于2026年7月1日及之后的差旅。"
+          ]
+        },
+        {
+          "fact_id": "A04",
+          "heading": "历史报销规则",
+          "text": "2025版餐费上限为每人每天80元，报销提交时限为出差结束后15个工作日。",
+          "anchor_terms": [
+            "2025版餐费上限为每人每天80元，报销提交时限为出差结束后15个工作日。"
+          ]
+        }
+      ]
+    },
+    {
+      "document_key": "plans",
+      "filename": "07_套餐配额表.xlsx",
+      "title": "套餐配额表",
+      "facts": [
+        {
+          "fact_id": "PL01",
+          "heading": "基础版 100",
+          "text": "记录编号：PL01；套餐：基础版；存储上限(GB)：100；日请求上限(次)：1000；服务时间：工作日9:00至18:00",
+          "anchor_terms": [
+            "PL01",
+            "基础版",
+            "100",
+            "1000",
+            "工作日9:00至18:00"
+          ],
+          "sheet": "套餐配额",
+          "cell_range": "A4:E4"
+        },
+        {
+          "fact_id": "PL02",
+          "heading": "标准版 500",
+          "text": "记录编号：PL02；套餐：标准版；存储上限(GB)：500；日请求上限(次)：10000；服务时间：工作日9:00至18:00",
+          "anchor_terms": [
+            "PL02",
+            "标准版",
+            "500",
+            "10000",
+            "工作日9:00至18:00"
+          ],
+          "sheet": "套餐配额",
+          "cell_range": "A5:E5"
+        },
+        {
+          "fact_id": "PL03",
+          "heading": "企业版 2000",
+          "text": "记录编号：PL03；套餐：企业版；存储上限(GB)：2000；日请求上限(次)：50000；服务时间：7×24小时",
+          "anchor_terms": [
+            "PL03",
+            "企业版",
+            "2000",
+            "50000",
+            "7×24小时"
+          ],
+          "sheet": "套餐配额",
+          "cell_range": "A6:E6"
+        }
+      ],
+      "sheet": "套餐配额",
+      "headers": [
+        "记录编号",
+        "套餐",
+        "存储上限(GB)",
+        "日请求上限(次)",
+        "服务时间"
+      ],
+      "rows": [
+        [
+          "PL01",
+          "基础版",
+          100,
+          1000,
+          "工作日9:00至18:00"
+        ],
+        [
+          "PL02",
+          "标准版",
+          500,
+          10000,
+          "工作日9:00至18:00"
+        ],
+        [
+          "PL03",
+          "企业版",
+          2000,
+          50000,
+          "7×24小时"
+        ]
+      ]
+    },
+    {
+      "document_key": "offices",
+      "filename": "08_办公资源表.xlsx",
+      "title": "办公资源表",
+      "facts": [
+        {
+          "fact_id": "O01",
+          "heading": "上海 工程部",
+          "text": "记录编号：O01；城市：上海；部门：工程部；人数：18；会议室数：3；安全区：有",
+          "anchor_terms": [
+            "O01",
+            "上海",
+            "工程部",
+            "18",
+            "3",
+            "有"
+          ],
+          "sheet": "办公资源",
+          "cell_range": "A4:F4"
+        },
+        {
+          "fact_id": "O02",
+          "heading": "杭州 运营部",
+          "text": "记录编号：O02；城市：杭州；部门：运营部；人数：12；会议室数：2；安全区：无",
+          "anchor_terms": [
+            "O02",
+            "杭州",
+            "运营部",
+            "12",
+            "2",
+            "无"
+          ],
+          "sheet": "办公资源",
+          "cell_range": "A5:F5"
+        },
+        {
+          "fact_id": "O03",
+          "heading": "北京 研究部",
+          "text": "记录编号：O03；城市：北京；部门：研究部；人数：10；会议室数：2；安全区：有",
+          "anchor_terms": [
+            "O03",
+            "北京",
+            "研究部",
+            "10",
+            "2",
+            "有"
+          ],
+          "sheet": "办公资源",
+          "cell_range": "A6:F6"
+        },
+        {
+          "fact_id": "O04",
+          "heading": "上海 安全部",
+          "text": "记录编号：O04；城市：上海；部门：安全部；人数：6；会议室数：1；安全区：有",
+          "anchor_terms": [
+            "O04",
+            "上海",
+            "安全部",
+            "6",
+            "1",
+            "有"
+          ],
+          "sheet": "办公资源",
+          "cell_range": "A7:F7"
+        }
+      ],
+      "sheet": "办公资源",
+      "headers": [
+        "记录编号",
+        "城市",
+        "部门",
+        "人数",
+        "会议室数",
+        "安全区"
+      ],
+      "rows": [
+        [
+          "O01",
+          "上海",
+          "工程部",
+          18,
+          3,
+          "有"
+        ],
+        [
+          "O02",
+          "杭州",
+          "运营部",
+          12,
+          2,
+          "无"
+        ],
+        [
+          "O03",
+          "北京",
+          "研究部",
+          10,
+          2,
+          "有"
+        ],
+        [
+          "O04",
+          "上海",
+          "安全部",
+          6,
+          1,
+          "有"
+        ]
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "real-v1-01",
+      "question": "工程部正式员工按2026版制度每周最多远程办公几天？",
+      "reference_answer": "每周最多3天。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "R02"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-02",
+      "question": "按2026版标准，差旅结束后须在多少个工作日内提交报销？",
+      "reference_answer": "10个工作日内。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "T06"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-03",
+      "question": "晨星项目预计在哪一天发布？",
+      "reference_answer": "2026年10月20日。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "P01"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-04",
+      "question": "标准版P1故障的目标恢复时间是多久？",
+      "reference_answer": "8小时。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "S02"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-05",
+      "question": "临时访问权限最长有效多久，需要谁共同审批？",
+      "reference_answer": "最长24小时，由数据所有者和安全部共同审批。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "D03"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-06",
+      "question": "权限与导出审计日志保留多少天？",
+      "reference_answer": "180天。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "D04"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-07",
+      "question": "企业版的每日请求上限是多少次？",
+      "reference_answer": "50000次。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "PL03"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-08",
+      "question": "杭州运营部有多少人？",
+      "reference_answer": "12人。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "O02"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-09",
+      "question": "已归档的2025版制度规定工程部每周最多远程办公几天？",
+      "reference_answer": "1天。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "A02"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-10",
+      "question": "工程部每周的共同到岗日是哪一天？",
+      "reference_answer": "每周三。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "R04"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-11",
+      "question": "标准版套餐的存储上限是多少GB？",
+      "reference_answer": "500GB。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "PL02"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-12",
+      "question": "L3级机密数据可以导出到外部系统吗？",
+      "reference_answer": "不可以，L3级机密数据禁止导出到外部系统。",
+      "answerable": true,
+      "expected_route": "fast_rag",
+      "source_fact_ids": [
+        "D02"
+      ],
+      "category": "single-hop",
+      "tags": [
+        "single-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-13",
+      "question": "晨星项目归哪个城市的哪个部门负责？该部门正式员工按2026版制度每周最多远程办公几天？",
+      "reference_answer": "晨星项目由上海工程部负责，正式员工每周最多远程办公3天。",
+      "answerable": true,
+      "expected_route": "research",
+      "source_fact_ids": [
+        "P01",
+        "R02"
+      ],
+      "category": "multi-hop",
+      "tags": [
+        "multi-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-14",
+      "question": "去澄海项目的现场验收城市出差，按2026版标准每人每晚住宿上限是多少？",
+      "reference_answer": "澄海项目在杭州现场验收，住宿上限为每人每晚520元。",
+      "answerable": true,
+      "expected_route": "research",
+      "source_fact_ids": [
+        "P02",
+        "T01",
+        "T03"
+      ],
+      "category": "multi-hop",
+      "tags": [
+        "multi-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-15",
+      "question": "晨星项目使用哪个套餐，该套餐每天请求上限是多少？",
+      "reference_answer": "晨星项目使用企业版，每天请求上限为50000次。",
+      "answerable": true,
+      "expected_route": "research",
+      "source_fact_ids": [
+        "P01",
+        "PL03"
+      ],
+      "category": "multi-hop",
+      "tags": [
+        "multi-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-16",
+      "question": "晨星和澄海各按其登记套餐使用一个独立实例，两者每天请求上限合计多少次？",
+      "reference_answer": "晨星企业版50000次，澄海标准版10000次，合计60000次。",
+      "answerable": true,
+      "expected_route": "research",
+      "source_fact_ids": [
+        "P01",
+        "P02",
+        "PL03",
+        "PL02"
+      ],
+      "category": "multi-hop",
+      "tags": [
+        "multi-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-17",
+      "question": "办公资源表中上海工程部和上海安全部合计多少人、多少间会议室？",
+      "reference_answer": "工程部18人3间，安全部6人1间，合计24人、4间会议室。",
+      "answerable": true,
+      "expected_route": "research",
+      "source_fact_ids": [
+        "O01",
+        "O04"
+      ],
+      "category": "multi-hop",
+      "tags": [
+        "multi-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-18",
+      "question": "上海住宿上限从归档的2025版调整到2026版后，每人每晚提高多少元？",
+      "reference_answer": "从550元提高到680元，每人每晚提高130元。",
+      "answerable": true,
+      "expected_route": "research",
+      "source_fact_ids": [
+        "A03",
+        "T02"
+      ],
+      "category": "multi-hop",
+      "tags": [
+        "multi-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-19",
+      "question": "云帆项目的负责部门位于哪里，该部门办公室是否有处理L3任务所需的安全区？",
+      "reference_answer": "云帆由北京研究部负责，办公资源表显示北京研究部有安全区，满足L3任务关于安全区的地点条件。",
+      "answerable": true,
+      "expected_route": "research",
+      "source_fact_ids": [
+        "P03",
+        "O03",
+        "D05"
+      ],
+      "category": "multi-hop",
+      "tags": [
+        "multi-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-20",
+      "question": "晨星项目所用套餐在P1故障时首次响应和目标恢复时间分别多久？",
+      "reference_answer": "晨星使用企业版，P1首次响应上限15分钟，目标恢复时间4小时。",
+      "answerable": true,
+      "expected_route": "research",
+      "source_fact_ids": [
+        "P01",
+        "S01"
+      ],
+      "category": "multi-hop",
+      "tags": [
+        "multi-hop",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-21",
+      "question": "晨星项目的实际生产上线日期是哪一天？",
+      "reference_answer": "资料只给出预计发布日期，没有实际生产上线日期。",
+      "answerable": false,
+      "expected_route": "research",
+      "source_fact_ids": [],
+      "category": "unanswerable",
+      "tags": [
+        "unanswerable",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-22",
+      "question": "星岚科技2027年的营业收入是多少？",
+      "reference_answer": "资料未提供2027年营业收入，无法确定。",
+      "answerable": false,
+      "expected_route": "research",
+      "source_fact_ids": [],
+      "category": "unanswerable",
+      "tags": [
+        "unanswerable",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-23",
+      "question": "澄海项目生产服务器使用哪一款GPU？",
+      "reference_answer": "资料未提供澄海生产服务器的GPU型号，无法确定。",
+      "answerable": false,
+      "expected_route": "research",
+      "source_fact_ids": [],
+      "category": "unanswerable",
+      "tags": [
+        "unanswerable",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    },
+    {
+      "case_id": "real-v1-24",
+      "question": "星岚科技法定代表人的姓名是什么？",
+      "reference_answer": "资料未提供法定代表人姓名，无法确定。",
+      "answerable": false,
+      "expected_route": "research",
+      "source_fact_ids": [],
+      "category": "unanswerable",
+      "tags": [
+        "unanswerable",
+        "synthetic-chinese",
+        "corpus-v1"
+      ]
+    }
+  ]
+}

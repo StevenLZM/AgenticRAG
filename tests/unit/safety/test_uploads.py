@@ -40,6 +40,21 @@ def _zip_bytes() -> bytes:
     return payload.getvalue()
 
 
+@pytest.mark.parametrize("xml,expected", [
+    ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>', UploadSafetyStatus.ACCEPTED),
+    ('<Relationships>', UploadSafetyStatus.REJECTED),
+    ('<!DOCTYPE x [<!ENTITY bad SYSTEM "file:///etc/passwd">]><x>&bad;</x>', UploadSafetyStatus.REJECTED),
+])
+def test_standard_root_relationship_part_uses_xml_validation(scanner, xml, expected):
+    content = _xlsx_bytes(extra_entries={"_rels/.rels": xml})
+    result = scanner.scan(
+        "standard.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        content,
+    )
+    assert result.status == expected
+
+
 def _forge_eocd_entry_count(content: bytes, advertised_count: int) -> bytes:
     forged = bytearray(content)
     eocd_offset = forged.rfind(b"PK\x05\x06")

@@ -388,7 +388,7 @@ def test_markdown_table_separator_uses_exact_raw_body_offsets() -> None:
         assert canonical_slice == resolved_body
 
 
-def test_parent_builder_keeps_paragraph_and_list_transitions_separate() -> None:
+def test_parent_builder_coalesces_paragraph_and_list_transitions() -> None:
     canonical = _canonical(
         (
             _block(0, text=_words(0, 500)),
@@ -398,11 +398,11 @@ def test_parent_builder_keeps_paragraph_and_list_transitions_separate() -> None:
 
     parents = ParentBuilder(_tokenizer()).build(canonical)
 
-    assert [parent.content_type for parent in parents] == ["paragraph", "list_item"]
-    assert [resolve_ast_locator(canonical, parent.ast_locator) for parent in parents] == [
-        _words(0, 500),
-        _words(500, 500),
-    ]
+    assert len(parents) == 1
+    assert parents[0].content_type == "mixed"
+    assert resolve_ast_locator(canonical, parents[0].ast_locator) == "\n\n".join(
+        (_words(0, 500), _words(500, 500))
+    )
 
 
 def test_long_list_item_keeps_docling_list_structure_and_source_ranges() -> None:

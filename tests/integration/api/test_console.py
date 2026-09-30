@@ -81,9 +81,34 @@ process.stdout.write(JSON.stringify({
       provider_response: "Bearer never expose this provider output"
     }
   }),
+  llmDegradation: call("eventPresentation", {
+    event_type: "MODEL_RETRY",
+    summary: "degraded",
+    attributes: {
+      component: "llm",
+      reason: "provider_outage",
+      outcome: "degraded",
+      retryable: true,
+      attempt: 1,
+      operation: "graph.node.fast_rag.llm",
+      requested_model: "light-model",
+      protocol: "auto",
+      client_timeout_seconds: 30,
+      error_class: "APITimeoutError",
+      http_status: 503,
+      provider_request_id: "req_123",
+      prompt: "never expose this prompt"
+    }
+  }),
   notices: ["RETRIEVAL_DEGRADED", "CIRCUIT_OPEN", "MODEL_REPAIR_EXHAUSTED", "WORKER_DLQ", "AUDIT_REFUSED"].map((type) => call("noticeCodeForEvent", type)),
   terminal: ["research_action_invalid", "research_round_limit", "audit_failed", "cannot_answer", "refuse", "clarify"].map((status) => call("terminalNoticeCode", {answer: {status}})),
   memory: call("memoryErrorPresentation", "provider unavailable"),
+  chat: call("answerPresentation", {answer: {
+    route: "chat", segments: [{kind: "content", text: "了解", evidence_ids: []}]
+  }}),
+  invalidChat: call("answerPresentation", {answer: {
+    route: "chat", audited: true, segments: [{kind: "content", text: "了解"}]
+  }}),
   provenance: call("provenanceFor", {evidence_parent_ids: ["parent-1"], route: "research", client_provenance: "api"}, {runtime_config_snapshot_id: "snapshot-1"}),
   answer: call("answerPresentation", {
     runtime_config_snapshot_id: "snapshot-1",
@@ -129,6 +154,7 @@ async def test_console_serves_same_origin_html_and_static_assets() -> None:
         style = await client.get("/static/app.css")
 
     assert page.status_code == script.status_code == style.status_code == 200
+    assert script.headers.get("cache-control") == "no-cache"
     assert all(f'id="{element_id}"' in page.text for element_id in STABLE_DOM_IDS)
     assert "localStorage" not in script.text
 
@@ -148,16 +174,17 @@ async def test_console_static_mount_rejects_non_asset_files() -> None:
 def test_console_client_contract_preserves_scope_and_safe_terminal_states() -> None:
     contract = _console_contract()
 
-    assert contract["query"] == {"query": "需要检索的问题", "wait_seconds": 30}
+    assert contract["chat"]["text"] == "了解"
+    assert contract["chat"]["audit"] == {}
+    assert contract["chat"]["provenance"]["route"] == "chat"
+    assert contract["invalidChat"] is None
+
+    assert contract["query"] == {"query": "需要检索的问题", "wait_seconds": 0}
     assert contract["headers"] == [
         {"Accept": "text/event-stream"},
         {"Accept": "text/event-stream", "Last-Event-ID": "17"},
     ]
-    assert contract["unknown"] == {
-        "label": "进度更新",
-        "summary": "进度更新",
-        "noticeCode": None,
-    }
+    assert contract["unknown"] is None
     assert contract["degradation"] == {
         "label": "RETRIEVAL_DEGRADED",
         "summary": "degraded",
@@ -167,6 +194,25 @@ def test_console_client_contract_preserves_scope_and_safe_terminal_states() -> N
             "component": "dense",
             "outcome": "degraded",
             "reason": "lane_timeout",
+            "retryable": True,
+        },
+    }
+    assert contract["llmDegradation"] == {
+        "label": "MODEL_RETRY",
+        "summary": "degraded",
+        "noticeCode": None,
+        "attributes": {
+            "attempt": 1,
+            "client_timeout_seconds": 30,
+            "component": "llm",
+            "error_class": "APITimeoutError",
+            "http_status": 503,
+            "operation": "graph.node.fast_rag.llm",
+            "outcome": "degraded",
+            "protocol": "auto",
+            "provider_request_id": "req_123",
+            "reason": "provider_outage",
+            "requested_model": "light-model",
             "retryable": True,
         },
     }
@@ -229,3 +275,10 @@ async def test_console_mem0_provider_failure_is_not_an_empty_list() -> None:
 
     assert response.status_code == 503
     assert response.json()["error_code"] == "MEMORY_UNAVAILABLE"
+
+
+def test_console_route_timeline_and_chat_dom_flow() -> None:
+    subprocess.run(
+        ["node", str(Path(__file__).with_name("console_flow.cjs")), str(CONSOLE_PATH)],
+        check=True, capture_output=True, text=True,
+    )

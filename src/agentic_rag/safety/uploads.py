@@ -372,7 +372,9 @@ class _UnsafeXmlPart(ValueError):
 
 def _is_safe_ooxml_part_content(workbook: ZipFile, entry: ZipInfo) -> bool:
     suffix = Path(entry.filename).suffix.lower()
-    if suffix in _XML_PART_SUFFIXES:
+    # The standard root relationship part is named `_rels/.rels`; pathlib
+    # considers that basename a dotfile with no suffix, but it is still XML.
+    if entry.filename.lower().endswith(_XML_PART_SUFFIXES):
         return _is_well_formed_xml_part(workbook, entry)
     expected_signatures = _IMAGE_PART_SIGNATURES.get(suffix)
     if expected_signatures is None:

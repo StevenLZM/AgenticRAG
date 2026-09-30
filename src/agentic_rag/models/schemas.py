@@ -8,11 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 class RouteDecision(BaseModel):
-    """The only two routes that a query may take after memory loading."""
+    """Chat, single-retrieval, or research routing after memory loading."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    route: Literal["fast_rag", "research"]
+    route: Literal["chat", "fast_rag", "research"]
     normalized_query: str = Field(min_length=1, max_length=8_000)
     reason_code: str = Field(min_length=1, max_length=256)
 

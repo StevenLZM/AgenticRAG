@@ -31,6 +31,22 @@ _DOCLING_COLLECTIONS = (
     "field_items",
 )
 
+# Layout repair is deliberately conservative.  These values are kept local to
+# the canonical assembler so every source type uses the same deterministic
+# relationship contract and no query/document classifier can influence it.
+_DATE_ATOM = (
+    r"(?:\d{4}(?:[./-]\s*\d{1,2})?(?:年\s*\d{1,2}月?)?|"
+    r"\d{1,2}[./-]\s*\d{4})"
+)
+_DATE_RANGE_RE = re.compile(
+    rf"^\s*{_DATE_ATOM}\s*[-–—~～至到]\s*"
+    rf"(?:{_DATE_ATOM}|至今|现在|今|present|current)\s*$",
+    re.IGNORECASE,
+)
+_LAYOUT_VERTICAL_OVERLAP_THRESHOLD = 0.6
+_LAYOUT_METADATA_BAND_FRACTION = 0.05
+_LAYOUT_GEOMETRY_TIE_TOLERANCE = 1e-9
+
 
 class AstAssemblyError(ValueError):
     """Raised when source provenance or Docling references fail closed."""
@@ -189,6 +205,11 @@ class _Candidate:
     continued_from_previous: bool
     continues_on_next: bool
     continuation_id: str | None
+    # Kept private to the assembler so layout/form blocks can never be treated
+    # as standalone date metadata.  Empty values preserve compatibility for
+    # unit-level candidates constructed without Docling collection labels.
+    block_label: str = ""
+    source_collection: str = ""
 
 
 class GlobalAssembler:
@@ -214,6 +235,7 @@ class GlobalAssembler:
         _validate_fragment_graphs(ordered_fragments)
         known_refs = _known_references(ordered_fragments)
         candidates = _normalize_reading_order(ordered_fragments, known_refs)
+        candidates = _associate_aligned_date_ranges(candidates)
         candidates = _join_cross_page_content(
             candidates, namespace=envelope.document_version_id
         )
@@ -251,21 +273,25 @@ def _normalize_reading_order(
     for fragment in fragments:
         doc = fragment.docling_document
         body_order = _body_reading_order(doc)
-        raw_blocks: list[Mapping[str, Any]] = []
+        raw_blocks: list[tuple[str, Mapping[str, Any]]] = []
         custom_blocks = doc.get("blocks")
         if isinstance(custom_blocks, list):
             raw_blocks.extend(
-                item for item in custom_blocks if isinstance(item, Mapping)
+                ("blocks", item)
+                for item in custom_blocks
+                if isinstance(item, Mapping)
             )
         else:
             for collection in ("texts", "tables", "key_value_items"):
                 items = doc.get(collection, [])
                 if isinstance(items, list):
                     raw_blocks.extend(
-                        item for item in items if isinstance(item, Mapping)
+                        (collection, item)
+                        for item in items
+                        if isinstance(item, Mapping)
                     )
 
-        for raw in raw_blocks:
+        for source_collection, raw in raw_blocks:
             text = _block_text(raw)
             if not text.strip():
                 continue
@@ -320,6 +346,8 @@ def _normalize_reading_order(
                         if raw.get("continuation_id") is not None
                         else None
                     ),
+                    block_label=label,
+                    source_collection=source_collection,
                 )
             )
             source_order += 1
@@ -331,6 +359,156 @@ def _normalize_reading_order(
             item.reading_order if item.reading_order is not None else item.source_order,
             item.source_order,
         ),
+    )
+
+
+def _associate_aligned_date_ranges(
+    candidates: Sequence[_Candidate],
+) -> list[_Candidate]:
+    """Relate high-confidence right-hand date ranges to left-hand headings.
+
+    Docling's graph order is the baseline.  This pass only moves a standalone
+    date block when the page demonstrates a repeated, unambiguous metadata band;
+    otherwise the exact candidate sequence is returned unchanged.
+    """
+    if len(candidates) < 4:
+        return list(candidates)
+
+    by_page: dict[int, list[tuple[int, _Candidate, tuple[float, float, float, float]]]] = {}
+    for index, candidate in enumerate(candidates):
+        geometry = _single_page_bbox(candidate)
+        if geometry is None:
+            continue
+        page_no, bbox = geometry
+        by_page.setdefault(page_no, []).append((index, candidate, bbox))
+
+    associations: dict[int, int] = {}
+    for page_candidates in by_page.values():
+        pairs = _page_date_heading_pairs(page_candidates)
+        if len(pairs) < 2:
+            continue
+        page_left = min(bbox[0] for _, _, bbox in page_candidates)
+        page_right = max(bbox[2] for _, _, bbox in page_candidates)
+        page_width = max(0.0, page_right - page_left)
+        band_tolerance = max(1.0, page_width * _LAYOUT_METADATA_BAND_FRACTION)
+        for anchor in pairs:
+            band = [
+                pair
+                for pair in pairs
+                if abs(pair[3] - anchor[3]) <= band_tolerance
+            ]
+            if len({pair[1] for pair in band}) < 2:
+                continue
+            for date_index, heading_index, _score, _date_left in band:
+                associations[date_index] = heading_index
+            break
+
+    if not associations:
+        return list(candidates)
+
+    dates_by_heading: dict[int, list[int]] = {}
+    for date_index, heading_index in associations.items():
+        dates_by_heading.setdefault(heading_index, []).append(date_index)
+    output: list[_Candidate] = []
+    for index, candidate in enumerate(candidates):
+        if index in associations:
+            continue
+        output.append(candidate)
+        for date_index in sorted(dates_by_heading.get(index, ())):
+            output.append(candidates[date_index])
+    return output
+
+
+def _page_date_heading_pairs(
+    page_candidates: Sequence[
+        tuple[int, _Candidate, tuple[float, float, float, float]]
+    ],
+) -> list[tuple[int, int, float, float]]:
+    headings = [
+        item for item in page_candidates if item[1].kind == "heading"
+    ]
+    dates = [
+        item
+        for item in page_candidates
+        if item[1].role is None
+        and item[1].kind in {"paragraph", "other"}
+        and _is_standalone_body_candidate(item[1])
+        and _DATE_RANGE_RE.fullmatch(item[1].text) is not None
+    ]
+    pairs: list[tuple[int, int, float, float]] = []
+    for date_index, _date, date_bbox in dates:
+        if not headings:
+            continue
+        candidates_for_date: list[tuple[int, float, float]] = []
+        for heading_index, _heading, heading_bbox in headings:
+            if heading_bbox[2] > date_bbox[0]:
+                continue
+            overlap = _vertical_overlap_ratio(heading_bbox, date_bbox)
+            if overlap < _LAYOUT_VERTICAL_OVERLAP_THRESHOLD:
+                continue
+            distance = max(0.0, date_bbox[0] - heading_bbox[2])
+            candidates_for_date.append((heading_index, overlap, distance))
+        if not candidates_for_date:
+            continue
+        ranked = sorted(
+            candidates_for_date,
+            key=lambda item: (-item[1], item[2], item[0]),
+        )
+        best = ranked[0]
+        if len(ranked) > 1 and _geometry_scores_tie(best, ranked[1]):
+            continue
+        pairs.append((date_index, best[0], best[1], date_bbox[0]))
+    return pairs
+
+
+_NON_BODY_COLLECTIONS = frozenset(
+    {"key_value_items", "form_items", "field_regions", "field_items", "pictures"}
+)
+_NON_BODY_LABEL_MARKERS = frozenset(
+    {"form", "field", "key_value", "picture", "image", "furniture", "header", "footer"}
+)
+
+
+def _is_standalone_body_candidate(candidate: _Candidate) -> bool:
+    """Reject form/furniture/picture metadata while allowing plain text blocks."""
+    if candidate.source_collection in _NON_BODY_COLLECTIONS:
+        return False
+    label = candidate.block_label.casefold()
+    return not any(marker in label for marker in _NON_BODY_LABEL_MARKERS)
+
+
+def _single_page_bbox(
+    candidate: _Candidate,
+) -> tuple[int, tuple[float, float, float, float]] | None:
+    """Return geometry only when provenance is a single unambiguous region."""
+    regions = candidate.provenance.regions
+    if len(regions) != 1:
+        return None
+    region = regions[0]
+    if region.bbox is None:
+        return None
+    left, right = sorted((region.bbox[0], region.bbox[2]))
+    top, bottom = sorted((region.bbox[1], region.bbox[3]))
+    if right <= left or bottom <= top:
+        return None
+    return region.page_no, (left, top, right, bottom)
+
+
+def _vertical_overlap_ratio(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    overlap = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
+    smaller_height = min(left[3] - left[1], right[3] - right[1])
+    return overlap / smaller_height if smaller_height > 0 else 0.0
+
+
+def _geometry_scores_tie(
+    left: tuple[int, float, float], right: tuple[int, float, float]
+) -> bool:
+    return (
+        abs(left[1] - right[1]) <= _LAYOUT_GEOMETRY_TIE_TOLERANCE
+        and abs(left[2] - right[2]) <= _LAYOUT_GEOMETRY_TIE_TOLERANCE
     )
 
 

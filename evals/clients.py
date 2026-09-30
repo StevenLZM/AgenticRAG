@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hashlib
+import fcntl
+from pathlib import Path
+from uuid import uuid4
 from collections.abc import Mapping
 from typing import Any, cast
 
 from agentic_rag.domain.models import UserScope
+from agentic_rag.query.public_answer import project_public_answer
 from agentic_rag.query.graph import query_checkpoint_config
 from agentic_rag.query.state import new_query_state
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 from evals.models import EvaluationCase
+from evals.report import atomic_write_text
 
 
 class EvaluationClientError(RuntimeError):
@@ -71,6 +77,8 @@ class HttpQueryClient:
         timeout_seconds: float = 60.0,
         poll_interval_seconds: float = 0.25,
         http_client: object | None = None,
+        collector: object | None = None,
+        ledger_dir: Path | None = None,
     ) -> None:
         if not base_url.strip():
             raise ValueError("base_url must not be blank")
@@ -79,6 +87,8 @@ class HttpQueryClient:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
+        self._collector = collector
+        self._ledger_dir = Path(ledger_dir) if ledger_dir is not None else None
         if http_client is None:
             try:
                 import httpx
@@ -89,31 +99,64 @@ class HttpQueryClient:
         self._owns_client = http_client.__class__.__module__.startswith("httpx")
 
     async def query(self, case: EvaluationCase) -> Mapping[str, object]:
-        response = await self._request(
-            "post",
-            "/v1/query-runs",
-            json={
-                "query": case.question,
-                "thread_id": f"eval-{case.case_id}",
-                "wait_seconds": 0,
-            },
-        )
-        created = _response_json(response)
-        run_id = created.get("run_id")
-        if not isinstance(run_id, str) or not run_id.strip():
-            raise EvaluationClientError("Query API omitted run_id")
+        if self._collector is None:
+            raise EvaluationClientError("API quality evaluation requires a scoped runtime collector")
+        if self._ledger_dir is None:
+            raise EvaluationClientError("API evaluation requires a durable query ledger")
+        self._ledger_dir.mkdir(parents=True, exist_ok=True)
+        path = self._ledger_dir / f"{case.case_id}.json"
+        with path.with_suffix(".lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise EvaluationClientError("query ledger already in use") from error
+            return await self._query_locked(case, path)
+
+    async def _query_locked(self, case: EvaluationCase, path: Path) -> Mapping[str, object]:
+        binding = {"case_sha256": hashlib.sha256(case.model_dump_json().encode()).hexdigest(),
+                   "base_url": self._base_url}
+        if path.exists():
+            record = json.loads(path.read_text())
+            if any(record.get(key) != value for key, value in binding.items()):
+                raise EvaluationClientError("query ledger binding changed; use a new output directory")
+            if not record.get("run_id"):
+                raise EvaluationClientError("uncertain submission requires reconciliation; refusing another POST")
+        else:
+            record = {**binding, "thread_id": f"eval-{uuid4()}", "status": "submitting"}
+
+        def persist():
+            atomic_write_text(path, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
+
+        if not record.get("run_id"):
+            persist()  # Crash/timeout leaves an uncertain request, never permission to resubmit.
+            response = await self._request("post", "/v1/query-runs", json={
+                "query": case.question, "thread_id": record["thread_id"], "wait_seconds": 0,
+            })
+            created = _response_json(response)
+            run_id = created.get("run_id")
+            if not isinstance(run_id, str) or not run_id.strip():
+                raise EvaluationClientError("Query API omitted run_id")
+            record.update(run_id=run_id, status="submitted")
+            persist()
+        run_id = record["run_id"]
 
         deadline = asyncio.get_running_loop().time() + self._timeout_seconds
         final: Mapping[str, object] | None = None
         while asyncio.get_running_loop().time() < deadline:
             response = await self._request("get", f"/v1/query-runs/{run_id}")
             current = _response_json(response)
+            if current.get("run_id") != run_id:
+                raise EvaluationClientError("Query API returned another run_id")
             status = current.get("status")
             if status in {"completed", "failed", "cancelled"}:
                 final = current
+                record.update(status=status)
+                persist()
                 break
             await asyncio.sleep(self._poll_interval_seconds)
         if final is None:
+            record.update(status="poll_timeout")
+            persist()
             raise EvaluationClientError("Query API did not reach a terminal Run state")
         snapshot_id = final.get("runtime_config_snapshot_id")
         if snapshot_id != case.runtime_config_snapshot_id:
@@ -124,15 +167,30 @@ class HttpQueryClient:
         answer = final.get("answer")
         if not isinstance(answer, Mapping):
             raise EvaluationClientError("completed Query API Run omitted audited answer")
+        observed = await self._collector.collect(
+            run_id=run_id, user_id=case.user_id,
+            snapshot_id=case.runtime_config_snapshot_id, question=case.question,
+        )
+        http_answer = project_public_answer(answer, runtime_config_snapshot_id=snapshot_id)
+        stored_answer = project_public_answer(observed["answer"], runtime_config_snapshot_id=snapshot_id)
+        if (answer.get("runtime_config_snapshot_id") not in {None, snapshot_id}
+                or http_answer is None or http_answer != stored_answer):
+            raise EvaluationClientError("HTTP answer differs from collected public answer")
+        record.update(status="collected")
+        persist()
         return {
+            "run_id": run_id,
             "runtime_config_snapshot_id": snapshot_id,
             "answer": dict(answer),
             "evidence_parent_ids": list(_parent_ids_from_answer(answer)),
-            "ranked_parent_ids": list(_parent_ids_from_answer(answer)),
-            "route": case.expected_route,
+            "ranked_parent_ids": observed["ranked_parent_ids"],
+            "route": observed["route"],
+            "retrieval_rounds": observed["retrieval_rounds"],
+            "ranking_scope": observed["ranking_scope"],
+            "final_context_parent_ids": observed["final_context_parent_ids"],
             "events_ref": f"inline://api-events/{case.case_id}",
             "events": events,
-            "contexts": [],
+            "contexts": observed["contexts"],
             "citation_coverage": _citation_coverage_from_answer(answer),
             "audited": answer.get("audited") is True,
             "client_provenance": self.provenance,

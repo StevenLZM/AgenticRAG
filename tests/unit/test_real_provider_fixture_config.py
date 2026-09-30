@@ -53,6 +53,19 @@ def test_real_runtime_exposes_the_seeded_parent_for_api_evidence_assertions() ->
     assert runtime.seeded_parent_id == "seeded-parent"
 
 
+def test_seeded_runtime_fixture_labels_its_summary_as_contract_only() -> None:
+    """A direct seed or deterministic embedding cannot become a quality score."""
+    summary = query_services._contract_only_fixture_summary("fixture-snapshot")
+
+    assert summary["fixture_kind"] == "contract_only"
+    assert summary["evaluation_mode"] == "contract"
+    assert summary["client_provenance"] == "contract_fixture"
+    assert summary["quality_measurement"] is False
+    assert summary["real_query_count"] == 0
+    assert summary["completed_cases"] == 0
+    assert summary["requested_cases"] == 0
+
+
 class _CleanupResult:
     def __init__(self, values: list[str] | None = None) -> None:
         self._values = values or []

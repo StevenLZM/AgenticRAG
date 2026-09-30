@@ -76,7 +76,12 @@ def test_runtime_snapshot_applies_contract_defaults_and_bounds():
     """Runtime execution limits have safe defaults and reject over-limit work."""
     snapshot = RuntimeConfigSnapshot(**SNAPSHOT_DATA)
 
-    assert snapshot.max_research_rounds == 4
+    assert snapshot.max_research_rounds == 6
+    assert RuntimeConfigSnapshot(
+        **SNAPSHOT_DATA, max_research_rounds=8
+    ).max_research_rounds == 8
+    with pytest.raises(ValidationError):
+        RuntimeConfigSnapshot(**SNAPSHOT_DATA, max_research_rounds=9)
     with pytest.raises(ValidationError):
         RuntimeConfigSnapshot(**SNAPSHOT_DATA, max_parallel_subagents_per_run=4)
 

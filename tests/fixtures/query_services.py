@@ -88,18 +88,11 @@ from agentic_rag.observability.logging import AgentEventEmitter
 from agentic_rag.observability.tracing import TraceRecorder
 from agentic_rag.persistence.lifecycle import SqlAlchemyPublicationRepository
 from agentic_rag.persistence.outbox import OutboxDispatcher
-from evals.clients import HttpQueryClient
-from evals.models import EvaluationCase
-from evals.report import write_summary
-from evals.run import EvalRunner
 from scripts.real_acceptance_evidence import (
-    ServiceBackupResources,
     create_isolated_mysql_database,
     drop_isolated_mysql_database,
-    exercise_query_worker_recovery,
     isolated_mysql_dsn,
     require_service_backup_admin_dsn,
-    run_service_backup_restore,
     service_backup_configuration_issue,
 )
 from scripts.run_query_worker import TransactionalQueryOutboxAdapter
@@ -147,6 +140,20 @@ class _FixedEmbedding:
 class _FixedCrossEncoder:
     def predict(self, pairs: Sequence[tuple[str, str]]) -> Sequence[float]:
         return [1.0 for _ in pairs]
+
+
+def _contract_only_fixture_summary(snapshot_id: str) -> dict[str, object]:
+    """Describe seeded/deterministic fixtures without advertising quality evidence."""
+    return {
+        "fixture_kind": "contract_only",
+        "evaluation_mode": "contract",
+        "client_provenance": "contract_fixture",
+        "quality_measurement": False,
+        "runtime_config_snapshot_id": snapshot_id,
+        "real_query_count": 0,
+        "requested_cases": 0,
+        "completed_cases": 0,
+    }
 
 
 class _DeterministicResponses:
@@ -781,13 +788,14 @@ async def real_query_fixture(tmp_path: Path) -> AsyncIterator[RealQueryFixture]:
 
 
 class RealQueryRuntime(RealQueryFixture):
-    """One opt-in live-provider runtime behind the public ASGI console API.
+    """One opt-in live-provider runtime used only for protocol-smoke checks.
 
     The fixture creates the production container once, then shares it between
     the API and ``QueryWorker``.  Its only synthetic collaborator is the
     deterministic vector used to seed a disposable Elasticsearch generation;
     query-time DeepSeek, Qwen, reranker and Mem0 clients all come from the
-    production composition root.
+    production composition root.  Its direct seed means it must never be
+    presented as a business-quality RAG evaluation.
     """
 
     def __init__(
@@ -799,10 +807,7 @@ class RealQueryRuntime(RealQueryFixture):
         client: httpx.AsyncClient,
         app_lifespan: Any,
         parent_id: str,
-        evaluation_output: Path,
         broker: IsolatedQueryBroker,
-        admin_mysql_dsn: str,
-        source_mysql_database: str,
     ) -> None:
         super().__init__(
             settings=settings,
@@ -817,9 +822,6 @@ class RealQueryRuntime(RealQueryFixture):
             "How many days notice does the seeded production document require?"
         )
         self._parent_id = parent_id
-        self._evaluation_output = evaluation_output
-        self._admin_mysql_dsn = admin_mysql_dsn
-        self._source_mysql_database = source_mysql_database
         self._isolated_broker = broker
         self._evaluation_summary: Mapping[str, object] | None = None
         self.memory_boundary: dict[str, bool] = {"read": False, "write": False}
@@ -949,81 +951,10 @@ class RealQueryRuntime(RealQueryFixture):
         raise RuntimeError("Mem0 write boundary did not return the stored acceptance marker")
 
     async def run_evaluation(self) -> None:
-        """Run EvalRunner via HttpQueryClient, never via a fixture query client."""
-        case = EvaluationCase.model_validate(
-            {
-                "case_id": f"real-console-api-{uuid4().hex}",
-                "user_id": self.settings.default_user_id,
-                "question": self.seeded_question,
-                "reference_answer": (
-                    "The seeded production document requires thirty days notice."
-                ),
-                "reference_parent_ids": [self._parent_id],
-                "expected_route": "fast_rag",
-                "tags": ["real-provider", "api", "console", "mem0"],
-                "runtime_config_snapshot_id": self.snapshot.snapshot_id,
-            }
+        """Retain the fixture hook as a protocol-smoke marker, not an evaluation."""
+        self._evaluation_summary = _contract_only_fixture_summary(
+            self.snapshot.snapshot_id
         )
-        summary = await EvalRunner(
-            HttpQueryClient(
-                "http://real-query",
-                http_client=self.client,
-                timeout_seconds=180,
-            ),
-            output_dir=self._evaluation_output,
-            evaluation_mode="api",
-            client_provenance=HttpQueryClient.provenance,
-        ).run(
-            [case],
-            recovery_drill_passed=False,
-            backup_restore_passed=False,
-        )
-        recovery_evidence, checkpoint_thread_id = await exercise_query_worker_recovery(
-            client=self.client,
-            container=self.container,
-            broker=self._isolated_broker,
-            user_id=self.settings.default_user_id,
-            snapshot_id=self.snapshot.snapshot_id,
-            parent_id=self._parent_id,
-            stop_worker=self._stop_worker_for_restart,
-            start_worker=self.start_worker,
-        )
-        await self._stop_worker_for_restart()
-        try:
-            backup_evidence = await run_service_backup_restore(
-                ServiceBackupResources(
-                    working_root=self._evaluation_output.parent,
-                    artifact_root=self.settings.artifact_root,
-                    query_checkpoint_path=self.settings.query_checkpoint_path,
-                    source_mysql_dsn=self.settings.mysql_dsn,
-                    source_mysql_database=self._source_mysql_database,
-                    admin_mysql_dsn=self._admin_mysql_dsn,
-                    redis_dsn=self.settings.redis_url,
-                    source_redis_prefix=self._isolated_broker.key_prefix,
-                    elasticsearch_url=self.settings.elasticsearch_url,
-                    source_index_generation=self.settings.index_generation,
-                    source_run_id=str(recovery_evidence["source_run_id"]),
-                    checkpoint_thread_id=checkpoint_thread_id,
-                    parent_id=self._parent_id,
-                    runtime_config_snapshot_id=self.snapshot.snapshot_id,
-                    app_version=self.snapshot.app_version,
-                )
-            )
-        finally:
-            await self.start_worker()
-        summary.update(
-            {
-                "recovery_drill_passed": True,
-                "backup_restore_passed": True,
-                "recovery_evidence": recovery_evidence,
-                "backup_restore_evidence": backup_evidence,
-            }
-        )
-        summary["memory_provider_available"] = bool(
-            getattr(self.container.memory_service, "available", False)
-        )
-        write_summary(self._evaluation_output / "summary.json", summary)
-        self._evaluation_summary = summary
 
     async def close(self) -> None:
         """Tear down every real boundary even when the worker already failed."""
@@ -1160,7 +1091,7 @@ async def _cleanup_real_provider_boundaries(
 
 @pytest.fixture
 async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
-    """Opt-in live provider fixture; setup errors fail instead of becoming a pass."""
+    """Opt-in live provider protocol fixture; it produces no quality report."""
     settings = _require_real_provider_services(tmp_path)
     admin_mysql_dsn = require_service_backup_admin_dsn()
     suffix = settings.index_generation.removeprefix("real-query-")
@@ -1223,10 +1154,7 @@ async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
             client=client,
             app_lifespan=app_lifespan,
             parent_id=parent_id,
-            evaluation_output=tmp_path / "evaluation",
             broker=isolated_broker,
-            admin_mysql_dsn=admin_mysql_dsn,
-            source_mysql_database=source_mysql_database,
         )
         await runtime.start_worker()
         await runtime.exercise_memory_boundary()

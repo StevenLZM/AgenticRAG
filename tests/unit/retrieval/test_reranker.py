@@ -100,6 +100,8 @@ async def test_reranker_orders_hits_by_cross_encoder_score(
     result = await service.rerank("query", candidates, limit=2)
 
     assert [item.child_id for item in result.hits] == ["b", "c"]
+    assert [item.rerank_score for item in result.hits] == [0.9, 0.5]
+    assert [item.retrieval_score for item in result.hits] == [1.0, 1.0]
     assert result.degraded is False
     assert result.model_version == "fake-cross-encoder-v1"
     assert service.model.calls == [[("query", item.content) for item in candidates]]

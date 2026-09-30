@@ -47,7 +47,7 @@ def ndcg_at_k(ranked_ids: Sequence[str], relevant_ids: Set[str], k: int) -> floa
         for value, rank in retrieved
         if value in relevant
     )
-    ideal_count = min(cutoff, len(relevant))
+    ideal_count = min(k, len(relevant))
     ideal = sum(1.0 / math.log2(index + 2) for index in range(ideal_count))
     return dcg / ideal if ideal else 0.0
 

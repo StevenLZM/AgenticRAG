@@ -6,11 +6,13 @@ from typing import Any, cast
 
 import pytest
 from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
-from elasticsearch.exceptions import BadRequestError
+from elasticsearch.exceptions import BadRequestError, NotFoundError
 
 from agentic_rag.ingestion.chunker import AstLocator, AstSpan, ChildChunk
 from agentic_rag.ingestion.indexer import EmbeddedChild, StagingContext
 from agentic_rag.persistence.elasticsearch import (
+    ACTIVE_CHILD_INDEX_ALIAS,
+    ChildIndexMappingError,
     ChildIndexWriteError,
     ElasticsearchChildIndexStore,
 )
@@ -24,6 +26,10 @@ class _Response:
 class _Indices:
     def __init__(self, *, existing_mapping: dict[str, Any] | None = None) -> None:
         self.mappings = existing_mapping
+        self.indices: set[str] = {"agenticrag-children-index-v2"} if existing_mapping else set()
+        self.aliases: dict[str, set[str]] = {}
+        self.alias_updates: list[list[dict[str, Any]]] = []
+        self.put_alias_calls: list[dict[str, str]] = []
         self.create_calls = 0
         self.get_mapping_calls = 0
 
@@ -32,12 +38,38 @@ class _Indices:
         if self.mappings is not None:
             raise _already_exists(index)
         self.mappings = mappings
+        self.indices.add(index)
         return _Response({"acknowledged": True})
+
+    async def exists(self, *, index: str) -> bool:
+        return index in self.indices
 
     async def get_mapping(self, *, index: str) -> _Response:
         self.get_mapping_calls += 1
         assert self.mappings is not None
         return _Response({index: {"mappings": self.mappings}})
+
+    async def get_alias(self, *, name: str) -> _Response:
+        targets = self.aliases.get(name)
+        if not targets:
+            raise _not_found(name)
+        return _Response({index: {"aliases": {name: {}}} for index in targets})
+
+    async def put_alias(self, *, index: str, name: str) -> _Response:
+        self.put_alias_calls.append({"index": index, "name": name})
+        self.aliases.setdefault(name, set()).add(index)
+        return _Response({"acknowledged": True})
+
+    async def update_aliases(self, *, actions: list[dict[str, Any]]) -> _Response:
+        self.alias_updates.append(actions)
+        for action in actions:
+            if "remove" in action:
+                payload = action["remove"]
+                self.aliases.get(payload["alias"], set()).discard(payload["index"])
+            if "add" in action:
+                payload = action["add"]
+                self.aliases.setdefault(payload["alias"], set()).add(payload["index"])
+        return _Response({"acknowledged": True})
 
 
 class _Client:
@@ -154,6 +186,20 @@ def _already_exists(index: str) -> BadRequestError:
     )
 
 
+def _not_found(alias: str) -> NotFoundError:
+    return NotFoundError(
+        "alias not found",
+        ApiResponseMeta(
+            status=404,
+            http_version="1.1",
+            headers=HttpHeaders(),
+            duration=0.0,
+            node=NodeConfig("http", "localhost", 9200),
+        ),
+        {"error": {"type": "alias_not_found_exception", "reason": alias}, "status": 404},
+    )
+
+
 def _base_v1_strict_mapping() -> dict[str, Any]:
     return {
         "dynamic": "strict",
@@ -213,7 +259,7 @@ async def test_legacy_index_v1_fails_closed_before_bulk() -> None:
     store = ElasticsearchChildIndexStore(cast(Any, client))
     context = _context(index_generation="index-v1")
 
-    with pytest.raises(ChildIndexWriteError, match="index-v1.*index-v2"):
+    with pytest.raises(ChildIndexMappingError, match="index-v1.*index-v3"):
         await store.stage(
             context,
             [_embedded_child(index_generation="index-v1")],
@@ -245,6 +291,91 @@ async def test_compatible_existing_index_is_an_idempotent_retry_boundary() -> No
     assert client.indices.create_calls == 2
     assert client.indices.get_mapping_calls == 1
     assert client.bulk_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_missing_active_alias_is_created_for_existing_index() -> None:
+    client = _Client()
+    store = ElasticsearchChildIndexStore(cast(Any, client))
+
+    await store.stage(_context(), [_embedded_child()])
+
+    assert await store.ensure_active_alias("index-v2") is True
+    assert client.indices.aliases == {
+        ACTIVE_CHILD_INDEX_ALIAS: {"agenticrag-children-index-v2"}
+    }
+    assert client.indices.put_alias_calls == [
+        {"index": "agenticrag-children-index-v2", "name": ACTIVE_CHILD_INDEX_ALIAS}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_missing_physical_index_keeps_alias_pending() -> None:
+    client = _Client()
+    store = ElasticsearchChildIndexStore(cast(Any, client))
+
+    assert await store.ensure_active_alias("index-v2") is False
+    assert client.indices.put_alias_calls == []
+
+
+@pytest.mark.asyncio
+async def test_existing_active_alias_is_not_silently_switched() -> None:
+    client = _Client()
+    store = ElasticsearchChildIndexStore(cast(Any, client))
+
+    await store.stage(_context(), [_embedded_child()])
+    client.indices.aliases[ACTIVE_CHILD_INDEX_ALIAS] = {"agenticrag-children-index-v1"}
+
+    with pytest.raises(ChildIndexWriteError, match="active alias"):
+        await store.ensure_active_alias("index-v2")
+
+    assert client.indices.alias_updates == []
+
+
+@pytest.mark.asyncio
+async def test_existing_active_alias_is_idempotent() -> None:
+    client = _Client()
+    store = ElasticsearchChildIndexStore(cast(Any, client))
+
+    await store.stage(_context(), [_embedded_child()])
+    client.indices.aliases[ACTIVE_CHILD_INDEX_ALIAS] = {
+        "agenticrag-children-index-v2"
+    }
+
+    assert await store.ensure_active_alias("index-v2") is False
+    assert await store.switch_active_alias("index-v2") is False
+    assert client.indices.alias_updates == []
+
+
+@pytest.mark.asyncio
+async def test_switch_active_alias_uses_one_atomic_update() -> None:
+    client = _Client()
+    store = ElasticsearchChildIndexStore(cast(Any, client))
+
+    await store.stage(_context(), [_embedded_child()])
+    client.indices.aliases[ACTIVE_CHILD_INDEX_ALIAS] = {"agenticrag-children-index-v1"}
+
+    await store.switch_active_alias("index-v2")
+
+    assert client.indices.aliases == {
+        ACTIVE_CHILD_INDEX_ALIAS: {"agenticrag-children-index-v2"}
+    }
+    assert client.indices.alias_updates == [
+        [
+            {
+                "remove": {
+                    "index": "agenticrag-children-index-v1",
+                    "alias": ACTIVE_CHILD_INDEX_ALIAS,
+                }
+            },
+            {
+                "add": {
+                    "index": "agenticrag-children-index-v2",
+                    "alias": ACTIVE_CHILD_INDEX_ALIAS,
+                }
+            },
+        ]
+    ]
 
 
 @pytest.mark.parametrize("generation", ["INDEX-V1", " index-v1 "])

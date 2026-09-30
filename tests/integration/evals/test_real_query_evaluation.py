@@ -1,4 +1,4 @@
-"""Composition-level evaluation through the real QueryGraph client boundary."""
+"""Contract-only evaluation through a fake QueryGraph boundary."""
 
 from __future__ import annotations
 
@@ -78,14 +78,14 @@ class _ProductionGraphBoundary:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_graph_evaluation_runs_through_real_client_and_passes_provenance_gate(
+async def test_fake_graph_evaluation_is_contract_only_and_fails_real_acceptance(
     tmp_path: Any,
 ) -> None:
     runner = EvalRunner(
         GraphQueryClient(_ProductionGraphBoundary(), snapshot=SNAPSHOT),
         output_dir=tmp_path,
-        evaluation_mode="graph",
-        client_provenance=GraphQueryClient.provenance,
+        evaluation_mode="contract",
+        client_provenance="contract_graph",
     )
 
     summary = await runner.run(
@@ -94,8 +94,7 @@ async def test_graph_evaluation_runs_through_real_client_and_passes_provenance_g
         backup_restore_passed=True,
     )
 
-    assert summary["evaluation_mode"] == "graph"
-    assert summary["client_provenance"] == "real_query_graph"
-    assert summary["real_query_count"] == 1
-    assert verify_acceptance(summary) == 0
-
+    assert summary["evaluation_mode"] == "contract"
+    assert summary["client_provenance"] == "contract_graph"
+    assert summary["real_query_count"] == 0
+    assert verify_acceptance(summary) == 1

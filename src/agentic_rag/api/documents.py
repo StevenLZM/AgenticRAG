@@ -109,6 +109,33 @@ async def get_ingestion_job(request: Request, job_id: str) -> IngestionJobRespon
     return IngestionJobResponse.from_job(job)
 
 
+@documents_router.post(
+    "/documents/{document_id}/reprocess", status_code=status.HTTP_202_ACCEPTED,
+    response_model=IngestionJobResponse,
+)
+async def reprocess_document(
+    request: Request, document_id: str,
+    file: Annotated[UploadFile, File(description="The unchanged original file")],
+) -> IngestionJobResponse:
+    """Version the unchanged original through the normal safety/worker pipeline."""
+    service, scope = _request_service(request)
+    try:
+        content = await _read_bounded_upload(file, request.app.state.container.settings.max_upload_bytes)
+        job = await service.create_upload(scope, filename=file.filename or "",
+            declared_mime=file.content_type or "application/octet-stream", content=content,
+            reprocess_document_id=document_id)
+    except UploadTooLargeError as error:
+        raise ApiException(status_code=413, error_code="UPLOAD_TOO_LARGE",
+                           message="The uploaded file exceeds the allowed size.", retryable=False) from error
+    except UploadRejectedError as error:
+        raise ApiException(status_code=415, error_code="UPLOAD_REJECTED",
+                           message="The uploaded file failed the safety policy.", retryable=False) from error
+    except ValueError as error:
+        raise ApiException(status_code=409, error_code="REPROCESS_CONFLICT",
+                           message="The original document cannot be reprocessed in its current state.", retryable=False) from error
+    return IngestionJobResponse.from_job(job)
+
+
 @documents_router.delete(
     "/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT
 )

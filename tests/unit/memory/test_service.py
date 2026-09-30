@@ -119,6 +119,45 @@ class FakeGateway:
         return self.result
 
 
+@pytest.mark.parametrize("case,expected", [
+    ("empty", (0, 0, 0, "no_candidates")),
+    ("unknown_source", (1, 1, 0, "filtered")),
+    ("stored", (1, 0, 1, "write_completed")),
+    ("write_failed", (1, 0, 0, "write_failed")),
+])
+async def test_capture_reports_counts_and_source_rejection_without_content(
+    case: str, expected: tuple[int, int, int, str],
+    mem0: FakeMem0, tombstones: FakeTombstones, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="agentic_rag.memory.service")
+    statement = "某位同事偏好上海工作"
+    candidates = () if case == "empty" else (MemoryCandidate(
+        text=statement, memory_type=MemoryType.SEMANTIC,
+        source_message_ids=("missing" if case == "unknown_source" else "u1",),
+    ),)
+    mem0.fail_add = case == "write_failed"
+    service = MemoryServiceImpl(
+        mem0, tombstones=tombstones, policy_version="memory-v1",
+        extractor=FakeExtractor(candidates=candidates),
+    )
+    await service.extract_and_store(
+        UserScope(user_id="user-1"), "run-1",
+        [PublicMessage(id="u1", role="user", content=statement)],
+    )
+    records = [r for r in caplog.records if r.message == "memory_capture_result"]
+    assert len(records) == 1
+    record = records[0]
+    assert (record.candidate_count, record.filtered_count, record.write_completed_count, record.outcome) == expected
+    assert record.run_id == "run-1"
+    assert statement not in str(record.__dict__)
+    if case == "unknown_source":
+        assert record.filter_reasons == {"unknown_source_message": 1}
+    if case == "stored":
+        assert (await service.list(UserScope(user_id="user-1")))[0].text == statement
+    else:
+        assert mem0.records == []
+
+
 SNAPSHOT = RuntimeConfigSnapshot(
     app_version="test", graph_version="graph-v1", prompt_version="prompt-v1",
     main_model_id="main", light_model_id="light", embedding_model="embed",

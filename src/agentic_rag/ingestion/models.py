@@ -76,6 +76,8 @@ class DocumentService:
         filename: str,
         declared_mime: str,
         content: bytes,
+        *,
+        reprocess_document_id: str | None = None,
     ) -> IngestionJob:
         if len(content) > self._max_upload_bytes:
             raise UploadTooLargeError()
@@ -86,7 +88,7 @@ class DocumentService:
             raise UploadRejectedError(decision)
 
         normalized_filename = normalize_upload_filename(filename)
-        document_id = new_id()
+        document_id = reprocess_document_id or new_id()
         document_version_id = new_id()
         artifact_path = (
             f"documents/{scope.user_id}/{document_id}/{document_version_id}/"
@@ -97,11 +99,7 @@ class DocumentService:
         )
         try:
             async with self._session_factory.begin() as transaction:
-                _document, version = await self._documents.create(
-                    scope,
-                    source_type=_source_type(decision.detected_mime),
-                    filename=normalized_filename,
-                    mime_type=decision.detected_mime,
+                values = dict(
                     content_hash=decision.content_hash,
                     parser_version=self._versions.parser,
                     pipeline_version=self._versions.pipeline,
@@ -116,6 +114,15 @@ class DocumentService:
                     ),
                     transaction=transaction,
                 )
+                if reprocess_document_id is None:
+                    _document, version = await self._documents.create(
+                        scope, source_type=_source_type(decision.detected_mime),
+                        filename=normalized_filename, mime_type=decision.detected_mime, **values,
+                    )
+                else:
+                    version = await self._documents.create_reprocessing_version(
+                        scope, filename=normalized_filename, **values,
+                    )
                 return await self._jobs.create(
                     scope,
                     document_id,

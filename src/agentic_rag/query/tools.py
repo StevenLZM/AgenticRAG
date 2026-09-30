@@ -43,6 +43,8 @@ class ResearchToolset:
     ) -> tuple[EvidenceBatch, PackedEvidence]:
         request = RetrievalRequest(query=query)
         batch = await self._retrieval.retrieve(request, ctx.scope, ctx.snapshot)
+        if target_id not in batch.target_ids:
+            batch = batch.model_copy(update={"target_ids": (*batch.target_ids, target_id)})
         packed = self._evidence_builder.build(
             [batch],
             [EvidenceCoverageTarget(target_id=target_id, description=query)],

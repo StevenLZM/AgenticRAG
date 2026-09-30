@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     mem0_elasticsearch_verify_certs: bool = True
     mem0_history_db_path: Path = Path("var/mem0/history.db")
     default_user_id: str = "default_user"
+    allow_evaluation_requests: bool = False
     main_model: str = "deepseek-v4-pro"
     light_model: str = "deepseek-v4-flash"
     embedding_model: str = "text-embedding-v3"
@@ -56,7 +57,7 @@ class Settings(BaseSettings):
     max_concurrent_llm_calls: int = 8
     max_concurrent_reranks: int = 1
     max_parallel_subagents_per_run: int = 3
-    max_research_rounds: int = 4
+    max_research_rounds: int = Field(default=6, ge=1, le=8)
     max_answer_revisions: int = 1
     query_run_timeout_seconds: int = 300
     max_evidence_tokens: int = 12_000
@@ -69,7 +70,7 @@ class Settings(BaseSettings):
         le=1024 * 1024 * 1024,
     )
     parser_version: str = "docling-v1"
-    ingestion_pipeline_version: str = "ingestion-v1"
+    ingestion_pipeline_version: str = "ingestion-v2"
     index_generation: str = DEFAULT_INDEX_GENERATION
     query_checkpoint_path: Path = Path("var/query_checkpoints.sqlite")
     ingestion_checkpoint_path: Path = Path("var/ingestion_checkpoints.sqlite")

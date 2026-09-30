@@ -24,6 +24,9 @@ if str(SOURCE_ROOT) not in sys.path:
 from agentic_rag.bootstrap import AppContainer, build_container  # noqa: E402
 from agentic_rag.config import Settings, get_settings  # noqa: E402
 from agentic_rag.persistence.outbox import OutboxDispatcher  # noqa: E402
+from agentic_rag.persistence.elasticsearch import (  # noqa: E402
+    ElasticsearchChildIndexStore,
+)
 from agentic_rag.persistence.repositories import (  # noqa: E402
     OutboxRecord,
     SqlAlchemyOutboxRepository,
@@ -44,6 +47,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E40
 
 
 DependenciesFactory = Callable[[AppContainer, Settings], Awaitable[QueryGraphDependencies]]
+
+
+async def ensure_active_child_alias(
+    container: AppContainer, settings: Settings
+) -> None:
+    """Repair a missing configured Child alias before consuming Query Outbox."""
+    await ElasticsearchChildIndexStore(container.elasticsearch).ensure_active_alias(
+        settings.index_generation
+    )
 
 
 class TransactionalQueryOutboxAdapter:
@@ -117,6 +129,7 @@ async def run(
     container = build_container(settings)
     dependencies: QueryGraphDependencies | None = None
     try:
+        await ensure_active_child_alias(container, settings)
         dependencies = await dependencies_factory(container, settings)
         shared_concurrency = dependencies.concurrency or ConcurrencyManager()
         async with container.checkpoints.open_query() as checkpointer:

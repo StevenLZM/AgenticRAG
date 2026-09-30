@@ -17,6 +17,8 @@ from agentic_rag.ingestion.assembler import (
     GlobalAssembler,
     Provenance,
     SourceRegion,
+    _Candidate,
+    _associate_aligned_date_ranges,
 )
 from agentic_rag.persistence.artifacts import LocalArtifactStore
 from agentic_rag.safety.content import ContentSafetyScanner
@@ -68,6 +70,182 @@ def test_assembler_merges_cross_page_paragraph_and_removes_repeated_footer() -> 
     assert canonical.text_blocks[0].provenance.page_from == 1
     assert canonical.text_blocks[0].provenance.page_to == 2
     assert canonical.text_blocks[0].source_refs == ("#/texts/0", "#/texts/2")
+
+
+def test_assembler_associates_consistent_same_row_date_ranges_with_headings() -> None:
+    """Depth-first Docling groups may place aligned dates after nested duties."""
+    fragment = FragmentAst(
+        envelope=_envelope(),
+        batch_no=1,
+        page_from=1,
+        page_to=1,
+        docling_document={
+            "schema_name": "DoclingDocument",
+            "body": {
+                "self_ref": "#/body",
+                "children": [
+                    {"$ref": "#/groups/0"},
+                    {"$ref": "#/groups/1"},
+                ],
+            },
+            "groups": [
+                {
+                    "self_ref": "#/groups/0",
+                    "children": [
+                        {"$ref": "#/texts/0"},
+                        {"$ref": "#/groups/2"},
+                        {"$ref": "#/texts/2"},
+                    ],
+                },
+                {
+                    "self_ref": "#/groups/1",
+                    "children": [
+                        {"$ref": "#/texts/3"},
+                        {"$ref": "#/groups/3"},
+                        {"$ref": "#/texts/5"},
+                    ],
+                },
+                {
+                    "self_ref": "#/groups/2",
+                    "children": [{"$ref": "#/texts/1"}],
+                },
+                {
+                    "self_ref": "#/groups/3",
+                    "children": [{"$ref": "#/texts/4"}],
+                },
+            ],
+            "texts": [
+                {
+                    "self_ref": "#/texts/0",
+                    "label": "section_header",
+                    "text": "甲公司 / 高级工程师",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 10, "t": 90, "r": 220, "b": 80},
+                        }
+                    ],
+                },
+                {
+                    "self_ref": "#/texts/1",
+                    "label": "text",
+                    "text": "负责平台建设",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 10, "t": 75, "r": 220, "b": 65},
+                        }
+                    ],
+                },
+                {
+                    "self_ref": "#/texts/2",
+                    "label": "text",
+                    "text": "2022.01-2024.03",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 300, "t": 90, "r": 490, "b": 80},
+                        }
+                    ],
+                },
+                {
+                    "self_ref": "#/texts/3",
+                    "label": "section_header",
+                    "text": "乙公司 / 工程师",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 10, "t": 55, "r": 220, "b": 45},
+                        }
+                    ],
+                },
+                {
+                    "self_ref": "#/texts/4",
+                    "label": "text",
+                    "text": "负责服务开发",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 10, "t": 40, "r": 220, "b": 30},
+                        }
+                    ],
+                },
+                {
+                    "self_ref": "#/texts/5",
+                    "label": "text",
+                    "text": "2020.01-2021.12",
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {"l": 300, "t": 55, "r": 490, "b": 45},
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    canonical = GlobalAssembler().assemble([fragment])
+
+    assert [block.text for block in canonical.text_blocks] == [
+        "甲公司 / 高级工程师",
+        "2022.01-2024.03",
+        "负责平台建设",
+        "乙公司 / 工程师",
+        "2020.01-2021.12",
+        "负责服务开发",
+    ]
+
+
+def _layout_candidate(
+    source_order: int,
+    *,
+    text: str,
+    kind: str,
+    bbox: tuple[float, float, float, float],
+) -> _Candidate:
+    return _Candidate(
+        id=f"candidate-{source_order}",
+        kind=kind,  # type: ignore[arg-type]
+        text=text,
+        provenance=Provenance(
+            page_from=1,
+            page_to=1,
+            regions=(SourceRegion(page_no=1, bbox=bbox),),
+        ),
+        source_refs=(f"#/texts/{source_order}",),
+        heading_level=1 if kind == "heading" else None,
+        source_order=source_order,
+        reading_order=source_order,
+        role=None,
+        continued_from_previous=False,
+        continues_on_next=False,
+        continuation_id=None,
+    )
+
+
+def test_layout_association_is_noop_for_single_or_non_range_dates() -> None:
+    candidates = [
+        _layout_candidate(0, text="Only heading", kind="heading", bbox=(10, 90, 220, 80)),
+        _layout_candidate(1, text="2026-08-31", kind="paragraph", bbox=(300, 90, 490, 80)),
+    ]
+
+    assert _associate_aligned_date_ranges(candidates) == candidates
+
+
+def test_layout_association_is_idempotent_after_reordering() -> None:
+    candidates = [
+        _layout_candidate(0, text="First heading", kind="heading", bbox=(10, 90, 220, 80)),
+        _layout_candidate(1, text="First duty", kind="paragraph", bbox=(10, 75, 220, 65)),
+        _layout_candidate(2, text="2022.01-2024.03", kind="paragraph", bbox=(300, 90, 490, 80)),
+        _layout_candidate(3, text="Second heading", kind="heading", bbox=(10, 55, 220, 45)),
+        _layout_candidate(4, text="Second duty", kind="paragraph", bbox=(10, 40, 220, 30)),
+        _layout_candidate(5, text="2020.01-2021.12", kind="paragraph", bbox=(300, 55, 490, 45)),
+    ]
+
+    repaired = _associate_aligned_date_ranges(candidates)
+
+    assert _associate_aligned_date_ranges(repaired) == repaired
 
 
 def test_merged_block_ids_remain_scoped_to_the_document_version() -> None:

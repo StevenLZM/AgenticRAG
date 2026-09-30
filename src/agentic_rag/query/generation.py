@@ -8,7 +8,7 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
-from agentic_rag.query.evidence_builder import PackedEvidence
+from agentic_rag.query.evidence_builder import PackedEvidence, model_evidence_manifest
 from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway, StructuredOutputValidationError, load_prompt
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
@@ -58,10 +58,7 @@ class AnswerGenerator:
         payload = {
             "question": question,
             "packed_context": packed_evidence.rendered_context,
-            "evidence_manifest": {
-                evidence_id: entry.model_dump(mode="json")
-                for evidence_id, entry in packed_evidence.manifest.items()
-            },
+            "evidence_manifest": model_evidence_manifest(packed_evidence.manifest),
             "repair_issues": list(repair_issues),
         }
         call = ModelCall(

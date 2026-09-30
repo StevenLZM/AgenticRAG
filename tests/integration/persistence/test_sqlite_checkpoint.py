@@ -70,6 +70,44 @@ async def test_checkpoint_resumes_interrupted_graph_after_database_reopen(
 
 
 @pytest.mark.integration
+async def test_research_action_resumes_after_sqlite_reopen_without_repeating_plan(tmp_path):
+    from dataclasses import replace
+    from agentic_rag.query.graph import build_query_graph, query_checkpoint_config
+    from tests.unit.query.test_graph import _deps
+    from tests.unit.query.test_research_dag import loop
+    from tests.unit.query.test_research_loop import _state_without_research_todos
+
+    deps, _memory, retrieval, _events = _deps(route="research", grades=["sufficient"])
+    agent = loop([
+        {"action": "create_todos", "items": [
+            {"key": "a", "title": "notice"},
+            {"key": "b", "title": "check notice", "blocked_by": ["a"]},
+        ]},
+        {"action": "retrieve_evidence", "todo_id": "todo-1", "query": "notice"},
+        {"action": "retrieve_evidence", "todo_id": "todo-2", "query": "check notice"},
+        {"action": "submit_evidence"},
+    ], retrieval)
+    backend = CheckpointBackend(_settings(tmp_path))
+    state = _state_without_research_todos()
+    config = query_checkpoint_config(state)
+    state["runtime_config_snapshot"]["max_research_rounds"] = 4
+    async with backend.open_query() as saver:
+        graph = build_query_graph(replace(deps, research_loop=agent), checkpointer=saver)
+        await graph.ainvoke(state, config=config, interrupt_after=["research_agent_loop"])
+        saved = await graph.aget_state(config)
+        assert saved.values["research_attempt_count"] == 1
+        assert saved.values["research"]["todos"][1]["blocked_by"] == ["todo-1"]
+        assert saved.next == ("research_agent_loop",)
+    async with backend.open_query() as saver:
+        graph = build_query_graph(replace(deps, research_loop=agent), checkpointer=saver)
+        result = await graph.ainvoke(None, config=config)
+        assert result["research_attempt_count"] == 4
+        assert result["research"]["submitted"] is True
+        assert len(result["research"]["todos"]) == 2
+        assert retrieval.calls == 2
+
+
+@pytest.mark.integration
 async def test_query_and_ingestion_use_independent_configured_databases(
     tmp_path: Path,
 ) -> None:

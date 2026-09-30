@@ -130,8 +130,8 @@ class Reranker:
         if len(scores) != len(input_hits):
             raise ValueError("Cross-Encoder returned a score count mismatch")
         ranked = [
-            hit
-            for _, hit in sorted(
+            hit.model_copy(update={"rerank_score": float(scores[position])})
+            for position, hit in sorted(
                 enumerate(input_hits),
                 key=lambda indexed_hit: (
                     -float(scores[indexed_hit[0]]),

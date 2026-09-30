@@ -22,6 +22,8 @@ from agentic_rag.retrieval.models import (
     EvidenceBatch,
     ParentEvidence,
     RetrievalRequest,
+    RankedHitRef,
+    RetrievalObservation,
 )
 from agentic_rag.retrieval.parents import aggregate_parents
 from agentic_rag.retrieval.ports import LexicalIndex, VectorIndex
@@ -265,6 +267,20 @@ def build_retrieval_graph(
             parents=tuple(state["hydrated_parents"]),
             degraded_components=state["degraded_components"],
             document_ids=state["request"].document_ids,
+            observation=RetrievalObservation(
+                user_id=state["scope"].user_id,
+                snapshot_id=state["snapshot"].snapshot_id,
+                index_generation=state["snapshot"].index_generation,
+                stages={name: tuple(RankedHitRef(
+                    child_id=hit.child_id, parent_id=hit.parent_id, user_id=hit.user_id,
+                    document_id=hit.document_id, document_version_id=hit.document_version_id,
+                ) for hit in state.get(key, [])) for name, key in (
+                    ("dense", "dense_hits"), ("bm25", "bm25_hits"),
+                    ("rrf", "fused_hits"), ("rerank", "reranked_hits"),
+                )},
+                selected_parent_ids=tuple(p.parent_id for p in state["selected_parents"]),
+                hydrated_parent_ids=tuple(p.parent_id for p in state["hydrated_parents"]),
+            ),
         )
         return _stage_update(state, "evidence_batch", started, evidence_batch=batch)
 

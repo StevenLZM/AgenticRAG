@@ -21,6 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from agentic_rag.memory.models import PublicMessage
+from agentic_rag.query.chat import run_chat
 from agentic_rag.memory.service import MemoryService
 from agentic_rag.observability.logging import (
     AgentEventEmitter,
@@ -125,6 +126,10 @@ def build_query_graph(
         await _event(dependencies, state, "QUERY_ROUTED", str(update.get("next_node", "research_agent")))
         return update
 
+    async def chat(state: QueryState) -> dict[str, object]:
+        async with _trace_span(dependencies, state, "graph.node.chat"):
+            return await run_chat(state, dependencies.gateway)
+
     async def fast_rag(state: QueryState) -> dict[str, object]:
         async with _trace_span(dependencies, state, "graph.node.fast_rag"):
             async with _trace_span(dependencies, state, "retrieval"):
@@ -145,13 +150,11 @@ def build_query_graph(
 
     async def research_agent_loop(state: QueryState) -> dict[str, object]:
         async with _trace_span(dependencies, state, "graph.node.research_agent_loop"):
-            async with _trace_span(dependencies, state, "retrieval"):
-                async with _trace_span(dependencies, state, "tool"):
-                    update = await dependencies.research_loop.ainvoke(state)
+            update = await dependencies.research_loop.ainvoke(state)
         await _event(
             dependencies,
             cast(QueryState, {**state, **update}),
-            "RESEARCH_LOOP_COMPLETED",
+            "PROGRESS" if update.get("next_node") == "research_agent" else "RESEARCH_LOOP_COMPLETED",
             str(update.get("next_node", "end")),
         )
         return update
@@ -178,12 +181,21 @@ def build_query_graph(
                         "termination_reason": "refuse",
                         "next_node": "end",
                     }
-                packed = dependencies.evidence_builder.build(
-                    batches,
-                    _coverage_targets(state),
-                    scope_from_state(state),
-                    snapshot_from_state(state),
-                )
+                try:
+                    packed = dependencies.evidence_builder.build(
+                        batches,
+                        _coverage_targets(state),
+                        scope_from_state(state),
+                        snapshot_from_state(state),
+                    )
+                except (TypeError, ValueError):
+                    return {
+                        "packed_context": _empty_pack(state).model_dump(mode="json"),
+                        "evidence": [],
+                        "errors": [*state.get("errors", []), {"code": "research_evidence_invalid"}],
+                        "termination_reason": "refuse",
+                        "next_node": "end",
+                    }
                 return {
                     "packed_context": packed.model_dump(mode="json"),
                     "evidence": [item.model_dump(mode="json") for item in packed.items],
@@ -255,6 +267,8 @@ def build_query_graph(
                 await _event(dependencies, state, "ANSWER_FINALIZED", completed)
                 # Publication precedes best-effort memory extraction.  A memory outage
                 # must never retract an answer that has already passed audits.
+                if snapshot_from_state(state).evaluation is not None:
+                    return {"termination_reason": completed, "next_node": "end"}
                 try:
                     await dependencies.memory.extract_and_store(
                         scope_from_state(state), state["run_id"], _public_messages(state)
@@ -272,6 +286,8 @@ def build_query_graph(
                 return {"termination_reason": completed, "next_node": "end"}
 
     def after_route(state: QueryState) -> str:
+        if state.get("next_node") == "chat":
+            return "chat"
         return "fast_rag" if state.get("next_node") == "fast_rag" else "research_agent_loop"
 
     def after_fast_grade(state: QueryState) -> str:
@@ -283,6 +299,8 @@ def build_query_graph(
         return "finalize"
 
     def after_research(state: QueryState) -> str:
+        if state.get("next_node") == "research_agent":
+            return "research_agent_loop"
         return "evidence_builder" if state.get("next_node") == "generate" else "finalize"
 
     def after_evidence_builder(state: QueryState) -> str:
@@ -298,6 +316,7 @@ def build_query_graph(
     builder = StateGraph(QueryState)
     builder.add_node("memory_loader", load_memory)
     builder.add_node("route", route)
+    builder.add_node("chat", chat)
     builder.add_node("fast_rag", fast_rag)
     builder.add_node("record_fast_grade", record_fast_grade)
     builder.add_node("research_agent_loop", research_agent_loop)
@@ -309,10 +328,11 @@ def build_query_graph(
     builder.add_node("finalize", finalize)
     builder.add_edge(START, "memory_loader")
     builder.add_edge("memory_loader", "route")
-    builder.add_conditional_edges("route", after_route, {"fast_rag": "fast_rag", "research_agent_loop": "research_agent_loop"})
+    builder.add_conditional_edges("route", after_route, {"chat": "chat", "fast_rag": "fast_rag", "research_agent_loop": "research_agent_loop"})
+    builder.add_edge("chat", "finalize")
     builder.add_edge("fast_rag", "record_fast_grade")
     builder.add_conditional_edges("record_fast_grade", after_fast_grade, {"generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
-    builder.add_conditional_edges("research_agent_loop", after_research, {"evidence_builder": "evidence_builder", "finalize": "finalize"})
+    builder.add_conditional_edges("research_agent_loop", after_research, {"research_agent_loop": "research_agent_loop", "evidence_builder": "evidence_builder", "finalize": "finalize"})
     builder.add_conditional_edges("evidence_builder", after_evidence_builder, {"evidence_grader": "evidence_grader", "finalize": "finalize"})
     builder.add_conditional_edges("evidence_grader", after_grade, {"generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
     builder.add_edge("generate", "faithfulness")
@@ -408,6 +428,8 @@ async def _span_event(
 
 
 async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_type: str, summary: str) -> None:
+    if event_type == "QUERY_ROUTED":
+        summary = {"chat": "chat", "fast_rag": "fast_rag", "research_agent": "research"}.get(summary, "completed")
     if dependencies.event_emitter is not None:
         if dependencies.event_emitter.runtime_config_snapshot_id != snapshot_from_state(state).snapshot_id:
             return
@@ -417,12 +439,13 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
                 user_id=scope_from_state(state).user_id,
                 event_type=event_type,
                 node_name=event_type.lower(),
-                summary="completed",
+                summary=summary if event_type == "QUERY_ROUTED" else "completed",
                 attributes=_event_attributes(state, event_type),
                 event_key=stable_event_key(
                     state["run_id"],
                     event_type,
                     str(state.get("revision_count", 0)),
+                    str(state.get("research_attempt_count", 0)),
                     str(len(state.get("audit_results", []))),
                     str(state.get("next_node", "")),
                 ),
@@ -442,6 +465,7 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
             state["run_id"],
             safe_event_type,
             str(state.get("revision_count", 0)),
+            str(state.get("research_attempt_count", 0)),
             str(len(state.get("audit_results", []))),
             str(len(state.get("retrieval_batches", []))),
             str(state.get("next_node", "")),
@@ -530,7 +554,8 @@ def _packed_from_state(state: QueryState) -> PackedEvidence:
         result = PackedEvidence.model_validate(packed)
     except (TypeError, ValueError):
         return _empty_pack(state)
-    return result
+    snapshot = snapshot_from_state(state)
+    return result if result.index_generation == snapshot.index_generation else _empty_pack(state)
 
 
 def _grade_decision(value: object) -> str:

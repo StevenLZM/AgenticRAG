@@ -4,7 +4,13 @@ from agentic_rag.retrieval.fusion import reciprocal_rank_score, rrf_fuse
 from agentic_rag.retrieval.models import ChildHit
 
 
-def hit(child_id: str, *, lane: str = "dense", lane_rank: int = 1) -> ChildHit:
+def hit(
+    child_id: str,
+    *,
+    lane: str = "dense",
+    lane_rank: int = 1,
+    score: float = 1.0,
+) -> ChildHit:
     """Build a small but valid retrieval hit."""
     return ChildHit(
         child_id=child_id,
@@ -16,7 +22,7 @@ def hit(child_id: str, *, lane: str = "dense", lane_rank: int = 1) -> ChildHit:
         ast_locator="segment-0",
         lane=lane,  # type: ignore[arg-type]
         lane_rank=lane_rank,
-        score=1.0,
+        score=score,
     )
 
 
@@ -48,6 +54,20 @@ def test_rrf_honors_the_result_limit() -> None:
     fused = rrf_fuse([[hit("a"), hit("b", lane_rank=2)]], limit=1)
 
     assert [item.child_id for item in fused] == ["a"]
+
+
+def test_rrf_propagates_raw_retrieval_and_fused_scores() -> None:
+    fused = rrf_fuse(
+        [
+            [hit("shared", lane="dense", lane_rank=1, score=0.91)],
+            [hit("shared", lane="bm25", lane_rank=1, score=12.0)],
+        ],
+        k=60,
+    )
+
+    assert fused[0].retrieval_score == 0.91
+    assert fused[0].rrf_score == 2 / 61
+    assert fused[0].rerank_score is None
 
 
 def test_rrf_rejects_a_non_positive_child_lane_rank() -> None:

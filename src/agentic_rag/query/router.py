@@ -44,6 +44,9 @@ class MemoryContextLoader:
         self._memory = memory
 
     async def load(self, state: QueryState) -> dict[str, object]:
+        evaluation = snapshot_from_state(state).evaluation
+        if evaluation is not None and evaluation.memory_policy == "disabled":
+            return {"memory_context": MemoryContext().model_dump(mode="json")}
         cached = state.get("memory_context")
         if isinstance(cached, dict):
             return {"memory_context": cached}
@@ -123,7 +126,7 @@ async def route_query(state: QueryState, gateway: ModelGateway) -> dict[str, obj
             outcome="degraded",
         )
         return _research_fallback(state, "router_unavailable", type(error).__name__)
-    next_node = "fast_rag" if decision.route == "fast_rag" else "research_agent"
+    next_node = decision.route if decision.route in {"chat", "fast_rag"} else "research_agent"
     return {"route": decision.model_dump(mode="json"), "next_node": next_node}
 
 

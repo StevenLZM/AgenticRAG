@@ -25,6 +25,26 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
 SCOPE = UserScope(user_id="api-user")
+
+
+@pytest.mark.parametrize("route", ["chat", "fast_rag", "research", "private prompt"])
+def test_sse_route_projects_only_safe_route_enum(route: str) -> None:
+    from agentic_rag.api.query_runs import _sse_event
+    from agentic_rag.observability.logging import sanitize_summary
+
+    event = AgentEvent(
+        id=1, event_key="route", trace_id="run-1", run_id="run-1",
+        user_id="api-user", event_type="QUERY_ROUTED", node_name="query_routed",
+        summary=sanitize_summary(route), runtime_config_snapshot_id="snapshot",
+    )
+    payload = json.loads(_sse_event(event).split("data: ", 1)[1])
+    if route == "private prompt":
+        assert "route" not in payload
+        assert "private prompt" not in json.dumps(payload)
+    else:
+        assert payload.get("route") == route
+
+
 SNAPSHOT = RuntimeConfigSnapshot(
     app_version="test",
     graph_version="query-v1",
@@ -431,6 +451,73 @@ async def test_sse_exposes_only_allowlisted_degradation_attributes(tmp_path: Pat
     }
     assert "never expose" not in response.text
     assert "Bearer " not in response.text
+
+
+@pytest.mark.integration
+async def test_sse_exposes_safe_llm_diagnostics(tmp_path: Path) -> None:
+    """LLM retry metadata reaches operators without exposing provider payloads."""
+    artifacts = LocalArtifactStore(tmp_path / "artifacts")
+    payload_ref = artifacts.put_json(
+        "observability/events/model-retry.json",
+        {
+            "attributes": {
+                "attempt": 1,
+                "client_timeout_seconds": 30.0,
+                "component": "llm",
+                "error_class": "APITimeoutError",
+                "http_status": 503,
+                "operation": "graph.node.fast_rag.llm",
+                "outcome": "degraded",
+                "protocol": "auto",
+                "provider_request_id": "req_123",
+                "reason": "provider_outage",
+                "requested_model": "deepseek-v4-flash",
+                "retryable": True,
+                "error_message": "Bearer provider-secret",
+            }
+        },
+    )
+    event = AgentEvent(
+        id=1,
+        event_key="model-retry-diagnostics",
+        trace_id="trace-1",
+        run_id="run-1",
+        user_id=SCOPE.user_id,
+        event_type="MODEL_RETRY",
+        summary="degraded",
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        node_name="graph.node.fast_rag.llm",
+        payload_ref=payload_ref.uri,
+        created_at=datetime.now(UTC),
+    )
+    runs = FakeRunManager(runs={"run-1": _run(status=RunStatus.COMPLETED)})
+    app, _, _, _ = _app(runs, FakeEvents(events=[event]), artifacts=artifacts)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/query-runs/run-1/events")
+
+    assert response.status_code == 200
+    payload = next(
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    )
+    assert payload["attributes"] == {
+        "attempt": 1,
+        "client_timeout_seconds": 30.0,
+        "component": "llm",
+        "error_class": "APITimeoutError",
+        "http_status": 503,
+        "operation": "graph.node.fast_rag.llm",
+        "outcome": "degraded",
+        "protocol": "auto",
+        "provider_request_id": "req_123",
+        "reason": "provider_outage",
+        "requested_model": "deepseek-v4-flash",
+        "retryable": True,
+    }
+    assert "provider-secret" not in response.text
 
 
 @pytest.mark.integration

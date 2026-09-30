@@ -4,6 +4,7 @@ from datetime import date
 from typing import Annotated, Literal
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -52,7 +53,7 @@ class SearchFilter(BaseModel):
 
 
 class ChildHit(BaseModel):
-    """A scored child chunk returned by one retrieval lane."""
+    """A child chunk with scores from each completed ranking stage."""
 
     child_id: str
     parent_id: str
@@ -63,7 +64,20 @@ class ChildHit(BaseModel):
     ast_locator: str
     lane: Literal["dense", "bm25"]
     lane_rank: int
-    score: float
+    retrieval_score: float = Field(
+        validation_alias=AliasChoices("retrieval_score", "score")
+    )
+    rrf_score: float | None = None
+    rerank_score: float | None = None
+
+    @property
+    def ranking_score(self) -> float:
+        """Return the latest available score without mixing ranking stages."""
+        if self.rerank_score is not None:
+            return self.rerank_score
+        if self.rrf_score is not None:
+            return self.rrf_score
+        return self.retrieval_score
 
 
 class ParentEvidence(BaseModel):
@@ -74,7 +88,43 @@ class ParentEvidence(BaseModel):
     document_version_id: str
     content: str
     child_hits: tuple[ChildHit, ...]
-    rerank_score: float
+    retrieval_score: float = 0.0
+    rrf_score: float | None = None
+    rerank_score: float | None = None
+    heading_path: tuple[str, ...] = ()
+
+    @property
+    def ranking_score(self) -> float:
+        """Return the score from the latest ranking stage that completed."""
+        if self.rerank_score is not None:
+            return self.rerank_score
+        if self.rrf_score is not None:
+            return self.rrf_score
+        return self.retrieval_score
+
+
+class RankedHitRef(BaseModel):
+    """Content-free identity at one observed retrieval stage, in list order."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    child_id: str
+    parent_id: str
+    user_id: str
+    document_id: str
+    document_version_id: str
+
+
+class RetrievalObservation(BaseModel):
+    """Checkpoint-only stage rankings; not model prompts or public event payloads."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    schema_version: Literal[1] = 1
+    user_id: str
+    snapshot_id: str
+    index_generation: str
+    stages: dict[Literal["dense", "bm25", "rrf", "rerank"], tuple[RankedHitRef, ...]]
+    selected_parent_ids: tuple[str, ...]
+    hydrated_parent_ids: tuple[str, ...]
 
 
 class EvidenceBatch(BaseModel):
@@ -88,3 +138,5 @@ class EvidenceBatch(BaseModel):
     parents: tuple[ParentEvidence, ...]
     degraded_components: tuple[str, ...] = ()
     document_ids: tuple[str, ...] = ()
+    target_ids: tuple[str, ...] = ()
+    observation: RetrievalObservation | None = None

@@ -7,6 +7,7 @@ not call the live QueryGraph, a model provider, or an external retrieval store.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
 
@@ -30,6 +31,12 @@ def test_retrieval_metrics_have_known_values() -> None:
     assert recall_at_k(ranked, relevant, 3) == 1.0
     assert mrr(ranked, relevant) == pytest.approx(0.5)
     assert ndcg_at_k(ranked, relevant, 3) == pytest.approx(0.6934, rel=1e-3)
+
+
+def test_ndcg_ideal_uses_requested_k_even_with_one_returned_parent() -> None:
+    assert ndcg_at_k(["p1"], {"p1", "p2"}, 10) == pytest.approx(
+        1 / (1 + 1 / math.log2(3))
+    )
 
 
 @pytest.mark.parametrize(
@@ -225,6 +232,20 @@ def test_evaluation_case_is_strict_and_requires_reference() -> None:
         EvaluationCase.model_validate({**_case(), "case_id": 123})
     with pytest.raises(ValidationError):
         EvaluationCase.model_validate({**_case(), "reference_parent_ids": [123]})
+
+
+def test_unanswerable_case_explicitly_allows_empty_gold_only() -> None:
+    row = {**_case(), "answerable": False, "reference_answer": "", "reference_parent_ids": []}
+    case = EvaluationCase.model_validate(row)
+    assert case.answerable is False
+    assert case.reference_answer == ""
+    assert case.reference_parent_ids == ()
+    with pytest.raises(ValidationError):
+        EvaluationCase.model_validate({**row, "reference_parent_ids": ["parent-1"]})
+    with pytest.raises(ValidationError):
+        EvaluationCase.model_validate({**row, "answerable": True})
+    with pytest.raises(ValidationError):
+        EvaluationCase.model_validate({**_case(), "answerable": "false"})
 
 
 @pytest.mark.parametrize(

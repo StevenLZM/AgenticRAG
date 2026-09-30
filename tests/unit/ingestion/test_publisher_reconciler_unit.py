@@ -237,6 +237,15 @@ class _Dispatcher:
 
 
 @dataclass
+class _AliasStore:
+    switched_generations: list[str] = field(default_factory=list)
+
+    async def switch_active_alias(self, index_generation: str) -> bool:
+        self.switched_generations.append(index_generation)
+        return True
+
+
+@dataclass
 class _SelectivePublisher:
     failures: set[str]
     published: list[str] = field(default_factory=list)
@@ -255,7 +264,10 @@ class _FirstDeactivateFails(_LifecycleStore):
 
 
 def _system(
-    *, corrupt_manifest: bool = False, corrupt_canonical: bool = False
+    *,
+    corrupt_manifest: bool = False,
+    corrupt_canonical: bool = False,
+    alias_store: object | None = None,
 ) -> tuple[
     VersionPublisher,
     _PublicationRepository,
@@ -313,6 +325,7 @@ def _system(
         parent_store=parents,
         child_store=children,
         artifacts=_Artifacts(payloads),
+        alias_store=cast(Any, alias_store),
     )
     return publisher, repository, parents, children, events
 
@@ -331,6 +344,21 @@ async def test_publish_uses_fixed_idempotent_activation_order() -> None:
         "finalize:version-2",
     ]
     assert repository.active_version_id == "version-2"
+    assert parents.active == {"version-2"}
+    assert children.active == {"version-2"}
+
+
+async def test_publish_switches_active_alias_after_durable_publication() -> None:
+    alias_store = _AliasStore()
+    publisher, repository, parents, children, events = _system(
+        alias_store=alias_store
+    )
+
+    await publisher.publish("version-2")
+
+    assert repository.active_version_id == "version-2"
+    assert alias_store.switched_generations == ["index-v2"]
+    assert events[-1] == "finalize:version-2"
     assert parents.active == {"version-2"}
     assert children.active == {"version-2"}
 

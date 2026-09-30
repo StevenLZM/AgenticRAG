@@ -20,8 +20,10 @@ def test_settings_use_local_defaults(monkeypatch):
     assert settings.query_worker_count == 1
     assert settings.ingestion_worker_count == 1
     assert settings.mem0_enabled is True
+    assert settings.max_research_rounds == 6
     assert settings.max_upload_bytes == 50 * 1024 * 1024
-    assert settings.index_generation == "index-v2"
+    assert settings.ingestion_pipeline_version == "ingestion-v2"
+    assert settings.index_generation == "index-v3"
 
 
 def test_mem0_can_be_explicitly_disabled_for_local_diagnostics(monkeypatch) -> None:

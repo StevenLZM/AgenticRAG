@@ -11,23 +11,32 @@ from typing import Annotated, Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, RootModel, TypeAdapter, ValidationError
 
 from agentic_rag.query.context import ContextBuilder
-from agentic_rag.query.evidence_builder import EvidenceBuilder
+from agentic_rag.query.evidence_builder import (
+    EvidenceBuilder,
+    EvidenceCoverageTarget,
+    EvidenceItem,
+    EvidenceManifestEntry,
+    PackedEvidence,
+)
 from agentic_rag.query.state import (
     QueryState,
     question_from_state,
     scope_from_state,
     snapshot_from_state,
 )
-from agentic_rag.query.subagents import EvidenceReducer, SubagentDispatcher
+from agentic_rag.query.subagents import SubagentDispatcher
 from agentic_rag.query.todos import (
     SUPERVISOR_OWNER,
     InvalidTodoTransition,
+    TodoDraft,
+    TodoDependencyInput,
     TodoItem,
     TodoReducer,
-    TodoUpdate,
 )
 from agentic_rag.query.tools import ResearchContext, ResearchToolset, RetrievalPort
+from agentic_rag.retrieval.models import EvidenceBatch
 from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway, StructuredOutputValidationError, load_prompt
+from agentic_rag.safety.context import DataEnvelope
 
 
 class UpdateTodos(BaseModel):
@@ -37,38 +46,38 @@ class UpdateTodos(BaseModel):
 
 
 class CreateTodos(BaseModel):
-    """Append titles only; the supervisor owns IDs, owners, and tenant scope."""
+    """Append an atomic DAG fragment with server-assigned IDs and ownership."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     action: Literal["create_todos"]
-    titles: tuple[str, ...] = Field(min_length=1)
+    items: tuple[TodoDraft, ...] = Field(min_length=1, max_length=12)
 
 
 class TodoActionUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     todo_id: str = Field(min_length=1)
-    status: Literal["pending", "in_progress", "completed", "blocked", "skipped"] | None = None
-    evidence_ids: tuple[str, ...] | None = None
-    result_ref: str | None = None
+    status: Literal["pending", "skipped"]
 
 
 class RetrieveEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     action: Literal["retrieve_evidence"]
     query: str = Field(min_length=1, max_length=8_000)
-    todo_id: str | None = None
+    todo_id: str = Field(min_length=1)
 
 
 class DelegateResearch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     action: Literal["delegate_research"]
     todo_ids: tuple[str, ...] = Field(min_length=1)
+    queries: dict[str, str] = Field(default_factory=dict)
 
 
 class CalculatorCall(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     action: Literal["calculator"]
     expression: str = Field(min_length=1, max_length=1_000)
+    todo_id: str = Field(min_length=1)
 
 
 class SubmitEvidence(BaseModel):
@@ -119,64 +128,78 @@ class ResearchAgentLoop:
         self._gateway = dependencies.gateway
         self._context = dependencies.context_builder or ContextBuilder()
         self._tools = ResearchToolset(dependencies.retrieval, dependencies.evidence_builder)
+        self._evidence_builder = dependencies.evidence_builder
         self._subagents = dependencies.subagents
 
     async def ainvoke(self, state: QueryState) -> dict[str, object]:
+        """Execute one action; QueryGraph checkpoints before the next action."""
         snapshot = snapshot_from_state(state)
         context = ResearchContext(scope=scope_from_state(state), snapshot=snapshot)
         research = _research_state(state)
-        todos = _todos(research.get("todos"))
+        if research.get("submitted") and research.get("gaps"):
+            research["needs_replan"] = True
+        state = {**state, "research": research}  # type: ignore[typeddict-item]
         observations = _observations(research.get("observations"))
-        evidence = _evidence(state)
-        retrieval_batches = _retrieval_batches(state)
-        if not todos:
-            todos = TodoReducer.create([question_from_state(state)], owner=SUPERVISOR_OWNER)
-            observations.append({"kind": "todo_created", "todo_ids": [todo.id for todo in todos]})
         attempt = int(state.get("research_attempt_count", 0))
-        while attempt < snapshot.max_research_rounds:
-            attempt += 1
-            action = await self._next_action(state, research, todos, observations)
-            result = await self._execute(
-                action,
-                context,
-                todos,
-                observations,
-                evidence,
-                state,
-                attempt - 1,
+        try:
+            todos = _todos(research.get("todos"))
+        except ValueError:
+            return _result(
+                {"todos": [], "observations": [{
+                    "kind": "todo_state", "ok": False, "error_code": "research_todos_invalid",
+                }]}, _empty_packed(snapshot), cannot_answer=True,
+                research_attempt_count=attempt, termination_reason="cannot_answer",
             )
-            todos, observations, evidence = result.todos, result.observations, result.evidence
-            retrieval_batches.extend(result.retrieval_batches)
-            research = {**research, "todos": _dump_todos(todos), "observations": observations}
-            if result.submitted:
-                return _result(
-                    research,
-                    evidence,
-                    retrieval_batches=retrieval_batches,
-                    submitted=True,
-                    research_attempt_count=attempt,
-                )
-            if result.cannot_answer:
-                return _result(
-                    {**research, "cannot_answer": True},
-                    evidence,
-                    retrieval_batches=retrieval_batches,
-                    cannot_answer=True,
-                    research_attempt_count=attempt,
-                    termination_reason=result.termination_reason or "cannot_answer",
-                )
-        blocked = tuple(
-            todo.model_copy(update={"status": "blocked"})
-            if todo.status in {"pending", "in_progress"}
-            else todo
+        interrupted = [todo.id for todo in todos if todo.status == "in_progress"]
+        todos = TodoReducer.recover_interrupted(todos)
+        if interrupted:
+            observations.append({"kind": "todo_interrupted", "todo_ids": interrupted})
+        retrieval_batches = _retrieval_batches(state)
+        checkpoint = state.get("packed_context")
+        if checkpoint is not None and _packed_validation_error(checkpoint, snapshot) is not None:
+            return _result(
+                {**research, "todos": _dump_todos(_block_active(todos)), "observations": [
+                    *observations, {"kind": "evidence_state", "ok": False,
+                                    "error_code": "research_evidence_invalid", "retryable": False},
+                ]}, _empty_packed(snapshot), cannot_answer=True,
+                research_attempt_count=attempt, termination_reason="cannot_answer",
+            )
+        packed = _packed_from_state(state, snapshot)
+        if retrieval_batches:
+            packed = self._rebuild_working_pack(state, todos, retrieval_batches, context)
+        if attempt >= snapshot.max_research_rounds:
+            return _result(
+                {**research, "todos": _dump_todos(_block_active(todos)), "observations": observations},
+                packed, retrieval_batches=retrieval_batches,
+                research_attempt_count=attempt, termination_reason="research_round_limit",
+            )
+        action = await self._next_action(state, research, todos, observations, packed)
+        step = await self._execute(action, context, todos, observations, packed, state, attempt)
+        todos, packed = step.todos, step.evidence
+        retrieval_batches.extend(step.retrieval_batches)
+        if step.retrieval_batches:
+            packed = self._rebuild_working_pack(state, todos, retrieval_batches, context)
+        # Status is finalized only against the canonical, repacked working set.
+        known = set(packed.manifest)
+        todos = tuple(
+            todo.model_copy(update={"status": "blocked", "evidence_ids": ()})
+            if todo.status == "completed" and todo.evidence_ids
+            and not set(todo.evidence_ids).issubset(known) else todo
             for todo in todos
         )
+        raw_results = research.get("results")
+        results = dict(raw_results) if isinstance(raw_results, Mapping) else {}
+        results.update(step.task_results)
+        if isinstance(action, CreateTodos) and len(todos) > len(_todos(research.get("todos"))):
+            research["needs_replan"] = False
         return _result(
-            {**research, "todos": _dump_todos(blocked), "observations": observations},
-            evidence,
-            retrieval_batches=retrieval_batches,
-            research_attempt_count=attempt,
-            termination_reason="research_round_limit",
+            {**research, "todos": _dump_todos(todos), "observations": step.observations,
+             "results": results},
+            packed, retrieval_batches=retrieval_batches,
+            submitted=step.submitted, cannot_answer=step.cannot_answer,
+            research_attempt_count=attempt + 1,
+            termination_reason=step.termination_reason,
+            next_node="generate" if step.submitted else "end" if step.cannot_answer else "research_agent",
         )
 
     async def _next_action(
@@ -185,6 +208,7 @@ class ResearchAgentLoop:
         research: dict[str, object],
         todos: tuple[TodoItem, ...],
         observations: list[dict[str, object]],
+        packed: PackedEvidence,
     ) -> ResearchAction:
         staged = dict(state)
         staged["research"] = {
@@ -192,6 +216,8 @@ class ResearchAgentLoop:
             "todos": _dump_todos(todos),
             "observations": observations,
         }
+        staged["packed_context"] = packed.model_dump(mode="json")
+        staged["evidence"] = [item.model_dump(mode="json") for item in packed.items]
         prompt_context = await self._context.build(staged)
         call = ModelCall(
             model_role="main",
@@ -214,238 +240,187 @@ class ResearchAgentLoop:
         except Exception:
             return CannotAnswer(action="cannot_answer", reason="model_unavailable")
 
-    async def _execute(
+    def _rebuild_working_pack(
         self,
-        action: ResearchAction,
-        context: ResearchContext,
-        todos: tuple[TodoItem, ...],
-        observations: list[dict[str, object]],
-        evidence: list[dict[str, object]],
         state: QueryState,
-        round_number: int,
-    ) -> "_Step":
-        if isinstance(action, CreateTodos):
-            titles = [title.strip() for title in action.titles]
-            if not all(titles) or len({title.casefold() for title in titles}) != len(titles):
-                return _Step(
-                    todos,
-                    [*observations, {
-                        "kind": "todo_created", "ok": False,
-                        "error_code": "todo_creation_invalid", "retryable": False,
-                        "attempt": round_number + 1,
-                    }],
-                    evidence,
-                )
-            try:
-                appended = TodoReducer.append(todos, titles, owner=SUPERVISOR_OWNER)
-            except (InvalidTodoTransition, ValueError):
-                return _Step(
-                    todos,
-                    [*observations, {
-                        "kind": "todo_created", "ok": False,
-                        "error_code": "todo_creation_invalid", "retryable": False,
-                        "attempt": round_number + 1,
-                    }],
-                    evidence,
-                )
-            return _Step(
-                appended,
-                [*observations, {"kind": "todo_created", "ok": True, "todo_ids": [todo.id for todo in appended[len(todos):]]}],
-                evidence,
+        todos: tuple[TodoItem, ...],
+        retrieval_batches: list[dict[str, object]],
+        context: ResearchContext,
+    ) -> PackedEvidence:
+        """Repack every raw batch into the one bounded research working set."""
+        try:
+            batches = tuple(EvidenceBatch.model_validate(value) for value in retrieval_batches)
+            return self._evidence_builder.build(
+                batches,
+                _coverage_targets(state, todos),
+                context.scope,
+                context.snapshot,
             )
+        except (TypeError, ValueError):
+            # Invalid checkpointed/raw evidence is never allowed to leak into
+            # a prompt; the loop continues with an empty, generation-bound pack.
+            return _empty_packed(context.snapshot)
+
+    async def _execute(
+        self, action: ResearchAction, context: ResearchContext,
+        todos: tuple[TodoItem, ...], observations: list[dict[str, object]],
+        evidence: PackedEvidence, state: QueryState, round_number: int,
+    ) -> "_Step":
+        def failure(kind: str, code: str, *, selected: tuple[TodoItem, ...] | None = None,
+                    terminal: bool = False, retryable: bool = False) -> _Step:
+            return _Step(
+                todos if selected is None else selected,
+                [*observations, {"kind": kind, "ok": False, "error_code": code,
+                                 "retryable": retryable, "attempt": round_number + 1}],
+                evidence, cannot_answer=terminal,
+                termination_reason="cannot_answer" if terminal else None,
+            )
+
+        if isinstance(action, CreateTodos):
+            try:
+                appended = TodoReducer.append_drafts(todos, action.items, owner=SUPERVISOR_OWNER)
+            except ValueError:
+                return failure("todo_created", "todo_creation_invalid")
+            return _Step(appended, [*observations, {
+                "kind": "todo_created", "ok": True,
+                "todo_ids": [todo.id for todo in appended[len(todos):]],
+                "key_to_id": dict(zip(
+                    (draft.key for draft in action.items),
+                    (todo.id for todo in appended[len(todos):]), strict=True,
+                )),
+            }], evidence)
+
         if isinstance(action, UpdateTodos):
             try:
-                updated = TodoReducer.apply_many(
-                    todos,
-                    tuple(
-                        (change.todo_id, TodoUpdate(status=change.status, evidence_ids=change.evidence_ids, result_ref=change.result_ref))
-                        for change in action.updates
-                    ),
-                    actor="supervisor",
+                updated = TodoReducer.apply_agent_updates(
+                    todos, tuple((change.todo_id, change.status) for change in action.updates),
                 )
-                observation = {"kind": "todo_update", "ok": True, "round": round_number + 1}
-                return _Step(updated, [*observations, observation], evidence)
-            except (InvalidTodoTransition, ValueError):
-                return _Step(todos, [*observations, {
-                    "kind": "todo_update", "ok": False,
-                    "error_code": "todo_update_invalid", "retryable": False,
-                    "attempt": round_number + 1,
-                }], evidence)
-        if isinstance(action, RetrieveEvidence):
-            try:
-                target_id = action.todo_id or f"query:{state['run_id']}"
-                _batch, packed = await self._tools.retrieve_evidence(query=action.query, ctx=context, target_id=target_id)
-            except asyncio.CancelledError:
-                raise
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                return _Step(
-                    _block_active(todos),
-                    [*observations, {
-                        "kind": "retrieval", "ok": False,
-                        "error_code": "retrieval_unavailable", "retryable": True,
-                        "attempt": round_number + 1,
-                    }],
-                    evidence,
-                )
-            additions = [item.model_dump(mode="json") for item in packed.items]
-            merged = _merge_evidence(evidence, additions)
-            return _Step(
-                todos,
-                [*observations, {"kind": "retrieval", "ok": True, "evidence_ids": [item["evidence_id"] for item in additions]}],
-                merged,
-                retrieval_batches=[_batch.model_dump(mode="json")],
-            )
+            except ValueError:
+                return failure("todo_update", "todo_update_invalid")
+            return _Step(updated, [*observations, {"kind": "todo_update", "ok": True}], evidence)
+
+        if isinstance(action, CannotAnswer):
+            return _Step(todos, [*observations, {
+                "kind": "cannot_answer", "reason": action.reason, "error_code": action.reason,
+                "retryable": action.reason == "model_unavailable", "attempt": round_number + 1,
+            }], evidence, cannot_answer=True,
+                termination_reason="research_action_invalid" if action.reason == "research_action_invalid" else "cannot_answer")
+
+        if isinstance(action, SubmitEvidence):
+            research = _research_state(state)
+            if not todos or any(todo.status in {"pending", "in_progress"} for todo in todos) or (
+                research.get("needs_replan") or research.get("submitted") is True and research.get("gaps")
+            ):
+                return failure("submit", "todos_unresolved")
+            known = set(evidence.manifest)
+            if action.evidence_ids and not set(action.evidence_ids).issubset(known):
+                return failure("submit", "unknown_evidence_id")
+            if not known or not evidence.items:
+                return failure("submit", "no_verified_evidence")
+            return _Step(todos, [*observations, {"kind": "submit", "ok": True}], evidence, submitted=True)
+
+        todo_ids = action.todo_ids if isinstance(action, DelegateResearch) else (action.todo_id,)
+        if isinstance(action, DelegateResearch):
+            if not set(action.queries).issubset(todo_ids) or any(
+                not query.strip() or len(query) > 8_000 for query in action.queries.values()
+            ):
+                return failure("delegate", "todo_query_invalid")
+            if any(todo.blocked_by and todo.id in todo_ids and todo.id not in action.queries for todo in todos):
+                return failure("delegate", "dependency_query_required")
+        try:
+            claimed = TodoReducer.claim_many(todos, todo_ids)
+        except InvalidTodoTransition:
+            return failure("delegate" if isinstance(action, DelegateResearch) else "retrieval", "todo_not_ready")
+        blocked = TodoReducer.block_many(claimed, todo_ids)
+
         if isinstance(action, CalculatorCall):
             observation = await self._tools.calculator(action.expression)
-            return _Step(todos, [*observations, {"kind": "calculator", **observation}], evidence)
-        if isinstance(action, SubmitEvidence):
-            known = {item.get("evidence_id") for item in evidence}
-            # Evidence identifiers are server-derived; a model cannot submit an invented one.
-            if action.evidence_ids and not set(action.evidence_ids).issubset(known):
-                return _Step(todos, [*observations, {
-                    "kind": "submit", "ok": False,
-                    "error_code": "unknown_evidence_id", "retryable": False,
-                    "attempt": round_number + 1,
-                }], evidence)
-            return _Step(todos, [*observations, {"kind": "submit", "ok": True}], evidence, submitted=True)
-        if isinstance(action, DelegateResearch):
-            if self._subagents is None:
-                return _Step(todos, [*observations, {
-                    "kind": "delegate", "ok": False,
-                    "error_code": "subagent_unavailable", "retryable": True,
-                    "attempt": round_number + 1,
-                }], evidence)
-            by_id = {todo.id: todo for todo in todos}
-            if not set(action.todo_ids).issubset(by_id):
-                return _Step(todos, [*observations, {
-                    "kind": "delegate", "ok": False,
-                    "error_code": "todo_not_found", "retryable": False,
-                    "attempt": round_number + 1,
-                }], evidence)
-            selected = tuple(by_id[todo_id] for todo_id in action.todo_ids)
-            completed = frozenset(todo.id for todo in todos if todo.status == "completed")
+            if not observation.get("ok"):
+                return _Step(blocked, [*observations, {"kind": "calculator", **observation}], evidence)
+            ref = f"calculator:{action.todo_id}:{round_number + 1}"
+            completed = TodoReducer.complete(claimed, action.todo_id, result_ref=ref)
+            return _Step(completed, [*observations, {
+                "kind": "calculator", "todo_id": action.todo_id, "result_ref": ref, **observation,
+            }], evidence, task_results={ref: observation})
+
+        if isinstance(action, RetrieveEvidence):
             try:
-                delegated = await self._subagents.delegate(
-                    selected,
-                    context,
-                    max_parallel=snapshot_from_state(state).max_parallel_subagents_per_run,
-                    resolved_todo_ids=completed,
+                batch, addition = await self._tools.retrieve_evidence(
+                    query=action.query, ctx=context, target_id=action.todo_id,
                 )
+                merged = _merge_packed(evidence, addition, max_tokens=context.snapshot.max_evidence_tokens)
             except asyncio.CancelledError:
                 raise
-            except (KeyboardInterrupt, SystemExit):
-                raise
+            except (TypeError, ValueError):
+                return failure("retrieval", "research_evidence_invalid", selected=blocked, terminal=True)
             except Exception:
-                return _Step(todos, [*observations, {
-                    "kind": "delegate", "ok": False,
-                    "error_code": "subagent_unavailable", "retryable": True,
-                    "attempt": round_number + 1,
-                }], evidence)
-            if delegated.results:
-                packed = EvidenceReducer.merge(
-                    delegated.results,
-                    expected_index_generation=context.snapshot.index_generation,
-                )
-                merged = _merge_evidence(evidence, [item.model_dump(mode="json") for item in packed.items])
-            else:
-                # A full timeout has no evidence to reduce; keep parent evidence
-                # and let the dispatcher-provided blocked IDs drive Todo state.
-                merged = evidence
-            selected_ids = {todo.id for todo in selected}
-            completed_results = {
-                result.todo_id: result
-                for result in delegated.results
-                if result.todo_id in selected_ids and result.evidence.items
-            }
-            known_evidence_ids = {
-                str(item.get("evidence_id"))
-                for item in merged
-                if isinstance(item.get("evidence_id"), str)
-            }
-            completed_ids = {
-                todo_id: tuple(
-                    item.evidence_id
-                    for item in result.evidence.items
-                    if item.evidence_id in known_evidence_ids
-                )
-                for todo_id, result in completed_results.items()
-            }
-            completed_ids = {
-                todo_id: evidence_ids
-                for todo_id, evidence_ids in completed_ids.items()
-                if evidence_ids
-            }
-            blocked_ids = set(delegated.blocked_todo_ids) & selected_ids
-            blocked_ids.update(
-                result.todo_id
-                for result in delegated.results
-                if result.todo_id in selected_ids and not result.evidence.items
-            )
-            blocked_ids.update(set(completed_results) - set(completed_ids))
-            blocked_ids.difference_update(completed_ids)
-            try:
-                started = TodoReducer.apply_many(
-                    todos,
-                    tuple(
-                        (todo_id, TodoUpdate(status="in_progress"))
-                        for todo_id in sorted(completed_ids)
-                    ),
-                    actor=SUPERVISOR_OWNER,
-                )
-                updated = TodoReducer.apply_many(
-                    started,
-                    tuple(
-                        [
-                            (
-                                todo_id,
-                                TodoUpdate(status="completed", evidence_ids=evidence_ids),
-                            )
-                            for todo_id, evidence_ids in sorted(completed_ids.items())
-                        ]
-                        + [
-                            (todo_id, TodoUpdate(status="blocked"))
-                            for todo_id in sorted(blocked_ids)
-                        ]
-                    ),
-                    actor=SUPERVISOR_OWNER,
-                )
-                TodoReducer.validate(updated)
-            except InvalidTodoTransition:
-                return _Step(
-                    _block_active(todos),
-                    [*observations, {
-                        "kind": "delegate", "ok": False,
-                        "error_code": "todo_update_invalid", "retryable": False,
-                        "attempt": round_number + 1,
-                    }],
-                    evidence,
-                )
-            return _Step(
-                updated,
-                [*observations, {
-                    "kind": "delegate", "ok": True,
-                    "completed_todo_ids": sorted(completed_ids), "blocked_todo_ids": sorted(blocked_ids),
-                }],
-                merged,
-            )
-        assert isinstance(action, CannotAnswer)
-        reason = "research_action_invalid" if action.reason == "research_action_invalid" else "cannot_answer"
-        return _Step(
-            todos,
-            [*observations, {
-                "kind": "cannot_answer",
-                "reason": action.reason,
-                "error_code": action.reason,
-                "retryable": action.reason == "model_unavailable",
-                "attempt": round_number + 1,
-            }],
-            evidence,
-            cannot_answer=True,
-            termination_reason=reason,
-        )
+                return failure("retrieval", "retrieval_unavailable", selected=blocked, retryable=True)
+            ids = tuple(item.evidence_id for item in addition.items)
+            completed = TodoReducer.complete(claimed, action.todo_id, evidence_ids=ids) if ids else blocked
+            return _Step(completed, [*observations, {
+                "kind": "retrieval", "ok": bool(ids), "todo_id": action.todo_id,
+                "evidence_ids": list(ids),
+            }], merged, retrieval_batches=[batch.model_dump(mode="json")])
 
+        assert isinstance(action, DelegateResearch)
+        if self._subagents is None:
+            return failure("delegate", "subagent_unavailable", selected=blocked, retryable=True)
+        by_id = {todo.id: todo for todo in todos}
+        selected = tuple(todo for todo in claimed if todo.id in todo_ids)
+        dependency_inputs = {
+            todo.id: tuple(
+                TodoDependencyInput(todo_id=dep, evidence_ids=by_id[dep].evidence_ids,
+                                    result_ref=by_id[dep].result_ref)
+                for dep in todo.blocked_by
+            ) for todo in selected
+        }
+        memory = state.get("memory_context", {})
+        try:
+            delegated = await self._subagents.delegate(
+                selected, context,
+                max_parallel=context.snapshot.max_parallel_subagents_per_run,
+                resolved_todo_ids=frozenset(todo.id for todo in todos if todo.status == "completed"),
+                packed_evidence=evidence, dependency_inputs=dependency_inputs,
+                task_results=_research_state(state).get("results", {}),
+                queries=action.queries,
+                memory_summary=str(memory.get("rendered_context", "")) if isinstance(memory, Mapping) else "",
+            )
+        except asyncio.CancelledError:
+            raise
+        except (TypeError, ValueError):
+            return failure("delegate", "research_evidence_invalid", selected=blocked, terminal=True)
+        except Exception:
+            return failure("delegate", "subagent_unavailable", selected=blocked, retryable=True)
+        if any(result.evidence.items and result.batch is None for result in delegated.results):
+            return failure("delegate", "research_batches_missing", selected=blocked, terminal=True)
+        result_ids = [result.todo_id for result in delegated.results]
+        if len(set(result_ids)) != len(result_ids) or not set(result_ids).issubset(todo_ids):
+            return failure("delegate", "research_evidence_invalid", selected=blocked, terminal=True)
+        try:
+            # Validate each child before the reducer can discard malformed entries.
+            for result in delegated.results:
+                if _packed_validation_error(result.evidence, context.snapshot):
+                    raise ValueError("invalid child evidence")
+            merged = evidence
+            for result in sorted(delegated.results, key=lambda result: result.todo_id):
+                merged = _merge_packed(merged, result.evidence, max_tokens=context.snapshot.max_evidence_tokens)
+        except (TypeError, ValueError):
+            return failure("delegate", "research_evidence_invalid", selected=blocked, terminal=True)
+        updated = claimed
+        completed_ids = []
+        for result in delegated.results:
+            ids = tuple(item.evidence_id for item in result.evidence.items)
+            if ids:
+                updated = TodoReducer.complete(updated, result.todo_id, evidence_ids=ids)
+                completed_ids.append(result.todo_id)
+        blocked_ids = tuple(key for key in todo_ids if key not in completed_ids)
+        updated = TodoReducer.block_many(updated, blocked_ids)
+        return _Step(updated, [*observations, {
+            "kind": "delegate", "ok": True, "completed_todo_ids": sorted(completed_ids),
+            "blocked_todo_ids": sorted(blocked_ids),
+        }], merged, retrieval_batches=[
+            result.batch.model_dump(mode="json") for result in delegated.results if result.batch is not None
+        ])
 
 class _ResearchActionSchema(RootModel[ResearchAction]):
     """Strict discriminated union passed to ModelGateway for one repair owner."""
@@ -455,11 +430,12 @@ class _ResearchActionSchema(RootModel[ResearchAction]):
 class _Step:
     todos: tuple[TodoItem, ...]
     observations: list[dict[str, object]]
-    evidence: list[dict[str, object]]
+    evidence: PackedEvidence
     submitted: bool = False
     cannot_answer: bool = False
     termination_reason: str | None = None
     retrieval_batches: list[dict[str, object]] = field(default_factory=list)
+    task_results: dict[str, object] = field(default_factory=dict)
 
 
 def _parse_action(value: object) -> ResearchAction:
@@ -476,8 +452,10 @@ def _research_state(state: QueryState) -> dict[str, object]:
 
 
 def _todos(value: object) -> tuple[TodoItem, ...]:
-    if not isinstance(value, list):
+    if value is None:
         return ()
+    if not isinstance(value, list) or any(not isinstance(item, Mapping) for item in value):
+        raise ValueError("invalid serialized research todos")
     try:
         parsed = tuple(TodoItem.model_validate(item) for item in value if isinstance(item, Mapping))
         TodoReducer.validate(parsed)
@@ -490,11 +468,6 @@ def _observations(value: object) -> list[dict[str, object]]:
     return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
 
 
-def _evidence(state: QueryState) -> list[dict[str, object]]:
-    value = state.get("evidence")
-    return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
-
-
 def _retrieval_batches(state: QueryState) -> list[dict[str, object]]:
     value = state.get("retrieval_batches")
     return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
@@ -504,13 +477,188 @@ def _dump_todos(todos: tuple[TodoItem, ...]) -> list[dict[str, object]]:
     return [todo.model_dump(mode="json") for todo in todos]
 
 
-def _merge_evidence(existing: list[dict[str, object]], additions: list[dict[str, object]]) -> list[dict[str, object]]:
-    merged = {str(item.get("evidence_id")): item for item in existing if item.get("evidence_id")}
-    for item in additions:
-        evidence_id = item.get("evidence_id")
-        if evidence_id:
-            merged[str(evidence_id)] = item
-    return [merged[key] for key in sorted(merged)]
+def _empty_packed(snapshot: Any) -> PackedEvidence:
+    return PackedEvidence(
+        items=(),
+        manifest={},
+        rendered_context="",
+        token_count=0,
+        index_generation=snapshot.index_generation,
+    )
+
+
+def _packed_from_state(state: QueryState, snapshot: Any) -> PackedEvidence:
+    value = state.get("packed_context")
+    if not isinstance(value, Mapping):
+        return _empty_packed(snapshot)
+    try:
+        packed = PackedEvidence.model_validate(value)
+    except (TypeError, ValueError):
+        return _empty_packed(snapshot)
+    return (
+        packed
+        if _packed_validation_error(packed, snapshot) is None
+        else _empty_packed(snapshot)
+    )
+
+
+def _packed_validation_error(value: object, snapshot: Any) -> str | None:
+    """Validate a checkpoint pack before any document-derived text is prompted."""
+    try:
+        packed = value if isinstance(value, PackedEvidence) else PackedEvidence.model_validate(value)
+    except (TypeError, ValueError):
+        return "malformed"
+    if packed.index_generation != snapshot.index_generation:
+        return "stale_index_generation"
+    if type(packed.token_count) is not int or packed.token_count < 0:
+        return "invalid_token_count"
+    if packed.token_count > snapshot.max_evidence_tokens:
+        return "evidence_over_budget"
+    if packed.token_count != len(packed.rendered_context):
+        return "token_count_mismatch"
+    if len(packed.manifest) != len(packed.items):
+        return "manifest_item_count_mismatch"
+    if len({item.evidence_id for item in packed.items}) != len(packed.items):
+        return "duplicate_evidence_id"
+    rendered: list[str] = []
+    for item in packed.items:
+        manifest = packed.manifest.get(item.evidence_id)
+        if not _matches_manifest(item, manifest):
+            return "manifest_mismatch"
+        rendered.append(
+            DataEnvelope(
+                source_label=f"document:{item.document_id}",
+                evidence_id=item.evidence_id,
+                content=item.content,
+                heading_path=item.heading_path,
+            ).render()
+        )
+    if packed.rendered_context != "\n".join(rendered):
+        return "rendered_context_mismatch"
+    return None
+
+
+def _matches_manifest(
+    item: EvidenceItem, manifest: EvidenceManifestEntry | None
+) -> bool:
+    return manifest is not None and (
+        manifest.evidence_id,
+        manifest.parent_id,
+        manifest.document_id,
+        manifest.document_version_id,
+        manifest.ast_locator,
+        manifest.heading_path,
+    ) == (
+        item.evidence_id,
+        item.parent_id,
+        item.document_id,
+        item.document_version_id,
+        item.ast_locator,
+        item.heading_path,
+    )
+
+
+def _coverage_targets(
+    state: QueryState, todos: tuple[TodoItem, ...]
+) -> tuple[EvidenceCoverageTarget, ...]:
+    targets = [
+        EvidenceCoverageTarget(
+            target_id=f"query:{state['run_id']}",
+            description=question_from_state(state),
+        )
+    ]
+    targets.extend(
+        EvidenceCoverageTarget(target_id=todo.id, description=todo.title)
+        for todo in todos
+    )
+    return tuple(dict((target.target_id, target) for target in targets).values())
+
+
+def _merge_packed(
+    existing: PackedEvidence,
+    addition: PackedEvidence,
+    *,
+    max_tokens: int | None = None,
+) -> PackedEvidence:
+    """Merge compatibility-only child packs without replacing source metadata."""
+    if existing.index_generation != addition.index_generation:
+        raise ValueError("evidence index generation must be consistent")
+    selected: dict[str, tuple[EvidenceItem, EvidenceManifestEntry]] = {}
+    for packed in (existing, addition):
+        for item in packed.items:
+            manifest = packed.manifest.get(item.evidence_id)
+            if manifest is None or not _matches_manifest(item, manifest):
+                raise ValueError("evidence manifest does not match its item")
+            prior = selected.get(item.evidence_id)
+            if prior is not None:
+                prior_item, prior_manifest = prior
+                if prior_manifest != manifest or not _same_evidence_metadata(
+                    prior_item, item
+                ):
+                    raise ValueError("conflicting evidence metadata for evidence id")
+                selected[item.evidence_id] = (
+                    prior_item.model_copy(
+                        update={
+                            "covered_target_ids": tuple(
+                                dict.fromkeys(
+                                    (
+                                        *prior_item.covered_target_ids,
+                                        *item.covered_target_ids,
+                                    )
+                                )
+                            )
+                        }
+                    ),
+                    prior_manifest,
+                )
+                continue
+            selected[item.evidence_id] = (item, manifest)
+    chosen: list[tuple[EvidenceItem, EvidenceManifestEntry]] = []
+    rendered_parts: list[str] = []
+    for key in sorted(selected):
+        item, manifest = selected[key]
+        rendered_item = DataEnvelope(
+            source_label=f"document:{item.document_id}",
+            evidence_id=item.evidence_id,
+            content=item.content,
+            heading_path=item.heading_path,
+        ).render()
+        candidate_rendered = "\n".join((*rendered_parts, rendered_item))
+        if max_tokens is not None and len(candidate_rendered) > max_tokens:
+            raise ValueError("evidence merge exceeds the snapshot token limit")
+        chosen.append((item, manifest))
+        rendered_parts.append(rendered_item)
+    ordered = tuple(item for item, _manifest in chosen)
+    merged_manifest = {item.evidence_id: manifest for item, manifest in chosen}
+    rendered = "\n".join(rendered_parts)
+    return PackedEvidence(
+        items=ordered,
+        manifest=merged_manifest,
+        rendered_context=rendered,
+        token_count=len(rendered),
+        index_generation=existing.index_generation,
+    )
+
+
+def _same_evidence_metadata(left: EvidenceItem, right: EvidenceItem) -> bool:
+    """Compare source identity while allowing coverage to accumulate."""
+    return (
+        left.evidence_id,
+        left.parent_id,
+        left.document_id,
+        left.document_version_id,
+        left.content,
+        left.ast_locator,
+        left.heading_path,
+    ) == (
+        right.evidence_id,
+        right.parent_id,
+        right.document_id,
+        right.document_version_id,
+        right.content,
+        right.ast_locator,
+        right.heading_path,
+    )
 
 
 def _block_active(todos: tuple[TodoItem, ...]) -> tuple[TodoItem, ...]:
@@ -519,19 +667,21 @@ def _block_active(todos: tuple[TodoItem, ...]) -> tuple[TodoItem, ...]:
 
 def _result(
     research: dict[str, object],
-    evidence: list[dict[str, object]],
+    packed: PackedEvidence,
     *,
     retrieval_batches: list[dict[str, object]] | None = None,
     submitted: bool = False,
     cannot_answer: bool = False,
     research_attempt_count: int,
     termination_reason: str | None = None,
+    next_node: str | None = None,
 ) -> dict[str, object]:
     return {
         "research": {**research, "submitted": submitted, "cannot_answer": cannot_answer},
-        "evidence": evidence,
+        "evidence": [item.model_dump(mode="json") for item in packed.items],
+        "packed_context": packed.model_dump(mode="json"),
         "retrieval_batches": retrieval_batches or [],
         "research_attempt_count": research_attempt_count,
-        "next_node": "generate" if submitted else "end",
+        "next_node": next_node or ("generate" if submitted else "end"),
         "termination_reason": termination_reason,
     }

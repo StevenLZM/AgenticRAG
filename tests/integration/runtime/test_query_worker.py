@@ -233,6 +233,48 @@ async def test_worker_claims_invokes_stable_checkpoint_and_acks_only_terminal_ru
     assert broker.acknowledged == ["1-0"]
 
 
+async def test_worker_question_reaches_memory_extractor_with_stable_source_id() -> None:
+    from agentic_rag.memory.models import MemoryExtraction
+    from agentic_rag.memory.service import ModelGatewayMemoryExtractor
+    from agentic_rag.query.graph import _public_messages
+    from agentic_rag.runtime.query_worker import QueryWorker
+
+    import json
+    from types import SimpleNamespace
+
+    payloads: list[list[dict[str, object]]] = []
+
+    class Gateway:
+        async def complete_structured(self, call: object, schema: object) -> object:
+            content = call.messages[1]["content"]
+            payloads.append(json.loads(content.split("JSON message data: ", 1)[1]))
+            return SimpleNamespace(value=MemoryExtraction(memories=()))
+
+    extractor = ModelGatewayMemoryExtractor(Gateway(), SNAPSHOT)
+
+    class ExtractionGraph:
+        async def ainvoke(self, state: dict[str, object], config: object) -> dict[str, object]:
+            await extractor.extract(_public_messages(state))
+            return state
+
+    runs = Runs()
+    run = await runs.create_queued(
+        SCOPE, "thread-1", SNAPSHOT, question="刘泽明偏好上海的工作"
+    )
+    worker = QueryWorker(
+        runs=runs, broker=Broker(), graph_factory=lambda **_: ExtractionGraph(),
+        worker_id="worker-1",
+    )
+    await worker._invoke_with_heartbeat(run)
+    await worker._invoke_with_heartbeat(run)
+
+    assert len(payloads[0]) == 1
+    assert payloads[0][0]["content"] == "刘泽明偏好上海的工作"
+    assert payloads[0][0]["role"] == "user"
+    assert payloads[0][0]["id"]
+    assert payloads[0] == payloads[1]
+
+
 async def test_worker_records_queue_span_when_trace_recorder_is_injected() -> None:
     """The worker's actual claim-to-finish path owns queue latency tracing."""
     from agentic_rag.observability.tracing import TraceRecorder

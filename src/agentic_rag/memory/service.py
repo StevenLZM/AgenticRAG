@@ -122,16 +122,36 @@ class MemoryServiceImpl:
     async def extract_and_store(
         self, scope: UserScope, run_id: str, messages: Sequence[PublicMessage]
     ) -> None:
+        report: dict[str, object] = {
+            "run_id": run_id, "message_count": len(messages),
+            "candidate_count": 0, "filtered_count": 0,
+            "write_completed_count": 0, "filter_reasons": {},
+        }
+
+        def record(outcome: str) -> None:
+            # Counts and fixed reason codes only; never log memory content.
+            logger.info("memory_capture_result", extra={**report, "outcome": outcome})
+
         if self._extractor is None:
+            record("extractor_unavailable")
             return
         public_messages = list(messages)
         try:
             candidates = await self._extractor.extract(public_messages)
         except (OSError, TimeoutError, ConnectionError, StructuredOutputValidationError) as error:
             await _log_degraded("extract", error)
+            record("extraction_failed")
             return
+        report["candidate_count"] = len(candidates)
+        filtered = 0
+        written = 0
+        reasons: dict[str, int] = {}
         for candidate in candidates:
-            if not _candidate_is_authorized(candidate, public_messages):
+            rejection = _candidate_rejection_reason(candidate, public_messages)
+            if rejection is not None:
+                filtered += 1
+                reasons[rejection] = reasons.get(rejection, 0) + 1
+                report.update(filtered_count=filtered, filter_reasons=reasons)
                 continue
             metadata: dict[str, object] = {
                 "user_id": scope.user_id,
@@ -147,11 +167,15 @@ class MemoryServiceImpl:
                     metadata=metadata,
                     infer=False,
                 )
+                written += 1
+                report["write_completed_count"] = written
             except _operational_errors() as error:
                 # Memory capture must not turn an otherwise valid query into a
                 # failed run; a later user statement may safely be captured.
                 await _log_degraded("add", error)
+                record("write_failed")
                 return
+        record("write_completed" if written else "filtered" if candidates else "no_candidates")
 
     async def list(self, scope: UserScope) -> builtins.list[MemoryRecord]:
         try:
@@ -332,17 +356,23 @@ def _optional_string(value: object) -> str | None:
 def _candidate_is_authorized(
     candidate: MemoryCandidate, messages: Sequence[PublicMessage]
 ) -> bool:
+    return _candidate_rejection_reason(candidate, messages) is None
+
+
+def _candidate_rejection_reason(
+    candidate: MemoryCandidate, messages: Sequence[PublicMessage]
+) -> str | None:
     """Accept only user sources or an assistant claim confirmed in this batch."""
     by_id = {message.id: message for message in messages}
     sources = [by_id.get(source_id) for source_id in candidate.source_message_ids]
     if any(source is None for source in sources):
-        return False
+        return "unknown_source_message"
     resolved = [source for source in sources if source is not None]
     if any(source.role == "system" for source in resolved):
-        return False
+        return "system_source"
     assistant_sources = [source for source in resolved if source.role == "assistant"]
     if not assistant_sources:
-        return all(source.role == "user" for source in resolved)
+        return None
     for assistant in assistant_sources:
         confirmation_id = assistant.confirmation_message_id
         confirmation = by_id.get(confirmation_id) if confirmation_id else None
@@ -352,8 +382,8 @@ def _candidate_is_authorized(
             or confirmation.role != "user"
             or confirmation.id not in candidate.source_message_ids
         ):
-            return False
-    return all(source.role in {"user", "assistant"} for source in resolved)
+            return "unconfirmed_assistant_source"
+    return None
 
 
 # Network/SDK failures are intentionally narrow; invalid provider data becomes

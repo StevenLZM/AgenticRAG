@@ -96,6 +96,12 @@ class VersionLifecycleStore(Protocol):
     async def delete(self, context: StagingContext) -> None: ...
 
 
+class ActiveIndexAliasStore(Protocol):
+    """Atomically publish the validated physical index generation."""
+
+    async def switch_active_alias(self, index_generation: str) -> bool: ...
+
+
 class ManifestArtifactReader(Protocol):
     """Minimal immutable Artifact boundary required by publication."""
 
@@ -116,11 +122,13 @@ class VersionPublisher:
         parent_store: VersionLifecycleStore,
         child_store: VersionLifecycleStore,
         artifacts: ManifestArtifactReader,
+        alias_store: ActiveIndexAliasStore | None = None,
     ) -> None:
         self._repository = repository
         self._parent_store = parent_store
         self._child_store = child_store
         self._artifacts = artifacts
+        self._alias_store = alias_store
 
     async def publish(
         self,
@@ -154,6 +162,11 @@ class VersionPublisher:
         await _fence(before_side_effect)
         await self._require_writable(target.context)
         await self._repository.finalize(target)
+        if self._alias_store is not None:
+            await _fence(before_side_effect)
+            await self._alias_store.switch_active_alias(
+                target.context.index_generation
+            )
 
     async def _require_writable(self, context: StagingContext) -> None:
         if not await self._repository.is_writable(context):

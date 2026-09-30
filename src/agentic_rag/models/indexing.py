@@ -6,8 +6,9 @@ import re
 
 
 _INDEX_GENERATION = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
-DEFAULT_INDEX_GENERATION = "index-v2"
+DEFAULT_INDEX_GENERATION = "index-v3"
 LEGACY_INDEX_GENERATIONS = frozenset({"index-v1"})
+ACTIVE_CHILD_INDEX_ALIAS = "agenticrag-children-active"
 
 
 def validate_index_generation(value: str) -> str:

@@ -135,6 +135,7 @@ async def run(settings: Settings) -> None:
         parent_store=parent_store,
         child_store=child_store,
         artifacts=artifacts,
+        alias_store=child_store,
     )
     reconciler = IngestionReconciler(
         repository=SqlAlchemyReconciliationRepository(factory),

@@ -14,7 +14,10 @@ from typing import Any, Literal, cast
 from elasticsearch import AsyncElasticsearch
 
 from agentic_rag.ingestion.indexer import EMBEDDING_DIMENSIONS
-from agentic_rag.models.indexing import validate_index_generation
+from agentic_rag.models.indexing import (
+    ACTIVE_CHILD_INDEX_ALIAS,
+    validate_index_generation,
+)
 from agentic_rag.retrieval.models import ChildHit, SearchFilter
 
 
@@ -28,9 +31,6 @@ class IndexGenerationMismatchError(ValueError):
 
 class UnsupportedDateRangeError(ValueError):
     """Raised until Child index mappings store a queryable document date."""
-
-
-ACTIVE_CHILD_INDEX_ALIAS = "agenticrag-children-active"
 
 
 _HIT_SOURCE_FIELDS = (
@@ -121,7 +121,7 @@ class _ElasticsearchChildSearch:
                     ),
                     lane=lane,
                     lane_rank=rank,
-                    score=float(raw_hit.get("_score") or 0.0),
+                    retrieval_score=float(raw_hit.get("_score") or 0.0),
                 )
             )
         return hits

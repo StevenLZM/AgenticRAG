@@ -330,11 +330,6 @@ class ParentBuilder:
         if not pending:
             pending.append(piece)
             return
-        if pending[-1].content_type != piece.content_type:
-            drafts.append((heading_path, heading_ast_locators, list(pending)))
-            pending.clear()
-            pending.append(piece)
-            return
 
         candidate_content = _join_piece_content((*pending, piece))
         candidate_tokens = self._count(candidate_content)

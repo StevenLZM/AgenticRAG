@@ -18,9 +18,9 @@ def aggregate_parents(
 ) -> list[ParentEvidence]:
     """Group reranked children into a deterministic, bounded parent list.
 
-    The input order is the reranker order.  Children are therefore retained in
-    that order, while parent ranking uses each parent's highest rerank score and
-    the first matching child as its stable tie breaker.
+    Children retain input order. Parent ranking uses each parent's latest
+    available stage score (rerank, then RRF, then raw retrieval) and the best
+    matching child's position as its stable tie breaker.
     """
     if max_children_per_parent < 1:
         raise ValueError("max_children_per_parent must be positive")
@@ -33,7 +33,7 @@ def aggregate_parents(
         if selection is None:
             selection = _ParentSelection(best_hit=hit, first_position=position)
             selections[hit.parent_id] = selection
-        elif hit.score > selection.best_hit.score:
+        elif hit.ranking_score > selection.best_hit.ranking_score:
             selection.best_hit = hit
             selection.best_position = position
 
@@ -43,7 +43,7 @@ def aggregate_parents(
     ordered = sorted(
         selections.values(),
         key=lambda selection: (
-            -selection.best_hit.score,
+            -selection.best_hit.ranking_score,
             selection.best_position,
             selection.best_hit.parent_id,
         ),
@@ -66,7 +66,9 @@ class _ParentSelection:
             document_version_id=self.best_hit.document_version_id,
             content="",
             child_hits=tuple(self.child_hits),
-            rerank_score=self.best_hit.score,
+            retrieval_score=self.best_hit.retrieval_score,
+            rrf_score=self.best_hit.rrf_score,
+            rerank_score=self.best_hit.rerank_score,
         )
 
 
@@ -115,7 +117,10 @@ class ParentFetcher:
                     document_version_id=evidence.document_version_id,
                     content=parent.content,
                     child_hits=evidence.child_hits,
+                    retrieval_score=evidence.retrieval_score,
+                    rrf_score=evidence.rrf_score,
                     rerank_score=evidence.rerank_score,
+                    heading_path=parent.heading_path,
                 )
             )
         return hydrated
@@ -147,5 +152,6 @@ def _to_parent_evidence(parent: ParentChunk) -> ParentEvidence:
         document_version_id=parent.document_version_id,
         content=parent.content,
         child_hits=(),
-        rerank_score=0.0,
+        retrieval_score=0.0,
+        heading_path=parent.heading_path,
     )

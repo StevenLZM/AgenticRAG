@@ -17,6 +17,7 @@ from agentic_rag.safety.context import DataEnvelope
 
 MAX_PACKED_EVIDENCE_TOKENS = 12_000
 MAX_ITEMS_PER_DOCUMENT = 3
+MAX_ITEMS_SINGLE_DOCUMENT = 6
 
 
 class EvidenceCoverageTarget(BaseModel):
@@ -40,6 +41,7 @@ class EvidenceItem(BaseModel):
     content: str
     ast_locator: str
     covered_target_ids: tuple[str, ...]
+    heading_path: tuple[str, ...] = ()
 
 
 class EvidenceManifestEntry(BaseModel):
@@ -52,6 +54,7 @@ class EvidenceManifestEntry(BaseModel):
     document_id: str
     document_version_id: str
     ast_locator: str
+    heading_path: tuple[str, ...] = ()
 
 
 class PackedEvidence(BaseModel):
@@ -64,6 +67,26 @@ class PackedEvidence(BaseModel):
     rendered_context: str
     token_count: int
     index_generation: str
+
+
+def model_evidence_manifest(
+    manifest: Mapping[str, EvidenceManifestEntry],
+) -> dict[str, dict[str, object]]:
+    """Return the allowlisted provenance fields needed by model prompts.
+
+    The authoritative manifest, including ``ast_locator``, remains on
+    ``PackedEvidence`` for deterministic citation and authorization checks.
+    """
+    return {
+        evidence_id: {
+            "evidence_id": entry.evidence_id,
+            "parent_id": entry.parent_id,
+            "document_id": entry.document_id,
+            "document_version_id": entry.document_version_id,
+            "heading_path": entry.heading_path,
+        }
+        for evidence_id, entry in manifest.items()
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,10 +123,9 @@ class EvidenceBuilder:
             max_tokens, snapshot.max_evidence_tokens, MAX_PACKED_EVIDENCE_TOKENS
         )
         candidates = self._candidates(batches, coverage_targets, scope)
-        descriptions_by_id = {
-            target.target_id: target.description.casefold()
-            for target in coverage_targets
-        }
+        allow_single_document = bool(candidates) and len(
+            {candidate.parent.document_id for candidate in candidates}
+        ) == 1
 
         items: list[EvidenceItem] = []
         rendered: list[str] = []
@@ -119,12 +141,16 @@ class EvidenceBuilder:
                 if target.target_id not in candidate.target_ids or key in selected_keys:
                     continue
                 packed = self._pack_candidate(
-                    candidate, rendered, capacity, descriptions_by_id
+                    candidate, rendered, capacity
                 )
                 if (
                     packed is None
                     or target.target_id not in packed[0].covered_target_ids
-                    or not _within_document_limit(candidate, document_counts)
+                    or not _within_document_limit(
+                        candidate,
+                        document_counts,
+                        allow_single_document=allow_single_document,
+                    )
                 ):
                     continue
                 item, rendered_envelope = packed
@@ -139,14 +165,14 @@ class EvidenceBuilder:
             key = (candidate.parent.parent_id, candidate.parent.document_version_id)
             if key in selected_keys:
                 continue
-            if (
-                not candidate.is_direct_single_document
-                and document_counts[candidate.parent.document_id]
-                >= MAX_ITEMS_PER_DOCUMENT
+            if not _within_document_limit(
+                candidate,
+                document_counts,
+                allow_single_document=allow_single_document,
             ):
                 continue
             packed = self._pack_candidate(
-                candidate, rendered, capacity, descriptions_by_id
+                candidate, rendered, capacity
             )
             if packed is None:
                 continue
@@ -162,6 +188,7 @@ class EvidenceBuilder:
                 document_id=item.document_id,
                 document_version_id=item.document_version_id,
                 ast_locator=item.ast_locator,
+                heading_path=item.heading_path,
             )
             for item in items
         }
@@ -179,13 +206,13 @@ class EvidenceBuilder:
         candidate: _Candidate,
         rendered: Sequence[str],
         capacity: int,
-        descriptions_by_id: Mapping[str, str],
     ) -> tuple[EvidenceItem, str] | None:
         item = self._item(candidate)
         envelope = DataEnvelope(
             source_label=f"document:{item.document_id}",
             evidence_id=item.evidence_id,
             content=item.content,
+            heading_path=item.heading_path,
         )
         included = self._fit(
             envelope,
@@ -196,10 +223,12 @@ class EvidenceBuilder:
         if included is None:
             return None
         fitted_content, rendered_envelope = included
-        retained_target_ids = tuple(
-            target_id
-            for target_id in item.covered_target_ids
-            if descriptions_by_id[target_id] in fitted_content.casefold()
+        # Coverage is provenance attached to the retrieval batch, not a text
+        # match inferred from untrusted document content.  Cropping may remove
+        # the human-readable target description while retaining usable source
+        # content, so preserve the server-owned IDs in that case.
+        retained_target_ids = (
+            item.covered_target_ids if _has_usable_content(fitted_content) else ()
         )
         return (
             item.model_copy(
@@ -218,25 +247,23 @@ class EvidenceBuilder:
         scope: UserScope,
     ) -> list[_Candidate]:
         candidates: list[_Candidate] = []
+        known_target_ids = {target.target_id for target in targets}
         for batch_position, batch in enumerate(batches):
             for parent_position, parent in enumerate(batch.parents):
                 child_hits = _valid_child_hits(parent, scope)
                 if not child_hits:
                     continue
                 locator = child_hits[0].ast_locator
-                haystack = "\n".join(
-                    (parent.content, *(child.content for child in child_hits))
-                ).casefold()
-                target_ids = tuple(
-                    target.target_id
-                    for target in targets
-                    if target.description.casefold() in haystack
+                candidate_target_ids = tuple(
+                    target_id
+                    for target_id in dict.fromkeys(batch.target_ids)
+                    if target_id in known_target_ids
                 )
                 candidates.append(
                     _Candidate(
                         parent=parent,
                         locator=locator,
-                        target_ids=target_ids,
+                        target_ids=candidate_target_ids,
                         is_direct_single_document=(
                             len(batch.document_ids) == 1
                             and batch.document_ids[0] == parent.document_id
@@ -249,7 +276,7 @@ class EvidenceBuilder:
         ranked = sorted(
             candidates,
             key=lambda candidate: (
-                -candidate.parent.rerank_score,
+                -candidate.parent.ranking_score,
                 candidate.batch_position,
                 candidate.parent_position,
                 candidate.parent.parent_id,
@@ -287,6 +314,7 @@ class EvidenceBuilder:
             ),
             ast_locator=candidate.locator,
             covered_target_ids=candidate.target_ids,
+            heading_path=parent.heading_path,
         )
 
     @staticmethod
@@ -332,13 +360,30 @@ def _valid_child_hits(parent: ParentEvidence, scope: UserScope) -> tuple[ChildHi
 
 
 def _within_document_limit(
-    candidate: _Candidate, document_counts: Counter[str]
+    candidate: _Candidate,
+    document_counts: Counter[str],
+    *,
+    allow_single_document: bool | None = None,
 ) -> bool:
     """Apply diversity only when the request is not a direct document lookup."""
-    return (
+    single_document = (
         candidate.is_direct_single_document
-        or document_counts[candidate.parent.document_id] < MAX_ITEMS_PER_DOCUMENT
+        if allow_single_document is None
+        else allow_single_document
     )
+    return (
+        document_counts[candidate.parent.document_id]
+        < (
+            MAX_ITEMS_SINGLE_DOCUMENT
+            if single_document
+            else MAX_ITEMS_PER_DOCUMENT
+        )
+    )
+
+
+def _has_usable_content(content: str) -> bool:
+    """Return whether a fitted fragment still contains source characters."""
+    return any(character not in {"…", " ", "\n", "\r", "\t"} for character in content)
 
 
 def _crop_around_child(content: str, child_content: str, limit: int = 1_200) -> str:
