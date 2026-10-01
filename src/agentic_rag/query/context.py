@@ -6,7 +6,8 @@ import json
 from collections.abc import Mapping
 from typing import Protocol
 
-from agentic_rag.query.state import QueryState, question_from_state, snapshot_from_state
+from agentic_rag.query.state import QueryState, snapshot_from_state
+from agentic_rag.query.routing_context import reasoning_question
 from agentic_rag.query.todos import MAX_TODO_ATTEMPTS, TodoItem, TodoReducer
 
 
@@ -25,7 +26,7 @@ class ContextBuilder:
 
     async def build(self, state: QueryState | dict[str, object]) -> dict[str, object]:
         typed_state = state  # TypedDict values are JSON-compatible by contract.
-        question = question_from_state(typed_state)  # type: ignore[arg-type]
+        question = reasoning_question(typed_state)  # type: ignore[arg-type]
         snapshot = snapshot_from_state(typed_state)  # type: ignore[arg-type]
         research = _mapping(typed_state.get("research"))
         todos = _list_of_mappings(research.get("todos"))

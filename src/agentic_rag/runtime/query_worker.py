@@ -442,6 +442,7 @@ class QueryWorker:
             }],
         )
         config: dict[str, object] = {"configurable": {"thread_id": claim.checkpoint_thread_id}}
+        state["request"]["thread_id"] = claim.thread_id
         task = asyncio.create_task(graph.ainvoke(dict(state), config))  # type: ignore[union-attr]
         try:
             while True:

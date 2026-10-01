@@ -48,6 +48,7 @@ class RuntimeConfigSnapshot(BaseModel):
     app_version: str
     graph_version: str
     prompt_version: str
+    routing_policy_version: str | None = None
     prompt_hashes: PromptHashes = ()
     main_model_id: str
     light_model_id: str

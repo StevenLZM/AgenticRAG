@@ -46,6 +46,13 @@ from agentic_rag.query.fast_rag import FastRagDependencies, EvidenceGrader as Ev
 from agentic_rag.query.generation import AnswerGenerator
 from agentic_rag.query.research_loop import ResearchAgentLoop
 from agentic_rag.query.router import MemoryContextLoader, route_query
+from agentic_rag.models.schemas import EvidenceGrade, RouteAssessment
+from agentic_rag.query.audit import EvidenceGradingUnavailable
+from agentic_rag.query.routing_context import (
+    ConversationReader, RoutingContext, RoutingContextUnavailable, fresh_routing_state,
+    prepare_routing_state, reasoning_question,
+)
+from agentic_rag.query.routing_policy import RuntimeCapabilities, decide_grade, policy_update, technical_failure
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.retrieval.graph import RetrievalService
 from agentic_rag.retrieval.models import EvidenceBatch
@@ -78,6 +85,8 @@ class QueryGraphDependencies:
     event_emitter: AgentEventEmitter | None = None
     concurrency: ConcurrencyManager | None = None
     owned_resources: tuple[object, ...] = ()
+    capabilities: RuntimeCapabilities | None = None
+    conversations: ConversationReader | None = None
 
 
 def query_checkpoint_config(state: QueryState) -> RunnableConfig:
@@ -109,20 +118,34 @@ def build_query_graph(
         retrieval=dependencies.retrieval,
         evidence_builder=dependencies.evidence_builder,
         evidence_grader=dependencies.evidence_grader,
+        capabilities=dependencies.capabilities,
     )
 
     async def load_memory(state: QueryState, config: RunnableConfig) -> dict[str, object]:
         _assert_server_checkpoint_namespace(state, config)
+        prepared: dict[str, object] = {}
+        if dependencies.capabilities is not None:
+            prepared = fresh_routing_state(state)
+            state = cast(QueryState, {**state, **prepared})
+            try:
+                prepared.update(await prepare_routing_state(state, capabilities=dependencies.capabilities,
+                                                           conversations=dependencies.conversations))
+            except RoutingContextUnavailable:
+                return {**prepared, **policy_update(state, technical_failure("routing_context_unavailable")),
+                        "errors": [{"code": "routing_context_unavailable"}]}
+            state = cast(QueryState, {**state, **prepared})
         async with _trace_span(dependencies, state, "graph.node.memory_loader"):
             async with _trace_span(dependencies, state, "memory"):
                 update = await memory_loader.load(state)
         await _event(dependencies, state, "MEMORY_LOADED", "memory context loaded")
-        return update
+        return {**prepared, **update}
 
     async def route(state: QueryState) -> dict[str, object]:
+        if dependencies.capabilities is not None and state.get("response_mode") == "technical_error":
+            return {"next_node": "chat"}
         async with _trace_span(dependencies, state, "graph.node.route"):
             async with _trace_span(dependencies, state, "llm"):
-                update = await route_query(state, dependencies.gateway)
+                update = await route_query(state, dependencies.gateway, capabilities=dependencies.capabilities)
         await _event(dependencies, state, "QUERY_ROUTED", str(update.get("next_node", "research_agent")))
         return update
 
@@ -149,6 +172,12 @@ def build_query_graph(
         return {}
 
     async def research_agent_loop(state: QueryState) -> dict[str, object]:
+        if dependencies.capabilities is not None and state.get("last_evidence_grade"):
+            grade = EvidenceGrade.model_validate(state["last_evidence_grade"])
+            if grade.gap_type in {"external_realtime_required", "external_lookup_required"}:
+                assessment = RouteAssessment.model_validate(state["route_assessment"]) if state.get("route_assessment") else None
+                return policy_update(state, decide_grade(grade, assessment, dependencies.capabilities,
+                    research_attempts=state.get("research_attempt_count", 0), max_research_rounds=snapshot_from_state(state).max_research_rounds))
         async with _trace_span(dependencies, state, "graph.node.research_agent_loop"):
             update = await dependencies.research_loop.ainvoke(state)
         await _event(
@@ -202,6 +231,23 @@ def build_query_graph(
                 }
 
     async def evidence_grader(state: QueryState) -> dict[str, object]:
+        if dependencies.capabilities is not None:
+            try:
+                async with _trace_span(dependencies, state, "graph.node.evidence_grader"):
+                    grade_v2 = await dependencies.evidence_grader.grade(
+                        reasoning_question(state), _packed_from_state(state), scope=scope_from_state(state),
+                        snapshot=snapshot_from_state(state), capabilities=dependencies.capabilities,
+                        routing_context=RoutingContext.model_validate(state["routing_context"]) if state.get("routing_context") else None)
+                grade_v2 = EvidenceGrade.model_validate(_unwrap(grade_v2))
+            except (EvidenceGradingUnavailable, OSError, TimeoutError, ValueError, TypeError):
+                return {**policy_update(state, technical_failure("evidence_grader_unavailable")),
+                        "errors": [*state.get("errors", []), {"code": "evidence_grader_unavailable"}]}
+            assessment = RouteAssessment.model_validate(state["route_assessment"]) if state.get("route_assessment") else None
+            await _event(dependencies, state, "EVIDENCE_GRADED", grade_v2.decision)
+            decision_v2 = decide_grade(grade_v2, assessment, dependencies.capabilities,
+                research_attempts=state.get("research_attempt_count", 0), max_research_rounds=snapshot_from_state(state).max_research_rounds)
+            return {**policy_update(state, decision_v2), "last_evidence_grade": grade_v2.model_dump(mode="json"),
+                    "research": {**state.get("research", {}), "gaps": list(grade_v2.gaps)}}
         async with _trace_span(dependencies, state, "graph.node.evidence_grader"):
             async with _trace_span(dependencies, state, "llm"):
                 packed = _packed_from_state(state)
@@ -236,7 +282,7 @@ def build_query_graph(
                     # `generate_with_mandatory_audits` is the sole owner of revision
                     # policy; subsequent graph nodes expose its completed gates only.
                     update = await generate_with_mandatory_audits(
-                        question=question_from_state(state), state=state, packed_evidence=packed,
+                        question=reasoning_question(state), state=state, packed_evidence=packed,
                         scope=scope_from_state(state), snapshot=snapshot_from_state(state),
                         generator=dependencies.generator, faithfulness_auditor=dependencies.faithfulness_auditor,
                         citation_validator=dependencies.citation_validator, authorization={},
@@ -291,6 +337,8 @@ def build_query_graph(
         return "fast_rag" if state.get("next_node") == "fast_rag" else "research_agent_loop"
 
     def after_fast_grade(state: QueryState) -> str:
+        if state.get("next_node") == "chat":
+            return "chat"
         next_node = state.get("next_node")
         if next_node == "generate":
             return "generate"
@@ -299,6 +347,8 @@ def build_query_graph(
         return "finalize"
 
     def after_research(state: QueryState) -> str:
+        if state.get("next_node") == "chat":
+            return "chat"
         if state.get("next_node") == "research_agent":
             return "research_agent_loop"
         return "evidence_builder" if state.get("next_node") == "generate" else "finalize"
@@ -307,34 +357,42 @@ def build_query_graph(
         return "finalize" if state.get("next_node") == "end" else "evidence_grader"
 
     def after_grade(state: QueryState) -> str:
+        if state.get("next_node") == "chat":
+            return "chat"
         if state.get("next_node") == "generate":
             return "generate"
         if state.get("next_node") == "research_agent":
             return "research_agent_loop"
         return "finalize"
 
+    def tracked(name, function):
+        async def invoke(state: QueryState, config: RunnableConfig):
+            if name == "memory_loader":
+                update = await function(state, config)
+            else:
+                update = await function(state)
+            if dependencies.capabilities is not None:
+                previous = [] if name == "memory_loader" and state.get("routing_owner_run_id") != state["run_id"] else state.get("executed_path", [])
+                update["executed_path"] = [*previous, name][-64:]
+            return update
+        return invoke
+
     builder = StateGraph(QueryState)
-    builder.add_node("memory_loader", load_memory)
-    builder.add_node("route", route)
-    builder.add_node("chat", chat)
-    builder.add_node("fast_rag", fast_rag)
-    builder.add_node("record_fast_grade", record_fast_grade)
-    builder.add_node("research_agent_loop", research_agent_loop)
-    builder.add_node("evidence_builder", evidence_builder)
-    builder.add_node("evidence_grader", evidence_grader)
-    builder.add_node("generate", generate)
-    builder.add_node("faithfulness", faithfulness)
-    builder.add_node("citation", citation)
-    builder.add_node("finalize", finalize)
+    for name, function in [("memory_loader", load_memory), ("route", route), ("chat", chat),
+                           ("fast_rag", fast_rag), ("record_fast_grade", record_fast_grade),
+                           ("research_agent_loop", research_agent_loop), ("evidence_builder", evidence_builder),
+                           ("evidence_grader", evidence_grader), ("generate", generate),
+                           ("faithfulness", faithfulness), ("citation", citation), ("finalize", finalize)]:
+        builder.add_node(name, tracked(name, function))
     builder.add_edge(START, "memory_loader")
     builder.add_edge("memory_loader", "route")
     builder.add_conditional_edges("route", after_route, {"chat": "chat", "fast_rag": "fast_rag", "research_agent_loop": "research_agent_loop"})
     builder.add_edge("chat", "finalize")
     builder.add_edge("fast_rag", "record_fast_grade")
-    builder.add_conditional_edges("record_fast_grade", after_fast_grade, {"generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
-    builder.add_conditional_edges("research_agent_loop", after_research, {"research_agent_loop": "research_agent_loop", "evidence_builder": "evidence_builder", "finalize": "finalize"})
+    builder.add_conditional_edges("record_fast_grade", after_fast_grade, {"chat": "chat", "generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
+    builder.add_conditional_edges("research_agent_loop", after_research, {"chat": "chat", "research_agent_loop": "research_agent_loop", "evidence_builder": "evidence_builder", "finalize": "finalize"})
     builder.add_conditional_edges("evidence_builder", after_evidence_builder, {"evidence_grader": "evidence_grader", "finalize": "finalize"})
-    builder.add_conditional_edges("evidence_grader", after_grade, {"generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
+    builder.add_conditional_edges("evidence_grader", after_grade, {"chat": "chat", "generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
     builder.add_edge("generate", "faithfulness")
     builder.add_edge("faithfulness", "citation")
     builder.add_edge("citation", "finalize")

@@ -93,15 +93,13 @@ async def run_fast_rag(
         "retrieval_batches": [batch.model_dump(mode="json")],
     }
     try:
-        kwargs = {}
         if dependencies.capabilities is not None:
-            kwargs = {"capabilities": dependencies.capabilities, "routing_context": (
-                RoutingContext.model_validate(state["routing_context"]) if state.get("routing_context") else None)}
-        grade = _grade(
-            await dependencies.evidence_grader.grade(
-                question, packed, scope=scope, snapshot=snapshot, **kwargs
-            )
-        )
+            result = await dependencies.evidence_grader.grade(question, packed, scope=scope, snapshot=snapshot,
+                capabilities=dependencies.capabilities, routing_context=(
+                    RoutingContext.model_validate(state["routing_context"]) if state.get("routing_context") else None))
+        else:
+            result = await dependencies.evidence_grader.grade(question, packed, scope=scope, snapshot=snapshot)
+        grade = _grade(result)
     except asyncio.CancelledError:
         raise
     except (OSError, TimeoutError, ConnectionError, ValidationError, TypeError, ValueError, EvidenceGradingUnavailable) as error:

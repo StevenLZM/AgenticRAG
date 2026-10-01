@@ -20,6 +20,8 @@ from agentic_rag.query.audit import (
 from agentic_rag.query.evidence_builder import EvidenceBuilder, PackedEvidence
 from agentic_rag.query.generation import AnswerGenerator
 from agentic_rag.query.graph import QueryGraphDependencies
+from agentic_rag.query.routing_policy import RuntimeCapabilities
+from agentic_rag.persistence.conversations import SqlAlchemyConversationReader
 from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
 from agentic_rag.query.subagents import (
     ChildResearchState,
@@ -49,9 +51,9 @@ class QueryCompositionError(RuntimeError):
 
 
 _PROMPTS = (
-    "chat_v1",
-    "router_v1",
-    "evidence_grader_v1",
+    "chat_v2",
+    "router_v2",
+    "evidence_grader_v2",
     "research_agent_v1",
     "generator_v1",
     "faithfulness_v1",
@@ -112,8 +114,9 @@ def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
         raise QueryCompositionError("Query Worker requires 1024-dimensional embeddings")
     return RuntimeConfigSnapshot(
         app_version="0.1.0",
-        graph_version="query-v1",
-        prompt_version="prompt-v1",
+        graph_version="query-v2",
+        prompt_version="prompt-v2",
+        routing_policy_version="routing-v2",
         prompt_hashes=tuple(sorted(hashes.items())),
         main_model_id=settings.main_model,
         light_model_id=settings.light_model,
@@ -275,6 +278,8 @@ async def build_query_dependencies(
             event_emitter=emitter,
             concurrency=shared_concurrency,
             owned_resources=(deepseek, qwen, reranker),
+            capabilities=RuntimeCapabilities(knowledge_base=True),
+            conversations=SqlAlchemyConversationReader(repositories.session_factory),
         )
         return dependencies
     except QueryCompositionError:
