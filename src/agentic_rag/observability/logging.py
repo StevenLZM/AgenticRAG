@@ -34,6 +34,7 @@ _SENSITIVE_VALUE = re.compile(
 )
 _SAFE_SUMMARIES = frozenset(
     {
+        "processing", "retrieving", "researching", "auditing",
         "completed",
         "started",
         "cancelled",

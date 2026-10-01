@@ -17,6 +17,7 @@ from agentic_rag.retrieval.graph import RetrievalService, RetrievalUnavailable
 from agentic_rag.retrieval.models import RetrievalRequest
 from agentic_rag.models.schemas import RouteAssessment
 from agentic_rag.query.audit import EvidenceGradingUnavailable
+from agentic_rag.query.phases import PhaseReporter, report_safely
 from agentic_rag.query.routing_context import RoutingContext, reasoning_question
 from agentic_rag.query.routing_policy import RuntimeCapabilities, decide_grade, policy_update, technical_failure
 
@@ -47,7 +48,7 @@ class FastRagDependencies:
 
 
 async def run_fast_rag(
-    state: QueryState, dependencies: FastRagDependencies
+    state: QueryState, dependencies: FastRagDependencies, *, report_phase: PhaseReporter | None = None
 ) -> dict[str, object]:
     """Retrieve once, pack once, then either generate, research, or terminate."""
     route = _route_from_state(state)
@@ -57,6 +58,7 @@ async def run_fast_rag(
     snapshot = snapshot_from_state(state)
     question = reasoning_question(state) if dependencies.capabilities is not None else question_from_state(state)
     request = RetrievalRequest(query=route.normalized_query)
+    await report_safely(report_phase, "retrieving")
     try:
         batch = await dependencies.retrieval.retrieve(request, scope, snapshot)
     except asyncio.CancelledError:
@@ -92,6 +94,7 @@ async def run_fast_rag(
         "packed_context": packed.model_dump(mode="json"),
         "retrieval_batches": [batch.model_dump(mode="json")],
     }
+    await report_safely(report_phase, "auditing")
     try:
         if dependencies.capabilities is not None:
             result = await dependencies.evidence_grader.grade(question, packed, scope=scope, snapshot=snapshot,

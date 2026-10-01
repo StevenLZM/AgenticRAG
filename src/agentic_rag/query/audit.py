@@ -13,6 +13,7 @@ from agentic_rag.domain.models import UserScope
 from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.models.schemas import EvidenceGrade, EvidenceGradeV2
 from agentic_rag.query.routing_context import RoutingContext
+from agentic_rag.query.phases import PhaseReporter, report_safely
 from agentic_rag.query.routing_policy import RuntimeCapabilities
 from agentic_rag.persistence.repositories import ParentRepository
 from agentic_rag.query.evidence_builder import (
@@ -331,6 +332,7 @@ async def generate_with_mandatory_audits(
     citation_validator: CitationValidator,
     authorization: Mapping[str, object],
     authorization_resolver: EvidenceAuthorizationResolver | None = None,
+    report_phase: PhaseReporter | None = None,
 ) -> dict[str, object]:
     """Generate at most twice; never return an unapproved draft in state."""
     raw_revision_count = state.get("revision_count", 0)
@@ -341,6 +343,7 @@ async def generate_with_mandatory_audits(
     run_id = raw_run_id if isinstance(raw_run_id, str) else None
     repair_issues: tuple[str, ...] = ()
     for attempt in range(2):
+        await report_safely(report_phase, "processing")
         try:
             draft = await generator.generate(
                 question, packed_evidence, snapshot, repair_issues=repair_issues
@@ -367,6 +370,7 @@ async def generate_with_mandatory_audits(
                     {"code": "generation_unavailable", "detail": type(error).__name__},
                 ],
             )
+        await report_safely(report_phase, "auditing")
         faithfulness = await faithfulness_auditor.audit(
             question, draft, packed_evidence, scope=scope, snapshot=snapshot
         )

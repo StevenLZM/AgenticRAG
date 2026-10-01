@@ -635,3 +635,18 @@ async def test_memory_list_and_delete_are_scoped_and_tombstone_backed() -> None:
     assert listed.json()["memories"][0]["id"] == "memory-1"
     assert deleted.status_code == 204
     assert memory.deleted == ["api-user:memory-1"]
+
+
+@pytest.mark.parametrize("status_value", [RunStatus.RUNNING, RunStatus.COMPLETED])
+async def test_run_phase_is_safe_optional_and_never_overrides_terminal(status_value):
+    manager = FakeRunManager(runs={"run-1": _run(status=status_value)})
+    app, _, _, _ = _app(runs=manager)
+    class Reader:
+        async def latest(self, scope, run_ids):
+            return {"run-1": "auditing"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        baseline = await client.get("/v1/query-runs/run-1")
+        assert baseline.json()["phase"] == ("processing" if status_value == RunStatus.RUNNING else None)
+        app.state.container.query_phase_reader = Reader()
+        live = await client.get("/v1/query-runs/run-1")
+        assert live.json()["phase"] == ("auditing" if status_value == RunStatus.RUNNING else None)

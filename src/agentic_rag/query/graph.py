@@ -42,6 +42,7 @@ from agentic_rag.query.evidence_builder import (
     EvidenceCoverageTarget,
     PackedEvidence,
 )
+from agentic_rag.query.phases import QueryPhaseEmitter
 from agentic_rag.query.fast_rag import FastRagDependencies, EvidenceGrader as EvidenceGraderPort, run_fast_rag
 from agentic_rag.query.generation import AnswerGenerator
 from agentic_rag.query.research_loop import ResearchAgentLoop
@@ -122,8 +123,14 @@ def build_query_graph(
         capabilities=dependencies.capabilities,
     )
 
+    def phase_reporter(state: QueryState):
+        return QueryPhaseEmitter(run_id=state["run_id"], scope=scope_from_state(state),
+            snapshot=snapshot_from_state(state), event_emitter=_run_emitter(dependencies, state),
+            event_repository=dependencies.event_repository).report
+
     async def load_memory(state: QueryState, config: RunnableConfig) -> dict[str, object]:
         _assert_server_checkpoint_namespace(state, config)
+        await phase_reporter(state)("processing")
         prepared: dict[str, object] = {}
         if dependencies.capabilities is not None:
             prepared = fresh_routing_state(state)
@@ -151,6 +158,7 @@ def build_query_graph(
         return update
 
     async def chat(state: QueryState) -> dict[str, object]:
+        await phase_reporter(state)("processing")
         async with _trace_span(dependencies, state, "graph.node.chat"):
             return await run_chat(state, dependencies.gateway)
 
@@ -158,7 +166,7 @@ def build_query_graph(
         async with _trace_span(dependencies, state, "graph.node.fast_rag"):
             async with _trace_span(dependencies, state, "retrieval"):
                 async with _trace_span(dependencies, state, "rerank"):
-                    update = await run_fast_rag(state, fast_dependencies)
+                    update = await run_fast_rag(state, fast_dependencies, report_phase=phase_reporter(state))
         await _event(
             dependencies,
             cast(QueryState, {**state, **update}),
@@ -179,6 +187,7 @@ def build_query_graph(
                 assessment = RouteAssessment.model_validate(state["route_assessment"]) if state.get("route_assessment") else None
                 return policy_update(state, decide_grade(grade, assessment, dependencies.capabilities,
                     research_attempts=state.get("research_attempt_count", 0), max_research_rounds=snapshot_from_state(state).max_research_rounds))
+        await phase_reporter(state)("researching")
         async with _trace_span(dependencies, state, "graph.node.research_agent_loop"):
             update = await dependencies.research_loop.ainvoke(state)
         await _event(
@@ -232,6 +241,7 @@ def build_query_graph(
                 }
 
     async def evidence_grader(state: QueryState) -> dict[str, object]:
+        await phase_reporter(state)("auditing")
         if dependencies.capabilities is not None:
             try:
                 async with _trace_span(dependencies, state, "graph.node.evidence_grader"):
@@ -288,6 +298,7 @@ def build_query_graph(
                         generator=dependencies.generator, faithfulness_auditor=dependencies.faithfulness_auditor,
                         citation_validator=dependencies.citation_validator, authorization={},
                         authorization_resolver=dependencies.authorization_resolver,
+                        report_phase=phase_reporter(state),
                     )
         await _event(dependencies, state, "ANSWER_GENERATED", "audited draft generated")
         return update
