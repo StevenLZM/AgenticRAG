@@ -100,6 +100,9 @@ const mark = (name) => {
       await page.locator(".source-meta").first().innerText(),
       /第 1 页/,
     );
+    await page.locator("#chat-scroll").evaluate((e) => {
+      e.scrollTop = 0;
+    });
     await page.screenshot({ path: path.join(output, "desktop-1440.png") });
     mark("rename and answer-bound AST source page");
     const backgroundRun = await submit("切换时请继续完成这次回答。");
@@ -286,6 +289,11 @@ const mark = (name) => {
         .evaluate((e) => document.activeElement === e),
       true,
     );
+    await page
+      .locator("#session-sidebar")
+      .evaluate((e) =>
+        Promise.all(e.getAnimations().map((animation) => animation.finished)),
+      );
     await page.screenshot({
       path: path.join(output, "mobile-sidebar-390.png"),
     });

@@ -25,3 +25,21 @@ def test_chat_client_contract(script):
         timeout=30,
     )
     assert result.returncode == 0, (result.stdout + result.stderr)[-10000:]
+
+
+@pytest.mark.parametrize(
+    "case", ["lateCancel", "crossSessionCancel", "historySwitch", "deletedCreation"]
+)
+def test_chat_controller_lifecycle(case):
+    result = subprocess.run(
+        [
+            "node",
+            str(Path(__file__).with_name("chat_lifecycle_flow.cjs")),
+            str(STATIC),
+            case,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (result.stdout + result.stderr)[-10000:]

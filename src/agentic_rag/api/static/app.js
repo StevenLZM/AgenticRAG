@@ -38,6 +38,8 @@
       sourceCounter = 0;
     let summaries = new Map();
     const openSources = new Map();
+    const pendingCancellations = new Set();
+    const loadingHistoryViews = new Set();
     const current = () =>
       state.selectedSessionId
         ? S.sessionState(state, state.selectedSessionId)
@@ -62,6 +64,10 @@
           !session.pendingSubmission,
         canStop: !!session?.activeRunId,
       });
+      byId("cancel-button").disabled = pendingCancellations.has(
+        session?.activeRunId,
+      );
+      byId("older-turns").disabled = loadingHistoryViews.has(token?.generation);
       const pending = session?.pendingSubmission;
       byId("pending-actions").hidden = pending?.status !== "unknown";
       byId("retry-submission").hidden = !pending?.question;
@@ -92,8 +98,9 @@
           view.notice("会话列表暂不可用，请稍后重试。");
       }
     }
-    function stopObservation() {
-      observer?.abort();
+    function stopObservation(runId) {
+      if (runId && observer?.runId !== runId) return;
+      observer?.control.abort();
       observer = null;
     }
     function clearSources() {
@@ -170,7 +177,7 @@
       stopObservation();
       if (!runId || document.hidden || !valid(t)) return;
       const control = new AbortController();
-      observer = control;
+      observer = { runId, control };
       const session = current();
       void api
         .watchRun({
@@ -340,8 +347,13 @@
         if (!disposed && state.viewGeneration === generation)
           await selectSession(summary.session_id);
         void refreshSessions();
-      } catch (_) {
-        if (!disposed)
+      } catch (error) {
+        if (error.status === 410 && error.code === "SESSION_GONE") {
+          if (state.creationRequestId === key) state.creationRequestId = null;
+          save();
+          if (!disposed && state.viewGeneration === generation)
+            view.notice("之前创建的对话已删除。再次点击新建可开始新的对话。");
+        } else if (!disposed && state.viewGeneration === generation)
           view.notice(
             "新建对话尚未确认。再次点击新建会使用同一个请求标识继续确认。",
           );
@@ -415,8 +427,9 @@
     async function stop() {
       const t = token,
         id = current()?.activeRunId;
-      if (!id) return;
-      byId("cancel-button").disabled = true;
+      if (!id || pendingCancellations.has(id)) return;
+      pendingCancellations.add(id);
+      updateComposer();
       try {
         const run = await api.cancelRun(id);
         if (valid(t)) {
@@ -424,23 +437,27 @@
           view.updateTurn(current().turns.get(id));
           updateComposer();
           if (S.isTerminal(run)) {
-            stopObservation();
+            stopObservation(id);
             await refreshLatest(t);
             void refreshSessions();
           }
         }
       } catch (_) {
-        if (valid(t)) view.notice("停止请求暂未确认，任务状态仍在同步。");
+        if (valid(t) && current()?.activeRunId === id)
+          view.notice("停止请求暂未确认，任务状态仍在同步。");
       } finally {
-        if (valid(t)) byId("cancel-button").disabled = false;
+        pendingCancellations.delete(id);
+        if (valid(t)) updateComposer();
       }
     }
     async function older() {
       const session = current(),
         t = token;
-      if (!session?.historyCursor) return;
+      if (!session?.historyCursor || loadingHistoryViews.has(t.generation))
+        return;
       const button = byId("older-turns");
-      button.disabled = true;
+      loadingHistoryViews.add(t.generation);
+      updateComposer();
       try {
         const page = await api.listTurns(t.sessionId, {
           cursor: session.historyCursor,
@@ -457,7 +474,8 @@
       } catch (_) {
         if (valid(t)) view.notice("更早消息加载失败，请重试。");
       } finally {
-        if (valid(t)) button.disabled = false;
+        loadingHistoryViews.delete(t.generation);
+        if (valid(t)) updateComposer();
       }
     }
     async function rename() {

@@ -10,7 +10,7 @@
 
 **Spec:** [持久化多轮聊天与会话管理设计](../specs/2026-10-01-persistent-chat-sessions-design.md)，用户已确认。源码基线 `b989c96`，设计文档提交 `2f71062`。
 
-**Branch / status:** 按用户要求在现有 checkout 的 `main` 分支开发；不另建分支或 worktree。用户已选择当前会话顺序实施（A）；Task 1–8 已实现并验证，最终独立审查进行中。
+**Branch / status:** 按用户要求在现有 checkout 的 `main` 分支开发；不另建分支或 worktree。用户已选择当前会话顺序实施（A）；Task 1–8 已实现并验证，已完成一次独立审查及问题修复。
 
 ## Global Constraints
 
@@ -285,7 +285,7 @@ fixture 在实际事件监听器上触发 compositionstart/end、keydown、scrol
 - [x] **Step 3: 完成一次针对性回归。** 运行 `conda run -n agentic-rag python -m pytest tests/unit tests/integration/api tests/integration/persistence/test_chat_sessions.py tests/integration/persistence/test_chat_turns.py tests/integration/persistence/test_chat_sources.py tests/integration/persistence/test_conversation_context.py tests/integration/runtime/test_query_worker.py -q`。Ruff 只检查本次变更的 Python 文件；记录已有类型检查基线，检查触及模块新增错误，不顺手重构无关代码。只有新失败或修复后才追加针对性重跑。
 - [x] **Step 4: 实际浏览器验收。** 使用隔离测试后端打开页面，在 1440px/390px 宽度检查三轮问答、列表折叠、重命名、刷新进行中任务、切换期间完成、停止、来源展开与文档删除、滚动/回到最新、中文输入、键盘焦点。用可控延迟/断网验证旧请求晚到和轮询回退；记录截图/结果，不只以 Node 虚拟 DOM 代替真实布局验证。
 - [x] **Step 5: 更新运维文档。** 明确 main 开发、历史列表从新功能起、逻辑删除语义、完整历史与模型窗口差别、备份/排空 Run/增量迁移/协调 API+Worker+静态发布步骤。文档给出检查命令，不在此步执行部署；回滚应用保留新增表列。更新旧 live-provider smoke 的 DOM/接口断言，但不自动触发真实 provider。
-- [ ] **Step 6: 完成最终审查并提交。** 对照 spec §9 验收矩阵检查全部实现与证据，解决功能内发现的问题，再按选定执行方式完成独立代码审查；`git diff --check` 必须通过，确认当前分支仍为 main 且仅包含目标改动。提交 `test: verify persistent chat workflows and document rollout`，向用户报告实际通过项及任何未执行项。
+- [x] **Step 6: 完成最终审查并提交。** 对照 spec §9 验收矩阵检查全部实现与证据，解决功能内发现的问题，再按选定执行方式完成独立代码审查；`git diff --check` 必须通过，确认当前分支仍为 main 且仅包含目标改动。提交 `test: verify persistent chat workflows and document rollout`，向用户报告实际通过项及任何未执行项。
 
 ## Coverage and Handoff
 
