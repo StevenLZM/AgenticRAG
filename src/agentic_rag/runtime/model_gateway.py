@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
@@ -514,8 +515,8 @@ _PROMPT_DIRECTORY = Path(__file__).parent.parent / "prompts"
 def load_prompt(name: str) -> PromptTemplate:
     """Load one checked-in versioned prompt without allowing path traversal."""
     filename = name if name.endswith(".md") else f"{name}.md"
-    if Path(filename).name != filename or not filename.endswith("_v1.md"):
-        raise ValueError("prompt names must name a checked-in *_v1.md file")
+    if Path(filename).name != filename or not re.fullmatch(r"[a-z][a-z0-9_]*_v[1-9][0-9]*\.md", filename):
+        raise ValueError("prompt names must name a checked-in versioned file")
     path = _PROMPT_DIRECTORY / filename
     content = path.read_text(encoding="utf-8")
     version = Path(filename).stem.rsplit("_", 1)[-1]

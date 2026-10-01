@@ -15,7 +15,8 @@ from pydantic import ValidationError
 from agentic_rag.memory.models import MemoryContext
 from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.memory.service import MemoryService
-from agentic_rag.models.schemas import RouteDecision
+from agentic_rag.models.schemas import RouteAssessment, RouteDecision
+from agentic_rag.query.routing_policy import RuntimeCapabilities, decide_route, policy_update, technical_failure
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.runtime.model_gateway import (
     ModelCall,
@@ -78,9 +79,9 @@ class MemoryContextLoader:
         return {"memory_context": context.model_dump(mode="json")}
 
 
-async def route_query(state: QueryState, gateway: ModelGateway) -> dict[str, object]:
+async def route_query(state: QueryState, gateway: ModelGateway, *, capabilities: RuntimeCapabilities | None = None) -> dict[str, object]:
     """Ask the light router once; invalid structured output always escalates."""
-    prompt = load_prompt("router_v1")
+    prompt = load_prompt("router_v2" if capabilities is not None else "router_v1")
     question = question_from_state(state)
     snapshot = snapshot_from_state(state)
     context = state.get("memory_context", {})
@@ -88,11 +89,15 @@ async def route_query(state: QueryState, gateway: ModelGateway) -> dict[str, obj
         model_role="light",
         snapshot=snapshot,
         messages=(
-            {"role": "system", "content": prompt.content},
+            {"role": "system", "content": prompt.content + (
+                "\nSERVER CAPABILITIES (not user permissions): " + capabilities.model_dump_json()
+                if capabilities is not None else ""
+            )},
             {
                 "role": "user",
                 "content": json.dumps(
-                    {"question": question, "memory_context": context},
+                    {"question": question, "memory_context": context,
+                     **({"routing_context": state.get("routing_context", {})} if capabilities is not None else {})},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
@@ -100,6 +105,14 @@ async def route_query(state: QueryState, gateway: ModelGateway) -> dict[str, obj
         ),
     )
     try:
+        if capabilities is not None:
+            response_v2 = await gateway.complete_structured(call, RouteAssessment)
+            assessment = RouteAssessment.model_validate(response_v2.value)
+            decision_v2 = decide_route(assessment, capabilities)
+            return {**policy_update(state, decision_v2, normalized_query=assessment.normalized_query),
+                    "route_assessment": assessment.model_dump(mode="json"),
+                    "initial_route": decision_v2.route, "routing_owner_run_id": state["run_id"],
+                    "routing_policy_version": "routing-v2", "capabilities": capabilities.model_dump(mode="json")}
         response = await gateway.complete_structured(call, RouteDecision)
         decision = _route_decision(response.value)
     except asyncio.CancelledError:
@@ -114,6 +127,9 @@ async def route_query(state: QueryState, gateway: ModelGateway) -> dict[str, obj
             retryable=False,
             outcome="degraded",
         )
+        if capabilities is not None:
+            return {**policy_update(state, technical_failure("router_schema_invalid")),
+                    "errors": [*state.get("errors", []), {"code": "router_schema_invalid"}]}
         return _research_fallback(state, "router_schema_invalid", type(error).__name__)
     except (OSError, TimeoutError, ConnectionError) as error:
         await emit_degradation(
@@ -125,6 +141,9 @@ async def route_query(state: QueryState, gateway: ModelGateway) -> dict[str, obj
             retryable=True,
             outcome="degraded",
         )
+        if capabilities is not None:
+            return {**policy_update(state, technical_failure("router_unavailable")),
+                    "errors": [*state.get("errors", []), {"code": "router_unavailable"}]}
         return _research_fallback(state, "router_unavailable", type(error).__name__)
     next_node = decision.route if decision.route in {"chat", "fast_rag"} else "research_agent"
     return {"route": decision.model_dump(mode="json"), "next_node": next_node}

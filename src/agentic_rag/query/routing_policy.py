@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from agentic_rag.models.schemas import EvidenceGrade, InformationSource, RouteAssessment
+from agentic_rag.query.state import QueryState, question_from_state
 
 
 class RuntimeCapabilities(BaseModel):
@@ -89,3 +90,18 @@ def decide_grade(
     if research_attempts >= max_research_rounds:
         return PolicyDecision(next_node="end", termination_reason="research_round_limit", reason_code="research_round_limit")
     return PolicyDecision(next_node="research_agent", route="research", reason_code=grade.gap_type or "unknown")
+
+
+def policy_update(state: QueryState, decision: PolicyDecision, *, normalized_query: str | None = None) -> dict[str, object]:
+    update: dict[str, object] = {
+        "next_node": decision.next_node, "response_mode": decision.response_mode,
+        "policy_decision": decision.model_dump(mode="json"),
+        "termination_reason": decision.termination_reason,
+    }
+    if decision.route:
+        previous = state.get("route") or {}
+        update["route"] = {"route": decision.route, "reason_code": decision.reason_code,
+                           "normalized_query": normalized_query or previous.get("normalized_query") or question_from_state(state)}
+    if decision.next_node == "end" and decision.termination_reason:
+        update["answer"] = {"status": decision.termination_reason}
+    return update
