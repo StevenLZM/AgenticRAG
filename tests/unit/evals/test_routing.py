@@ -2,6 +2,8 @@ from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import subprocess
+import sys
 
 from evals.routing import load_cases, RoutingSample, run_routing_eval, score_routing, dataset_hash
 from agentic_rag.models.schemas import RouteDecision
@@ -10,6 +12,13 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
 DATASET = Path("evals/datasets/routing_v2.jsonl")
+
+
+def test_cli_loads_from_a_checkout_without_installed_package():
+    result = subprocess.run([sys.executable, "scripts/eval_routing.py", "--help"],
+                            capture_output=True, text=True, check=False, env={"PATH": "/usr/bin:/bin"})
+    assert result.returncode == 0, result.stderr
+    assert "--output-dir" in result.stdout
 
 
 def perfect(cases):

@@ -63,3 +63,15 @@ async def test_second_run_does_not_reuse_routing_or_memory_context():
     assert result["routing_context"]["run_id"] == "run-next"
     assert result["executed_path"] == first["executed_path"]
     assert memory.loads == 2
+
+
+async def test_v2_document_route_keeps_audits_and_citations():
+    deps, _, retrieval, _ = _deps()
+    deps = replace(deps, gateway=Gateway(classify("knowledge_base", "single")),
+                   capabilities=RuntimeCapabilities(knowledge_base=True),
+                   evidence_grader=FakeGrader(EvidenceGradeV2(decision="sufficient", gap_type="none")))
+    result = await build_query_graph(deps).ainvoke(_state())
+    assert retrieval.calls == 1
+    assert result["route"]["route"] == "fast_rag"
+    assert "faithfulness" in result["executed_path"] and "citation" in result["executed_path"]
+    assert result["answer"]["segments"][0]["evidence_ids"]

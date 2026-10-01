@@ -126,9 +126,11 @@ class _ScriptedGateway:
     ) -> ModelResponse[object]:
         if getattr(call, "model_role", "") == "light":
             value: object = {
-                "route": "research",
+                "required_sources": ["knowledge_base"],
+                "retrieval_complexity": "multi",
+                "needs_clarification": False,
                 "normalized_query": "Find notice period",
-                "reason_code": "scripted_pipeline",
+                "reason_code": "knowledge_base_research",
             }
         else:
             value = next(self._actions)
@@ -215,7 +217,7 @@ async def test_production_composition_graph_factory_delegates_research_with_serv
         )
 
         retrieval = _RecordingRetrieval.last
-        assert retrieval is not None and len(retrieval.calls) == 1
+        assert retrieval is not None and len(retrieval.calls) == 1, result
         assert retrieval.calls[0][1].user_id == "server-user"
         observations = result["research"]["observations"]
         assert all(

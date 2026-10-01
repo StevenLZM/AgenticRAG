@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11、Pydantic、LangGraph、SQLAlchemy async、MySQL、SQLite checkpoint、pytest；复用已有 ModelGateway 和配置的真实模型，不新增框架。
 
-**Spec:** [已确认设计](../specs/2026-10-01-capability-aware-routing-design.md)，用户于 2026-10-01 确认。本文待审阅与执行方式选择，所有未勾选项均未实施。
+**Spec:** [已确认设计](../specs/2026-10-01-capability-aware-routing-design.md)，用户于 2026-10-01 确认并授权原地实施。代码与分类回归已执行，实际结果与尚未通过的服务端到端验收见[验收记录](../../capability-routing-validation.md)；下列条目保留原计划，不以未勾选状态代表当前交付状态。
 
 ## Global Constraints
 
@@ -183,4 +183,4 @@
 
 覆盖核对：Spec §1–3 对应全局约束与 Task 1/2；§4 对应 Task 1/3/4；§5 对应 Task 2/4/6/7；§6 对应 Task 2/5/6；§7 对应 Task 3/6/7；§8 对应 Task 8/9；§9 的交付状态在 Task 9 更新。Review Focus 五项均已纳入对应测试。
 
-当前只完成计划编写与设计确认状态更新。没有运行以上实现测试、真实模型或 E2E；没有开始生产代码修改。用户审阅此计划并选择执行方式后，才进入实现。
+执行记录：按 1–9 顺序实施，真实模型 360 次对照完成，新版分类 180/180 通过；服务 E2E 因显式隔离配置未启用而 skip，仍未验收。未重启生产服务。测试和最终审查结果以[验收记录](../../capability-routing-validation.md)为准。

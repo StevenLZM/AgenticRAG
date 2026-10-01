@@ -28,3 +28,12 @@ def test_reasoning_context_is_run_scoped():
     state.update(routing_owner_run_id="new", routing_context=None)
     assert json.loads(m.reasoning_question(state))["original_question"] == "他呢"
     assert state["request"]["question"] == "他呢"
+
+
+def test_fresh_run_has_a_valid_empty_research_pack():
+    from tests.unit.query.test_router_fast_path import _initial_state
+    from agentic_rag.query.state import snapshot_from_state
+    from agentic_rag.query.research_loop import _packed_validation_error
+    state = _initial_state()
+    fresh = module().fresh_routing_state(state)
+    assert _packed_validation_error(fresh["packed_context"], snapshot_from_state(state)) is None

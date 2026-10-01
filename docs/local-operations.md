@@ -303,6 +303,8 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
 `scripts/verify_acceptance.py` 通用验证器现在必须提供`--run-dir`，重新读取scoped MySQL/checkpoint，验证24题、8份文件、上传任务、源事实映射、真实排名、评分输入及汇总；它不单独校验生产Mem0容量、安全对抗和恢复/备份演练。`--quality-only`表示“测评执行完整”，不是“质量达标”。省略该参数仍执行发布硬门禁；本轮拒答率低且未做恢复/备份演练，因此不能发布通过。Ragas失败必须显式记录，禁止补0或用参考答案替代。模型tokens未逐Run持久化，报告明确不可用。
 # 一条命令运行既有语料的真实 RAG 测评
 
+信息来源路由的独立回归与服务切换说明位于本文末尾，不与本节正式 RAG 质量评测混合计分。
+
 在项目根目录运行：
 
 ```sh
@@ -333,3 +335,18 @@ conda run -n agentic-rag python -m pytest --import-mode=importlib \
 当前入口是本项目冻结语料的重测入口，不是任意目录自动建库工具：目录内所有受支持文档必须与 manifest 完全匹配，辅助 `qa/` 不参与测评；新增/缺失/变更文档、错误版本或未入库内容直接报错，绝不静默跳过。更换数据集需先另行完成上传和冻结金标。服务必须事先可用（默认 API8001、ES9201、隔离 MySQL/Redis、Query Worker）。默认解释器为 `var/eval-venv-ragas042/bin/python`，可用 `RAG_EVAL_PYTHON` 指定已配置的环境；脚本不会安装依赖。
 
 退出码：0 表示全量测评及运行证据核验完成，**不是生产发布通过**；1 表示本轮未完成/评分或核验失败，查看报告并修复后续跑；2 表示前置检查或参数错误。快照或输入变化须开启新实验；judge 配置变化时底层 runner 可能重新评分，但会复用查询结果。并发续跑同一目录会被文件锁拒绝；不确定的 POST 提交结果不会自动重提。
+
+## 信息来源路由回归与切换
+
+设计与实际结果见[路由验收记录](capability-routing-validation.md)。在项目根目录，用已配置模型凭据的环境运行：
+
+```sh
+python scripts/eval_routing.py --dataset evals/datasets/routing_v2.jsonl \
+  --repeats 3 --output-dir /private/tmp/routing-eval-unique-new-directory
+```
+
+目录必须为空，不能覆盖旧结果。该入口只调用分类模型，60 题各运行新旧版 3 次共 360 次逻辑调用；不读写业务记忆、不检索、不接入天气工具。输出 samples.jsonl、manifest.json、report.json、report.md；退出码 0/1/2 分别表示 PASS/FAIL/INCOMPLETE。分类 PASS 不等于端到端上线通过。
+
+真实服务回归使用 `python -m pytest tests/e2e/test_capability_routing.py -m 'e2e and live_model' -v -rs`。沿用现有真实 Query fixture 的显式本地测试配置：`AGENTIC_RAG_RUN_REAL_QUERY_PROVIDER_E2E=1`、测试 MySQL/Redis/ES DSN、测试 MySQL admin DSN 与 backup/restore opt-in；缺失时 skip。仅创建和清理随机命名的测试数据库、索引、Redis namespace 与 checkpoint；上传小型文本天气报告和简历，经真实 parser/assembler/chunker/embedding 发布，查询记忆策略 disabled，不触碰生产数据或 active alias。
+
+正式切换前先完成隔离端到端验收，再停止接收新请求并排空旧活动 Run；不要让旧 prompt/schema checkpoint 被新图恢复。验证新快照包含 graph=query-v2、prompt=prompt-v2、routing_policy_version=routing-v2 及 v2 Prompt 哈希。得到用户明确授权后才重启 API/Query Worker，核对 API 与 Worker 的 snapshot_id 一致，再进行天气与文档问答 smoke。回滚也须排空活动 Run 并恢复匹配的图/Prompt 版本。本轮没有执行切换，不需要业务数据库迁移、重建索引或重新切块。

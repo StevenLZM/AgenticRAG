@@ -2,13 +2,13 @@
 
 > 日期：2026-10-01
 >
-> 状态：用户于 2026-10-01 确认书面设计；尚未实现或验收。
+> 状态：用户于 2026-10-01 确认设计并授权原地实施；代码已接线，验证记录见[验收记录](../../capability-routing-validation.md)。未部署，不代表真实服务端到端验收通过。
 >
 > 范围：Router、证据不足后的升级决策、真实模型路由回归。
 >
 > 主设计：[生产级 Agentic RAG 设计文档](./2026-08-04-production-agentic-rag-design.md)。
 >
-> 实施计划：[信息来源路由实施计划](../plans/2026-10-01-capability-aware-routing.md)，待审阅与执行方式选择。
+> 实施计划：[信息来源路由实施计划](../plans/2026-10-01-capability-aware-routing.md)，按任务顺序原地实施并保留原有未提交改动。
 
 ## 1. 目标与问题依据
 
@@ -169,4 +169,8 @@ refuse、clarify 和 sufficient 的合法结果优先按 decision 处理；只�
 
 修改范围预计包括 `models/schemas.py`、`query/router.py`、`query/state.py`、`query/fast_rag.py`、`query/audit.py`、`query/graph.py`、`query/chat.py`、相关 Prompt、组合根、最近消息的只读 Repository/Worker 接线、公开结果/安全事件投影与测试；新增独立的策略模块和路由评测资产。实际实施计划须逐项列出测试与兼容验证，不顺便重构其他未提交工作。
 
-当前书面设计已获用户确认，已编写待审阅的实施计划并更新主设计索引。未修改生产代码、未执行真实模型评测、未重启服务。tool/MCP 权限治理仍为明确延期事项；完成实现后应追加实际测试、真实模型结果与部署状态，不把本节的计划描述当成完成记录。
+已实现 RouteAssessment、服务端纯策略、受控 Chat、双入口 Evidence Grader 缺口分类、最近对话只读装载、Worker 和主图接线、版本快照与实际路由展示，并新增冻结的 60 题新旧对照入口。原始 question 不变，normalized_query 只供推理与检索；已检索后转 Chat 保留内部证据但不向用户附加无关引用。
+
+实施决策：历史消息从同 user/thread 已完成 Run 的公开问答投影读取，因为当前生产流程不填充 messages 表；固定当前 Run 创建时点，最多 6 条/8000 字符。旧调用方保留 v1 兼容，生产组合根显式传入能力描述。研究重入防护集中在主图 research 节点，而非新增模型工具。跨 Run 清理使用当前索引代次的有效空证据包，避免研究循环把空字典当损坏 checkpoint。
+
+详细命令、真实模型结果和未验收项保存在[验收记录](../../capability-routing-validation.md)。不修改 PDF/chunker/ES/MySQL Parent，不需要业务表结构迁移，没有启动或重启生产服务。tool/MCP 权限治理仍为明确延期事项。

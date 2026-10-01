@@ -257,7 +257,7 @@ Clarify 与 Refuse 路径不生成知识性答案，因此不进入 Faithfulness
 
 ### 5.1 路由
 
-> 2026-10-01 修订方案已记录于[信息来源路由与检索升级控制设计](./2026-10-01-capability-aware-routing-design.md)，书面设计已获用户确认，[实施计划](../plans/2026-10-01-capability-aware-routing.md)待审阅，尚未实现。该方案以“所需信息来源 + 当前实际能力 + 检索复杂度”替代直接选择快慢检索，保留一次分类模型任务；tool/MCP 权限治理明确延期，现有数据隔离保持不变。
+> 2026-10-01 修订已按[实施计划](../plans/2026-10-01-capability-aware-routing.md)接线，设计见[信息来源路由与检索升级控制设计](./2026-10-01-capability-aware-routing-design.md)，验证与未验收项见[验收记录](../../capability-routing-validation.md)。以“所需信息来源 + 当前实际能力 + 检索复杂度”替代直接选择快慢检索，保留一次分类模型任务；tool/MCP 权限治理延期，现有数据隔离不变。代码已实现不代表服务已部署。
 
 修订前实现使用轻量模型输出结构化结果（实际模型以运行配置快照为准）：
 
@@ -267,7 +267,7 @@ normalized_query: string
 reason_code: string
 ```
 
-拟议修订增加 `RouteAssessment`（required_sources、retrieval_complexity、needs_clarification 等），由服务端策略派生最终路由。无实时执行能力的天气问题应进入受控 Chat 能力说明；上传天气报告仍进入知识库；混合请求保留完整意图并澄清。完整状态、错误处理、兼容和真实模型验收口径以上述修订文档为准，不能将其视为当前已上线行为。
+修订增加 `RouteAssessment`（required_sources、retrieval_complexity、needs_clarification 等），由服务端策略派生最终路由。无实时执行能力的天气问题进入受控 Chat 能力说明；上传天气报告仍进入知识库；混合请求保留完整意图并澄清。完整状态、错误处理、兼容和真实模型验收口径以上述修订文档为准，不能将其视为当前已上线行为。
 
 V1 不设置单独的结构化 SQL 路由。结构化 Metadata 只作为 Dense 与 BM25 的 Filter；MySQL 只由内部 Repository 获取 Parent。
 

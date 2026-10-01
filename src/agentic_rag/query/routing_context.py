@@ -9,7 +9,8 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict
 
 from agentic_rag.domain.models import UserScope
-from agentic_rag.query.state import QueryState, question_from_state, scope_from_state
+from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
+from agentic_rag.query.evidence_builder import PackedEvidence
 
 
 class RoutingTurn(BaseModel):
@@ -70,7 +71,9 @@ def fresh_routing_state(state: QueryState) -> dict[str, object]:
             "route_assessment": {}, "route": {}, "policy_decision": {},
             "response_mode": None, "last_evidence_grade": {}, "executed_path": [],
             "initial_route": "", "memory_context": None, "evidence": [], "retrieval_batches": [],
-            "packed_context": {}, "research": {}, "answer": {}, "errors": [],
+            "packed_context": PackedEvidence(items=(), manifest={}, rendered_context="", token_count=0,
+                index_generation=snapshot_from_state(state).index_generation).model_dump(mode="json"),
+            "research": {}, "answer": {}, "errors": [],
             "termination_reason": None, "research_attempt_count": 0, "revision_count": 0,
             "audit_results": [], "next_node": "route", "routing_policy_version": "routing-v2"}
 

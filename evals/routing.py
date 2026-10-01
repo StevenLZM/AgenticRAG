@@ -142,4 +142,9 @@ def score_routing(samples: Sequence[RoutingSample], cases: Sequence[RoutingCase]
             clarification_rate=sum(s.response_mode == "clarify" for s in valid) / len(valid) if valid else 0,
             failed_cases=sorted({s.case_id for s in wrong}),
             mean_latency_ms=sum(s.latency_ms for s in valid) / len(valid) if valid else None)
+        variants[variant]["groups"] = {
+            group: {"valid": len(group_rows), "correct": sum(correct(s) for s in group_rows)}
+            for group in sorted({c.group for c in cases})
+            for group_rows in [[s for s in valid if case_map[s.case_id].group == group]]
+        }
     return {"status": variants["v2"]["status"], "variants": variants}
