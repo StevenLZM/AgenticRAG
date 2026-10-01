@@ -255,7 +255,7 @@ agent_runs = Table(
     Column("heartbeat_at", DateTime(timezone=True), nullable=True),
     Column("attempt_count", Integer, nullable=False, default=0),
     Column("route", String(64), nullable=True),
-    Column("question", Text, nullable=False, default=""),
+    Column("question", Text().with_variant(mysql.MEDIUMTEXT(), "mysql"), nullable=False, default=""),
     Column("client_request_id", String(36), nullable=True),
     Column("runtime_config_snapshot_id", String(64), nullable=False),
     Column("runtime_config_snapshot", JSON, nullable=False),

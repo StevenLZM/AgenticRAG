@@ -12,6 +12,8 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # The public limit counts Unicode characters; TEXT only holds 64 KiB.
+    op.alter_column("agent_runs", "question", existing_type=sa.Text(), type_=mysql.MEDIUMTEXT(), existing_nullable=False)
     op.create_table(
         "chat_sessions",
         sa.Column("id", sa.String(36), primary_key=True),
@@ -34,6 +36,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Retain the backward-compatible wider question column to avoid data loss.
     op.drop_constraint("uq_runs_client_request", "agent_runs", type_="unique")
     op.drop_column("agent_runs", "answer_sources")
     op.drop_column("agent_runs", "client_request_id")

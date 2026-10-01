@@ -42,6 +42,7 @@ from agentic_rag.persistence.repositories import (
     SqlAlchemyParentRepository,
     agent_events,
     agent_runs,
+    chat_sessions,
     documents,
     memory_tombstones,
     parent_chunks,
@@ -77,6 +78,7 @@ from agentic_rag.runtime.query_worker import (
     QueryWorker,
     build_graph_factory,
 )
+from agentic_rag.runtime.chat_sessions import ChatSessionService
 from agentic_rag.runtime.run_manager import RunManager, TransactionalRunRepository
 from agentic_rag.testing.isolated_query_broker import IsolatedQueryBroker
 from agentic_rag.testing.real_provider_config import (
@@ -565,6 +567,7 @@ async def _cleanup_local_fixture_mysql(
         await session.execute(
             delete(agent_runs).where(agent_runs.c.user_id == settings.default_user_id)
         )
+        await session.execute(delete(chat_sessions).where(chat_sessions.c.user_id == settings.default_user_id))
         await session.execute(
             delete(parent_chunks).where(parent_chunks.c.user_id == settings.default_user_id)
         )
@@ -760,6 +763,7 @@ async def real_query_fixture(tmp_path: Path) -> AsyncIterator[RealQueryFixture]:
             outbox_stream_name=isolated_broker.query_stream,
         ),
     )
+    container.chat_session_service = ChatSessionService(container.repositories.session_factory, container.run_manager)
     await container.redis.ping()
     await container.elasticsearch.info()
     async with container.mysql_engine.connect() as connection:
@@ -1040,6 +1044,7 @@ async def _cleanup_real_provider_mysql(
         await session.execute(
             delete(agent_runs).where(agent_runs.c.user_id == settings.default_user_id)
         )
+        await session.execute(delete(chat_sessions).where(chat_sessions.c.user_id == settings.default_user_id))
         await session.execute(
             delete(parent_chunks).where(parent_chunks.c.user_id == settings.default_user_id)
         )
@@ -1127,6 +1132,7 @@ async def real_query_runtime(tmp_path: Path) -> AsyncIterator[RealQueryRuntime]:
                 outbox_stream_name=isolated_broker.query_stream,
             ),
         )
+        container.chat_session_service = ChatSessionService(container.repositories.session_factory, container.run_manager)
         await container.redis.ping()
         await container.elasticsearch.info()
         async with container.mysql_engine.connect() as connection:

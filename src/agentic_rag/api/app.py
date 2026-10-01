@@ -17,6 +17,7 @@ from agentic_rag.api.documents import documents_router
 from agentic_rag.api.feedback import feedback_router
 from agentic_rag.api.memories import memories_router
 from agentic_rag.api.query_runs import query_runs_router
+from agentic_rag.api.chat_sessions import chat_sessions_router
 from agentic_rag.api.runtime_summary import runtime_summary_router
 from agentic_rag.bootstrap import build_container
 from agentic_rag.config import Settings
@@ -68,6 +69,7 @@ def create_app(settings: Settings, *, container: Any | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(documents_router)
     app.include_router(query_runs_router)
+    app.include_router(chat_sessions_router)
     app.include_router(memories_router)
     app.include_router(feedback_router)
     app.include_router(runtime_summary_router)

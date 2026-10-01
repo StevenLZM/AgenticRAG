@@ -63,7 +63,7 @@ def migrated_schema(mysql_dsn: str) -> Iterator[None]:
     yield
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 async def session_factory(
     mysql_dsn: str, migrated_schema: None
 ) -> AsyncIterator[async_sessionmaker[AsyncSession]]:

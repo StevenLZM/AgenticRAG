@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from agentic_rag.persistence.repositories import ActiveRunConflict
+from agentic_rag.domain.chat_sessions import SessionNotFound, SessionGone, SessionBusy, IdempotencyConflict
 from agentic_rag.runtime.ids import new_id
 
 
@@ -155,8 +156,25 @@ async def _unexpected_error_handler(request: Request, _exc: Exception) -> JSONRe
     )
 
 
+async def _chat_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    mapping = {
+        SessionNotFound: (404, "CHAT_NOT_FOUND", "The requested chat resource was not found."),
+        SessionGone: (410, "SESSION_GONE", "The chat session has been deleted."),
+        SessionBusy: (409, "SESSION_BUSY", "This session already has an active turn."),
+        IdempotencyConflict: (409, "IDEMPOTENCY_CONFLICT", "The request identifier has already been used."),
+    }
+    code, name, message = mapping[type(exc)]
+    response = _response(request, status_code=code, error_code=name, message=message, retryable=False)
+    response.headers["Cache-Control"] = "no-store"
+    if isinstance(exc, SessionBusy):
+        response.headers["Location"] = f"/v1/query-runs/{exc.active_run_id}"
+    return response
+
+
 def register_error_handlers(app: FastAPI) -> None:
     """Install stable mappings without exposing exception strings or tracebacks."""
+    for error_type in (SessionNotFound, SessionGone, SessionBusy, IdempotencyConflict):
+        app.add_exception_handler(error_type, _chat_error_handler)
     app.add_exception_handler(ApiException, _api_exception_handler)  # type: ignore[arg-type]
     app.add_exception_handler(RequestValidationError, _validation_error_handler)
     app.add_exception_handler(RequestFormatError, _format_error_handler)  # type: ignore[arg-type]

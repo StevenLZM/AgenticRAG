@@ -23,6 +23,9 @@ from agentic_rag.persistence.repositories import (
     SqlAlchemyEventRepository,
     SqlAlchemyIngestionJobRepository,
 )
+from agentic_rag.runtime.chat_sessions import ChatSessionService
+from agentic_rag.runtime.chat_sources import ChatSourceService
+from agentic_rag.runtime.query_phase_reader import QueryPhaseReader
 from agentic_rag.runtime.run_manager import RunManager, TransactionalRunRepository
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 from agentic_rag.runtime.query_composition import build_query_snapshot
@@ -64,6 +67,9 @@ class AppContainer:
     run_manager: RunManager | None = None
     event_repository: object | None = None
     memory_service: MemoryService | None = None
+    chat_session_service: ChatSessionService | None = None
+    chat_source_service: ChatSourceService | None = None
+    query_phase_reader: QueryPhaseReader | None = None
 
     async def close(self, *, raise_on_error: bool = False) -> None:
         """Attempt cleanup of every process-owned async client.
@@ -194,6 +200,9 @@ def build_container(settings: Settings) -> AppContainer:
         reranker_initialized=reranker_initialized,
         runtime_snapshot=runtime_snapshot,
         run_manager=run_manager,
+        chat_session_service=ChatSessionService(repositories.session_factory, run_manager),
+        chat_source_service=ChatSourceService(repositories.session_factory),
+        query_phase_reader=QueryPhaseReader(repositories.session_factory),
         event_repository=event_repository,
         memory_service=memory_service,
     )
