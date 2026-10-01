@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
+from openai import APIError
 
 from agentic_rag.memory.models import MemoryContext
 from agentic_rag.observability.logging import emit_degradation
@@ -145,6 +146,16 @@ async def route_query(state: QueryState, gateway: ModelGateway, *, capabilities:
             return {**policy_update(state, technical_failure("router_unavailable")),
                     "errors": [*state.get("errors", []), {"code": "router_unavailable"}]}
         return _research_fallback(state, "router_unavailable", type(error).__name__)
+    except APIError:
+        # Gateway owns retries but preserves SDK failure types on exhaustion.
+        # Do not let v2 failures escape into a second Worker-level query retry.
+        if capabilities is None:
+            raise
+        await emit_degradation(component="router", reason="router_unavailable",
+            run_id=state["run_id"], snapshot_id=snapshot.snapshot_id,
+            attempt=1, retryable=False, outcome="degraded")
+        return {**policy_update(state, technical_failure("router_unavailable")),
+                "errors": [*state.get("errors", []), {"code": "router_unavailable"}]}
     next_node = decision.route if decision.route in {"chat", "fast_rag"} else "research_agent"
     return {"route": decision.model_dump(mode="json"), "next_node": next_node}
 

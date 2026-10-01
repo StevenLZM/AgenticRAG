@@ -345,7 +345,7 @@ python scripts/eval_routing.py --dataset evals/datasets/routing_v2.jsonl \
   --repeats 3 --output-dir /private/tmp/routing-eval-unique-new-directory
 ```
 
-目录必须为空，不能覆盖旧结果。该入口只调用分类模型，60 题各运行新旧版 3 次共 360 次逻辑调用；不读写业务记忆、不检索、不接入天气工具。输出 samples.jsonl、manifest.json、report.json、report.md；退出码 0/1/2 分别表示 PASS/FAIL/INCOMPLETE。分类 PASS 不等于端到端上线通过。
+目录必须为空，不能覆盖旧结果。该入口只调用分类模型，60 题各运行新旧版 3 次共 360 次逻辑调用；不读写业务记忆、不检索、不接入天气工具。输出 samples.jsonl、manifest.json、report.json、report.md；退出码 0/1/2 分别表示 PASS/FAIL/INCOMPLETE。新旧两版都要完整有效，非 3 轮的探索调用不能得到验收 PASS。分类 PASS 不等于端到端上线通过。
 
 真实服务回归使用 `python -m pytest tests/e2e/test_capability_routing.py -m 'e2e and live_model' -v -rs`。沿用现有真实 Query fixture 的显式本地测试配置：`AGENTIC_RAG_RUN_REAL_QUERY_PROVIDER_E2E=1`、测试 MySQL/Redis/ES DSN、测试 MySQL admin DSN 与 backup/restore opt-in；缺失时 skip。仅创建和清理随机命名的测试数据库、索引、Redis namespace 与 checkpoint；上传小型文本天气报告和简历，经真实 parser/assembler/chunker/embedding 发布，查询记忆策略 disabled，不触碰生产数据或 active alias。
 

@@ -24,7 +24,7 @@ python -m mypy src/agentic_rag/query src/agentic_rag/runtime src/agentic_rag/per
 python -m pytest tests/e2e/test_capability_routing.py -m 'e2e and live_model' -v -rs
 ```
 
-专项回归与全量复跑结果在最终审查后更新。首次全量测试发现旧组合根 Fake Router 输出 v1，以及新 Run 重置时使用空字典导致研究包校验失败；已更新测试并以失败用例驱动修复，保留拒绝损坏 checkpoint 的校验。Ruff 对本次变更相关文件检查通过，退出码 0。
+专项回归 321 项通过，退出码 0。最终全量复跑 1024 项通过、53 项跳过、19 条 warning，退出码 0（29.38 秒）；跳过项不计入验收通过。首次全量测试发现旧组合根 Fake Router 输出 v1，以及新 Run 重置时使用空字典导致研究包校验失败；已更新测试并以失败用例驱动修复，保留拒绝损坏 checkpoint 的校验。Ruff 对本次变更相关文件检查通过，退出码 0。
 
 Mypy 退出码 1：9 个错误位于本次未修改的 `ingestion/models.py:120,124`（7 个 kwargs 类型问题）和已有未提交评测改动的 `retrieval/graph.py:283,287`（2 个类型问题）；本轮涉及的 query/runtime/conversations 文件没有报告新错误。未替用户修改这些无关内容。
 
@@ -61,6 +61,8 @@ python scripts/eval_routing.py --dataset evals/datasets/routing_v2.jsonl \
 
 每类结果从相同 samples 重新聚合，未请求额外模型。该成绩只反映冻结题集上的分类表现，不是生产置信保证；分类平均耗时不是端到端首 token 延迟。本轮没有测量上线后的首 token 改善幅度。
 
+独立审查后采用加严计分规则重新核验同一批 360 条样本，仍为 PASS，新结果另存 `report-final.json`，不覆盖原始报告。新旧两版都必须完整有效；旧版的语义错误可以作为对照，但旧版缺样本或 provider 失败会使总状态 INCOMPLETE。`--repeats` 非 3 仅用于探索，不能得到验收 PASS。
+
 版本证据：
 
 - canonical dataset SHA256：`9cc8aca9a9f44d1297ada117ac147c441a79b05e6fb0ea76523467b678057edb`
@@ -71,3 +73,14 @@ python scripts/eval_routing.py --dataset evals/datasets/routing_v2.jsonl \
 ## 发布边界
 
 没有新增天气或联网工具，没有修改 PDF/chunker，没有重建 ES 或 MySQL Parent，没有业务表结构迁移。未授权的工具/MCP 权限治理继续待办；现有数据权限和引用审计不放宽。正式切换须先补齐隔离端到端验收、排空旧活动 Run、核对 query-v2/prompt-v2/routing-v2 快照，在明确授权后重启 API 与 Worker，步骤见[本地运行说明](local-operations.md#信息来源路由回归与切换)。
+
+## 独立审查与修复
+
+完成一次独立只读审查，提出 4 个 Important、无 Critical/Minor；四项均由先失败后通过的测试覆盖，再执行上述全量复跑，没有用第二次审查代替验证。
+
+1. Router 捕获真实 OpenAI SDK 的 APIError 子类；Gateway 重试耗尽后进入技术错误 Chat/Finalize，不再把请求交给 Worker 重试。保留 cancellation 和旧 v1 行为。
+2. MySQL 的时间列为秒级 DATETIME，同一秒的前序完成 Run 必须进入历史。读取时使用 finished_at <= anchor，并用 created_at 与服务端 UUIDv7 ID 组成严格前序边界；回放不能读到同秒的后续 Run。该修复无需数据库迁移。
+3. 新旧对照任意一版样本不完整或存在 provider 失败，总状态 INCOMPLETE。
+4. 验收固定 3 轮；单轮探索不能显示 PASS。
+
+审查范围外的取舍保持原约定：工具/MCP 权限和外部执行器不实现；其他未提交正式评测工作和 9 个既有 Mypy 问题不修改；不扩大为整个 Gateway 瞬态异常分类重构，因此不同 SDK 异常的底层重试次数仍由既有 Gateway 决定。没有延期的 Minor 审查项。

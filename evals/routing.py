@@ -147,4 +147,7 @@ def score_routing(samples: Sequence[RoutingSample], cases: Sequence[RoutingCase]
             for group in sorted({c.group for c in cases})
             for group_rows in [[s for s in valid if case_map[s.case_id].group == group]]
         }
-    return {"status": variants["v2"]["status"], "variants": variants}
+    # Exploration may use fewer repeats, but it is never three-round acceptance.
+    complete_pair = repeats == 3 and all(v["status"] != "INCOMPLETE" for v in variants.values())
+    return {"status": variants["v2"]["status"] if complete_pair else "INCOMPLETE",
+            "acceptance_repeats": 3, "requested_repeats": repeats, "variants": variants}

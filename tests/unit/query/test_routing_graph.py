@@ -1,4 +1,6 @@
 from dataclasses import replace
+import httpx
+from openai import APIConnectionError
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
@@ -75,3 +77,14 @@ async def test_v2_document_route_keeps_audits_and_citations():
     assert result["route"]["route"] == "fast_rag"
     assert "faithfulness" in result["executed_path"] and "citation" in result["executed_path"]
     assert result["answer"]["segments"][0]["evidence_ids"]
+
+
+async def test_sdk_failure_reaches_finalize_without_retrying_graph():
+    deps, memory, retrieval, _ = _deps()
+    gateway = Gateway(APIConnectionError(request=httpx.Request("POST", "https://model.invalid")))
+    deps = replace(deps, gateway=gateway, capabilities=RuntimeCapabilities(knowledge_base=True))
+    result = await build_query_graph(deps).ainvoke(_state())
+    assert result["response_mode"] == "technical_error"
+    assert result["executed_path"] == ["memory_loader", "route", "chat", "finalize"]
+    assert retrieval.calls == 0 and len(gateway.calls) == 1
+    assert len(memory.stored) == 1

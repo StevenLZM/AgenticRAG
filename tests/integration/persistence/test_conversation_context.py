@@ -43,3 +43,29 @@ async def test_history_is_scoped_bounded_read_only_and_time_stable():
     with pytest.raises(RoutingContextUnavailable):
         await reader.load(UserScope(user_id="v"), run_id="current", thread_id="t")
     await engine.dispose()
+
+
+async def test_second_precision_history_includes_prior_but_excludes_later_run():
+    from agentic_rag.persistence.conversations import SqlAlchemyConversationReader
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    anchor = datetime(2026, 10, 1, 0, 0, 0)
+    previous = "01a00000-0001-7000-8000-000000000001"
+    current = "01a00000-0002-7000-8000-000000000002"
+    future = "01a00000-0003-7000-8000-000000000003"
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(agent_runs.create)
+            for rid in (previous, current, future):
+                await conn.execute(insert(agent_runs).values(
+                    id=rid, user_id="u", thread_id="t", checkpoint_thread_id="query:u:t",
+                    status="running" if rid == current else "completed",
+                    active_slot=1 if rid == current else None,
+                    question="previous entity" if rid == previous else "unavailable future",
+                    runtime_config_snapshot_id="s", runtime_config_snapshot={},
+                    created_at=anchor, finished_at=None if rid == current else anchor, answer=None))
+        reader = SqlAlchemyConversationReader(async_sessionmaker(engine))
+        context = await reader.load(UserScope(user_id="u"), run_id=current, thread_id="t")
+        assert [turn.id for turn in context.history] == [f"query:{previous}:user"]
+        assert context.history[0].content == "previous entity"
+    finally:
+        await engine.dispose()

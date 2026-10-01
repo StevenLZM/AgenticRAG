@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import json
 import subprocess
 import sys
+import pytest
 
 from evals.routing import load_cases, RoutingSample, run_routing_eval, score_routing, dataset_hash
 from agentic_rag.models.schemas import RouteDecision
@@ -43,6 +44,19 @@ def test_complete_incomplete_and_duplicate_samples():
     assert score_routing(samples + [samples[-1]], cases)["status"] == "INCOMPLETE"
     samples[-1] = samples[-1].model_copy(update={"error_code": "provider_unavailable"})
     assert score_routing(samples, cases)["status"] == "INCOMPLETE"
+
+
+@pytest.mark.parametrize("scenario", ["missing", "failed", "single"])
+def test_missing_baseline_and_single_repetition_cannot_pass_acceptance(scenario):
+    cases = load_cases(DATASET)
+    samples = perfect(cases)
+    if scenario == "missing":
+        samples = [s for s in samples if s.variant == "v2"]
+    elif scenario == "failed":
+        samples = [s.model_copy(update={"error_code": "provider_unavailable"}) if s.variant == "v1" else s for s in samples]
+    else:
+        samples = [s for s in samples if s.repeat == 0]
+    assert score_routing(samples, cases, repeats=1 if scenario == "single" else 3)["status"] == "INCOMPLETE"
 
 
 def test_all_clarify_is_not_success_and_entities_are_checked():

@@ -3,7 +3,7 @@
 from datetime import timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentic_rag.domain.models import UserScope
@@ -31,8 +31,11 @@ class SqlAlchemyConversationReader:
                     agent_runs.c.id, agent_runs.c.question, agent_runs.c.answer,
                 ).where(
                     agent_runs.c.user_id == scope.user_id, agent_runs.c.thread_id == thread_id,
-                    agent_runs.c.status == "completed", agent_runs.c.finished_at < anchor,
-                    agent_runs.c.id != run_id,
+                    agent_runs.c.status == "completed", agent_runs.c.finished_at <= anchor,
+                    # MySQL DATETIME is second precision. IDs are server UUIDv7:
+                    # break creation-time ties without including a later Run on replay.
+                    or_(agent_runs.c.created_at < anchor, and_(
+                        agent_runs.c.created_at == anchor, agent_runs.c.id < run_id)),
                 ).order_by(agent_runs.c.created_at.desc(), agent_runs.c.id.desc()).limit(6))).mappings().all()
             turns = []
             for row in reversed(rows):
