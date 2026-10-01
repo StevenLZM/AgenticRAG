@@ -223,6 +223,23 @@ ingestion_jobs = Table(
     Index("ix_jobs_user_created", "user_id", "created_at"),
 )
 
+chat_sessions = Table(
+    "chat_sessions",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("user_id", String(255), nullable=False),
+    Column("creation_request_id", String(36), nullable=False),
+    Column("title", String(100), nullable=False),
+    Column("title_source", String(16), nullable=False),
+    Column("created_at", DateTime().with_variant(mysql.DATETIME(fsp=6), "mysql"), nullable=False),
+    Column("updated_at", DateTime().with_variant(mysql.DATETIME(fsp=6), "mysql"), nullable=False),
+    Column("last_activity_at", DateTime().with_variant(mysql.DATETIME(fsp=6), "mysql"), nullable=False),
+    Column("deleted_at", DateTime().with_variant(mysql.DATETIME(fsp=6), "mysql"), nullable=True),
+    CheckConstraint("title_source IN ('default','first_question','manual')", name="ck_chat_session_title_source"),
+    UniqueConstraint("user_id", "creation_request_id", name="uq_chat_session_creation"),
+    Index("ix_chat_sessions_user_activity", "user_id", "deleted_at", "last_activity_at", "id"),
+)
+
 agent_runs = Table(
     "agent_runs",
     metadata,
@@ -238,9 +255,11 @@ agent_runs = Table(
     Column("attempt_count", Integer, nullable=False, default=0),
     Column("route", String(64), nullable=True),
     Column("question", Text, nullable=False, default=""),
+    Column("client_request_id", String(36), nullable=True),
     Column("runtime_config_snapshot_id", String(64), nullable=False),
     Column("runtime_config_snapshot", JSON, nullable=False),
     Column("answer", JSON, nullable=True),
+    Column("answer_sources", JSON, nullable=True),
     Column("result_ref", String(1024), nullable=True),
     Column("error_code", String(128), nullable=True),
     Column("termination_reason", String(255), nullable=True),
@@ -258,6 +277,7 @@ agent_runs = Table(
         name="ck_active_slot",
     ),
     UniqueConstraint("user_id", "thread_id", "active_slot", name="uq_runs_active_slot"),
+    UniqueConstraint("user_id", "thread_id", "client_request_id", name="uq_runs_client_request"),
     Index("ix_runs_status_lease", "status", "lease_expires_at"),
     Index("ix_runs_user_thread_created", "user_id", "thread_id", "created_at"),
 )

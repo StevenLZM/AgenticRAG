@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from agentic_rag.config import Settings
 from agentic_rag.persistence.artifacts import ArtifactRef, ArtifactStore
 from agentic_rag.persistence.checkpoint import CheckpointBackend
+from agentic_rag.persistence.schema_readiness import check_chat_schema
 from agentic_rag.runtime.ids import new_id
 
 
@@ -163,6 +164,7 @@ def build_readiness_checks(
         {
             "configuration": partial(check_configuration, settings),
             "mysql": partial(check_mysql, mysql),
+            "chat_schema": partial(check_chat_schema, mysql),
             "redis": partial(check_redis, redis),
             "elasticsearch": partial(check_elasticsearch, elasticsearch),
             "artifacts": partial(check_artifacts, artifacts),

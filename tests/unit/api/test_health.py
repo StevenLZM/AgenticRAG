@@ -55,6 +55,19 @@ async def _ok() -> None:
     return None
 
 
+async def test_built_readiness_reports_unmigrated_chat_schema():
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from agentic_rag.api.health import build_readiness_checks
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    empty = SimpleNamespace()
+    try:
+        checks = build_readiness_checks(settings=empty, mysql=engine, redis=empty,
+            elasticsearch=empty, artifacts=empty, checkpoints=empty, reranker_initialized=True)
+        assert (await checks.run()).get("chat_schema") == "unavailable"
+    finally:
+        await engine.dispose()
+
+
 def _container(checks: ReadinessChecks) -> SimpleNamespace:
     container = SimpleNamespace(readiness_checks=checks, closed=False)
 

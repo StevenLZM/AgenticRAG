@@ -49,6 +49,7 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 pytestmark = pytest.mark.integration
 
 EXPECTED_TABLES = {
+    "chat_sessions",
     "documents",
     "document_versions",
     "parent_chunks",
@@ -61,6 +62,9 @@ EXPECTED_TABLES = {
 }
 
 EXPECTED_INDEXES = {
+    "chat_sessions": {
+        "ix_chat_sessions_user_activity": ("user_id", "deleted_at", "last_activity_at", "id"),
+    },
     "documents": {
         "ix_documents_user_status": ("user_id", "status"),
         "ix_documents_user_content_hash": ("user_id", "content_hash"),
@@ -87,6 +91,7 @@ EXPECTED_INDEXES = {
 }
 
 EXPECTED_FOREIGN_KEYS = {
+    "chat_sessions": {},
     "documents": {
         "fk_documents_active_version": (
             ("active_version_id",),
@@ -171,7 +176,7 @@ def mysql_dsn() -> str:
     return dsn
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 async def session_factory(
     mysql_dsn: str, migrated_schema: None
 ) -> AsyncIterator[async_sessionmaker[AsyncSession]]:

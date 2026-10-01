@@ -129,6 +129,8 @@ async def run(
     container = build_container(settings)
     dependencies: QueryGraphDependencies | None = None
     try:
+        from agentic_rag.persistence.schema_readiness import check_chat_schema
+        await check_chat_schema(container.mysql_engine)
         await ensure_active_child_alias(container, settings)
         dependencies = await dependencies_factory(container, settings)
         shared_concurrency = dependencies.concurrency or ConcurrencyManager()
