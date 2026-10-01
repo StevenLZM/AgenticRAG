@@ -100,7 +100,8 @@ def build_answer_sources(
         lookup = {item.evidence_id: item for item in packed.items}
         if len(lookup) != len(packed.items):
             raise InvalidAnswerSources("duplicate packed evidence")
-        sources, contents = [], []
+        sources: list[dict[str, object]] = []
+        contents: list[str] = []
         for eid in ids:
             item, manifest = lookup.get(eid), packed.manifest.get(eid)
             if (
@@ -116,7 +117,7 @@ def build_answer_sources(
                     break
                 headings.append(heading[:remaining])
                 remaining -= len(headings[-1])
-            pages = (None, None)
+            pages: tuple[int | None, int | None] = (None, None)
             try:
                 locator = AstLocator.model_validate_json(item.ast_locator)
                 low, high = (
@@ -152,11 +153,11 @@ def build_answer_sources(
         )
         if not within_budget(candidate):
             raise InvalidAnswerSources("metadata exceeds source budget")
-        for source, content in zip(sources, contents):
+        for source_data, content in zip(sources, contents):
             low, high = 0, min(2000, len(content))
             while low < high:
                 mid = (low + high + 1) // 2
-                source.update(
+                source_data.update(
                     excerpt=content[:mid],
                     excerpt_omitted=False,
                     truncated=mid < len(content),
@@ -165,7 +166,7 @@ def build_answer_sources(
                     low = mid
                 else:
                     high = mid - 1
-            source.update(
+            source_data.update(
                 excerpt=content[:low],
                 excerpt_omitted=bool(content) and low == 0,
                 truncated=low < len(content),

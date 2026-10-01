@@ -3,12 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from tests.fixtures import query_services
+
+
+async def test_deterministic_model_reads_role_messages_after_schema_prefix() -> None:
+    from agentic_rag.runtime.model_gateway import _structured_messages
+    from agentic_rag.models.schemas import RouteDecision
+
+    response = await query_services._DeterministicResponses().create(
+        input=_structured_messages(
+            (
+                {"role": "system", "content": "Classify the query"},
+                {"role": "user", "content": json.dumps({"question": "notice period"})},
+            ),
+            RouteDecision,
+        )
+    )
+    assert json.loads(str(response["output_text"])) == {
+        "route": "fast_rag", "normalized_query": "notice period",
+        "reason_code": "deterministic_e2e",
+    }
 
 
 def test_mixed_missing_and_explicitly_disabled_provider_configuration_fails(

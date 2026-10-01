@@ -2,12 +2,12 @@
 
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import uuid4
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.observability.logging import AgentEventEmitter
-from agentic_rag.persistence.repositories import AgentEvent, EventRepository
+from agentic_rag.persistence.repositories import AgentEvent
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 QueryPhase = Literal["processing", "retrieving", "researching", "auditing"]
@@ -24,6 +24,10 @@ async def report_safely(reporter: PhaseReporter | None, phase: QueryPhase) -> No
             pass
 
 
+class PhaseEventRecorder(Protocol):
+    async def append(self, event: AgentEvent) -> int: ...
+
+
 class QueryPhaseEmitter:
     def __init__(
         self,
@@ -32,7 +36,7 @@ class QueryPhaseEmitter:
         scope: UserScope,
         snapshot: RuntimeConfigSnapshot,
         event_emitter: AgentEventEmitter | None = None,
-        event_repository: EventRepository | None = None,
+        event_repository: PhaseEventRecorder | None = None,
     ):
         self.run_id, self.scope, self.snapshot = run_id, scope, snapshot
         self.emitter, self.repository = event_emitter, event_repository

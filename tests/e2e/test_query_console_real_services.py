@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import pytest
 
@@ -22,7 +23,9 @@ async def test_console_real_graph_api_query_protocol_smoke_has_snapshot_provenan
     """A live provider run must cross the public console/API boundary safely."""
     page = await real_query_runtime.client.get("/")
     assert page.status_code == 200
-    assert "知识检索控制台" in page.text
+    assert 'id="chat-messages"' in page.text
+    assert 'id="query-input"' in page.text
+    assert 'id="session-list"' in page.text
     memories = await real_query_runtime.client.get("/v1/memories")
     assert memories.status_code == 200
     stored_marker = real_query_runtime.memory_marker
@@ -33,11 +36,16 @@ async def test_console_real_graph_api_query_protocol_smoke_has_snapshot_provenan
         if isinstance(memory, Mapping)
     )
 
-    created = await real_query_runtime.client.post(
-        "/v1/query",
-        json={"query": real_query_runtime.seeded_question, "wait_seconds": 30},
+    session = await real_query_runtime.client.post(
+        "/v1/chat-sessions", json={"creation_request_id": str(uuid4())}
     )
-    assert created.status_code in {200, 202}
+    assert session.status_code == 201
+    session_id = session.json()["session_id"]
+    created = await real_query_runtime.client.post(
+        f"/v1/chat-sessions/{session_id}/turns",
+        json={"query": real_query_runtime.seeded_question, "client_request_id": str(uuid4())},
+    )
+    assert created.status_code == 202
     run_id = created.json()["run_id"]
     assert isinstance(run_id, str) and run_id
 
@@ -51,6 +59,17 @@ async def test_console_real_graph_api_query_protocol_smoke_has_snapshot_provenan
     assert answer["segments"]
     assert answer["evidence_parent_ids"]
     assert real_query_runtime.seeded_parent_id in answer["evidence_parent_ids"]
+
+    history = await real_query_runtime.client.get(f"/v1/chat-sessions/{session_id}/turns")
+    assert history.status_code == 200
+    assert [item["run_id"] for item in history.json()["items"]] == [run_id]
+    assert history.json()["items"][0]["answer"] == answer
+    sources = await real_query_runtime.client.get(
+        f"/v1/chat-sessions/{session_id}/turns/{run_id}/sources"
+    )
+    assert sources.status_code == 200
+    assert sources.json()["status"] == "available"
+    assert sources.json()["items"]
 
     degradation = next(
         event for event in events if event["event_type"] == "CIRCUIT_OPEN"

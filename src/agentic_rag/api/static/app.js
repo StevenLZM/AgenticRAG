@@ -21,7 +21,7 @@
       byId = (id) => document.getElementById(id);
     if (storage === undefined) {
       try {
-        storage = window.localStorage;
+        storage = window.sessionStorage;
       } catch (_) {
         storage = null;
       }

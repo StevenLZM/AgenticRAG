@@ -103,7 +103,13 @@ conda run -n agentic-rag python scripts/rebuild_preflight.py \
 
 只有报告 `ready=true` 且逐项记录了重排原因、Parent 数量、token 分布和 source-span 覆盖后，才能由另一个经审批的变更执行备份—删除—重建 runbook。不要把 `*`、未展开的环境变量或 Alias 名称作为删除目标。
 
-控制台实际调用 `POST /v1/query` 这个同步 wrapper：它创建与异步 API 相同的持久化 Run，并在 `wait_seconds` 内等待终态；未完成时返回现有 Run 的 `202` 响应，不会创建第二个 Run。`POST /v1/query-runs` 是直接创建 Run 后立即返回的异步 API，供其他客户端或显式异步流程使用；页面不会把它误当成同步路径。两种入口都通过 `GET /v1/query-runs/{run_id}/events` 的 SSE 接收进度。断线后页面会使用最后收到的 event ID 重连；运维排查也可传入 `Last-Event-ID` 重新连接同一路径。页面只呈现服务端白名单内的运行状态、证据、审计、`runtime_config_snapshot_id` 与 `client_provenance`，绝不呈现 prompt、记忆原文、隐藏推理、工具载荷或服务提供方原始响应。升级时先停止 Worker，等待当前图节点到达 SQLite checkpoint，再执行迁移，并按相同顺序重新启动。
+聊天页面先通过 `POST /v1/chat-sessions` 创建会话，再向 `POST /v1/chat-sessions/{session_id}/turns` 提交每一问。一个 session 固定使用同一个 thread，每问创建独立 Run；首问自动命名，也可手动重命名。左侧列表支持重新打开、继续追问和逻辑删除；删除不清理用户知识库或 Mem0，旧调试、评测与独立 Run 不导入新列表。知识库和长期记忆继续按服务端 `user_id` 共享和隔离。页面完整保存已受理问答；模型使用的历史窗口仍为最近 6 条角色消息、最多 8000 字符，不能理解为模型读取了全部聊天记录。
+
+提问、阶段和回答在同一消息流中。处理中只显示“处理中／检索中／研究中／审核中”，持久化终态后整体显示公开结果；每轮来源单独展开，并重新校验文档权限与删除状态。文档更新后旧回答引用标注历史版本。文档上传、记忆管理和系统状态放在工具抽屉中，聊天页面不显示检索日志、prompt、隐藏推理、原始工具或供应商载荷。
+
+浏览器通过 `GET /v1/query-runs/{run_id}/events` 接收 SSE，按最后 event ID 重连，多次失败后回退为 GET 轮询；终态事件仅触发持久化状态核验。切换会话只切换观察连接，后台任务继续执行；停止按钮请求取消，收到实际终态后才能发下一问。当前标签页 sessionStorage 只保存会话 ID、提交幂等键、活动 Run ID 和事件游标，不缓存问题、答案或来源。提交响应丢失时，用原幂等键查询或重试；刷新后的 404 只代表尚未确认，不能换新键自动重发。浏览器禁止存储时仍可使用会话列表恢复已受理任务，但无法保留标签页恢复元数据。
+
+旧 `POST /v1/query` 同步 wrapper 与 `POST /v1/query-runs` 异步 API保留兼容；对已登记聊天 session 同样实施归属、删除与单活动 Run 约束。评测使用独立 thread，不在聊天 session 上运行。
 
 ## Query Outbox 与 Query Worker
 
@@ -350,3 +356,15 @@ python scripts/eval_routing.py --dataset evals/datasets/routing_v2.jsonl \
 真实服务回归使用 `python -m pytest tests/e2e/test_capability_routing.py -m 'e2e and live_model' -v -rs`。沿用现有真实 Query fixture 的显式本地测试配置：`AGENTIC_RAG_RUN_REAL_QUERY_PROVIDER_E2E=1`、测试 MySQL/Redis/ES DSN、测试 MySQL admin DSN 与 backup/restore opt-in；缺失时 skip。仅创建和清理随机命名的测试数据库、索引、Redis namespace 与 checkpoint；上传小型文本天气报告和简历，经真实 parser/assembler/chunker/embedding 发布，查询记忆策略 disabled，不触碰生产数据或 active alias。
 
 正式切换前先完成隔离端到端验收，再停止接收新请求并排空旧活动 Run；不要让旧 prompt/schema checkpoint 被新图恢复。验证新快照包含 graph=query-v2、prompt=prompt-v2、routing_policy_version=routing-v2 及 v2 Prompt 哈希。得到用户明确授权后才重启 API/Query Worker，核对 API 与 Worker 的 snapshot_id 一致，再进行天气与文档问答 smoke。回滚也须排空活动 Run 并恢复匹配的图/Prompt 版本。本轮没有执行切换，不需要业务数据库迁移、重建索引或重新切块。
+
+
+## 持久化聊天升级与回滚（2026-10-01）
+
+本次在 `main` 开发；实现与验收不等于部署。实际结果见[聊天验收记录](validation/2026-10-01-persistent-chat-sessions.md)。以下是获准发布时的操作顺序，本次没有对应用数据库执行这些命令，也没有重启应用服务：
+
+1. 备份 MySQL 和 checkpoint，核实可恢复；停止新查询入口，排空 `queued/running/cancel_requested` Run，再停止 Query Worker，避免旧图或旧静态资源跨版本执行。
+2. 检查 `alembic current` 后执行 `conda run -n agentic-rag alembic upgrade head`。`0008_chat_sessions` 增加会话表、提交键与来源快照，以及用户/会话范围内的唯一键和分页索引；将 `agent_runs.question` 扩为 MEDIUMTEXT，支持 32,000 个中文或 emoji 字符。DDL 按实际表大小安排维护窗口，不假定 MySQL DDL 可整笔回滚。
+3. 协调更新 API、Query Worker 与本版本静态文件，使用相同配置快照。API readiness 和 Worker 启动均检查新表、字段、唯一键、索引及 question 容量；只通过 `/health/live` 不代表可接流量。先检查 Worker 启动结果、`/health/ready`、`/v1/runtime-config/summary`，再开放流量。
+4. 完成新建会话、连续两问、刷新、切换、停止与来源展开 smoke；确认同 session 的 thread 稳定且每问 Run 不同，观察 Outbox/Worker 消费和终态持久化。历史列表从新功能创建的 session 起生效。
+
+回滚前同样排空活动 Run，恢复相互匹配的 API、Worker、静态资源和图版本。应用回滚优先保留新增表列与数据，旧客户端仍能使用旧 API。不要把 Alembic downgrade 当作无损回滚：它会移除会话、幂等键和来源字段；`question` 故意保留较大的兼容类型，避免历史长消息截断。确需降级 schema 时，先另行备份和批准数据处理方案。

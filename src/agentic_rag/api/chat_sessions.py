@@ -1,7 +1,7 @@
 """Scoped persistent chat endpoints; all public data is explicitly projected."""
 
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, overload
 from uuid import UUID
 
 from fastapi import APIRouter, Query, Request, Response
@@ -50,6 +50,14 @@ class SubmitTurn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     query: Question
     client_request_id: UUID
+
+
+@overload
+def public_time(value: datetime) -> str: ...
+
+
+@overload
+def public_time(value: None) -> None: ...
 
 
 def public_time(value: datetime | None) -> str | None:
@@ -103,6 +111,8 @@ class TurnResponse(BaseModel):
 
     @classmethod
     def project(cls, run: QueryRun, phases: dict):
+        # Durable managed turns always have a server-assigned creation time.
+        assert run.created_at is not None
         answer = (
             project_public_answer(
                 run.answer, runtime_config_snapshot_id=run.runtime_config_snapshot_id

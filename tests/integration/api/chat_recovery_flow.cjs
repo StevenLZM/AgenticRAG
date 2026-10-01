@@ -123,3 +123,44 @@ main().catch((e) => {
   console.error(e);
   process.exitCode = 1;
 });
+
+async function browserStorageContract() {
+  const document = fromFile(path.join(dir, "index.html"));
+  let reads = 0,
+    localReads = 0;
+  const browser = {
+    ...window,
+    sessionStorage: {
+      getItem() {
+        reads++;
+        return null;
+      },
+      setItem() {},
+    },
+  };
+  Object.defineProperty(browser, "localStorage", {
+    get() {
+      localReads++;
+      throw new Error("persistent storage forbidden");
+    },
+  });
+  const api = {
+    listSessions: async () => ({ items: [summary] }),
+    getSession: async () => summary,
+    listTurns: async () => ({ items: [] }),
+  };
+  const controller = createChatController({
+    document,
+    window: browser,
+    tools,
+    api,
+  });
+  await controller.start();
+  assert.equal(reads, 1);
+  assert.equal(localReads, 0);
+  controller.dispose();
+}
+browserStorageContract().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

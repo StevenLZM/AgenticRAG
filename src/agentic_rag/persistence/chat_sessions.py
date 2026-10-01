@@ -16,7 +16,7 @@ from agentic_rag.persistence.repositories import agent_runs, chat_sessions, docu
 from agentic_rag.runtime.ids import new_id
 
 
-def _from_row(row: Mapping[str, Any]) -> ChatSession:
+def _from_row(row: Mapping[Any, Any]) -> ChatSession:
     return ChatSession(
         id=row["id"], user_id=row["user_id"], creation_request_id=row["creation_request_id"],
         title=row["title"], title_source=row["title_source"],

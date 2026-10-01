@@ -59,6 +59,8 @@ from agentic_rag.query.evidence_builder import EvidenceBuilder
 from agentic_rag.query.generation import AnswerGenerator
 from agentic_rag.query.graph import QueryGraphDependencies
 from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+from agentic_rag.query.routing_policy import RuntimeCapabilities
+from agentic_rag.persistence.conversations import SqlAlchemyConversationReader
 from agentic_rag.retrieval.adapters.elasticsearch import (
     ElasticsearchBm25Index,
     ElasticsearchVectorIndex,
@@ -163,25 +165,40 @@ class _DeterministicResponses:
         messages = kwargs.get("input", ())
         system = ""
         user_payload: dict[str, object] = {}
-        if isinstance(messages, Sequence) and messages:
-            first = messages[0]
-            if isinstance(first, dict):
-                system = str(first.get("content", ""))
-            if len(messages) > 1 and isinstance(messages[1], dict):
+        if isinstance(messages, Sequence):
+            # The gateway may prepend server-owned schema system messages.
+            # Match model roles, not positions in the structured envelope.
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                if message.get("role") == "system":
+                    system += "\n" + str(message.get("content", ""))
+                if message.get("role") != "user":
+                    continue
                 try:
-                    parsed = json.loads(str(messages[1].get("content", "{}")))
+                    parsed = json.loads(str(message.get("content", "{}")))
                 except (TypeError, ValueError):
                     parsed = {}
                 if isinstance(parsed, dict):
                     user_payload = parsed
-        if "Classify the query" in system:
+        if "Identify the information sources" in system:
             value: object = {
+                "required_sources": ["knowledge_base"],
+                "retrieval_complexity": "single",
+                "needs_clarification": False,
+                "normalized_query": str(user_payload.get("question", "query")),
+                "reason_code": "knowledge_base_lookup",
+            }
+        elif "Classify the query" in system:
+            value = {
                 "route": "fast_rag",
                 "normalized_query": str(user_payload.get("question", "query")),
                 "reason_code": "deterministic_e2e",
             }
         elif "Determine whether the available evidence" in system:
             value = {"decision": "sufficient", "gaps": []}
+        elif "Assess whether the verified evidence" in system:
+            value = {"decision": "sufficient", "gap_type": "none", "gaps": []}
         elif "Generate a concise" in system:
             manifest = user_payload.get("evidence_manifest", {})
             evidence_id = next(iter(manifest), "") if isinstance(manifest, dict) else ""
@@ -524,6 +541,8 @@ def _dependencies(container: AppContainer, settings: Settings) -> QueryGraphDepe
             runtime_config_snapshot_id=snapshot.snapshot_id,
         ),
         owned_resources=(),
+        capabilities=RuntimeCapabilities(knowledge_base=True),
+        conversations=SqlAlchemyConversationReader(container.repositories.session_factory),
     )
 
 
