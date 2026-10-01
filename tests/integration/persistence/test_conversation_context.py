@@ -1,0 +1,45 @@
+import importlib.util
+from datetime import datetime, timedelta
+
+import pytest
+from sqlalchemy import event, insert
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from agentic_rag.domain.models import UserScope
+from agentic_rag.persistence.repositories import agent_runs
+
+
+async def test_history_is_scoped_bounded_read_only_and_time_stable():
+    assert importlib.util.find_spec("agentic_rag.persistence.conversations") is not None
+    from agentic_rag.persistence.conversations import SqlAlchemyConversationReader
+    from agentic_rag.query.routing_context import RoutingContextUnavailable
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    now = datetime(2026, 9, 30, 16, 1)
+    async with engine.begin() as conn:
+        await conn.run_sync(agent_runs.create)
+        for rid, user, thread, status, offset in [
+            ("old", "u", "t", "completed", -2), ("other-user", "v", "t", "completed", -2),
+            ("other-thread", "u", "x", "completed", -2), ("late", "u", "t", "completed", 1),
+            ("current", "u", "t", "running", 0),
+        ]:
+            await conn.execute(insert(agent_runs).values(
+                id=rid, user_id=user, thread_id=thread, checkpoint_thread_id=f"query:{user}:{thread}",
+                status=status, active_slot=1 if status == "running" else None,
+                question="京东经历", runtime_config_snapshot_id="s", runtime_config_snapshot={},
+                created_at=now + timedelta(minutes=offset),
+                finished_at=now + timedelta(minutes=offset) if status == "completed" else None,
+                answer={"route": "chat", "segments": [{"kind": "content", "text": "描述经历", "evidence_ids": []}]},
+            ))
+    statements = []
+    event.listen(engine.sync_engine, "before_cursor_execute", lambda c, cur, statement, *args: statements.append(statement))
+    reader = SqlAlchemyConversationReader(async_sessionmaker(engine))
+    a = await reader.load(UserScope(user_id="u"), run_id="current", thread_id="t")
+    b = await reader.load(UserScope(user_id="u"), run_id="current", thread_id="t")
+    assert a == b
+    assert a.requested_at.startswith("2026-10-01T00:01")
+    assert [t.id for t in a.history] == ["query:old:user", "query:old:assistant"]
+    assert all(s.lstrip().upper().startswith("SELECT") for s in statements)
+    with pytest.raises(RoutingContextUnavailable):
+        await reader.load(UserScope(user_id="v"), run_id="current", thread_id="t")
+    await engine.dispose()
