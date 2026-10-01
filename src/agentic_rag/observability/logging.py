@@ -204,6 +204,16 @@ def sanitize_attributes(attributes: Mapping[str, Any] | None) -> dict[str, Any]:
             result[key] = value
         elif key == "outcome" and value in _DEGRADATION_OUTCOMES:
             result[key] = value
+        elif key in {"initial_route", "route"} and isinstance(value, str) and value in {"chat", "fast_rag", "research"}:
+            result[key] = value
+        elif key == "response_mode" and isinstance(value, str) and value in {"conversation", "capability_unavailable", "clarify", "technical_error"}:
+            result[key] = value
+        elif key == "gap_type" and isinstance(value, str) and value in {"none", "missing_facts", "multi_step_required", "query_ambiguous", "external_realtime_required", "external_lookup_required", "irrelevant_results", "unknown"}:
+            result[key] = value
+        elif key == "executed_path" and isinstance(value, (list, tuple)) and len(value) <= 64 and all(
+            isinstance(node, str) and node in {"memory_loader", "route", "chat", "fast_rag", "record_fast_grade", "research_agent_loop", "evidence_builder", "evidence_grader", "generate", "faithfulness", "citation", "finalize"} for node in value
+        ):
+            result[key] = list(value)
         elif key == "termination_reason" and value in _TERMINATION_REASONS:
             result[key] = value
         elif key == "rating" and value in {"up", "down"}:

@@ -146,7 +146,7 @@ def build_query_graph(
         async with _trace_span(dependencies, state, "graph.node.route"):
             async with _trace_span(dependencies, state, "llm"):
                 update = await route_query(state, dependencies.gateway, capabilities=dependencies.capabilities)
-        await _event(dependencies, state, "QUERY_ROUTED", str(update.get("next_node", "research_agent")))
+        await _event(dependencies, cast(QueryState, {**state, **update}), "QUERY_ROUTED", str(update.get("next_node", "research_agent")))
         return update
 
     async def chat(state: QueryState) -> dict[str, object]:
@@ -367,13 +367,17 @@ def build_query_graph(
 
     def tracked(name, function):
         async def invoke(state: QueryState, config: RunnableConfig):
+            path = []
+            if dependencies.capabilities is not None:
+                previous = [] if name == "memory_loader" and state.get("routing_owner_run_id") != state["run_id"] else state.get("executed_path", [])
+                path = [*previous, name][-64:]
+                state = cast(QueryState, {**state, "executed_path": path})
             if name == "memory_loader":
                 update = await function(state, config)
             else:
                 update = await function(state)
             if dependencies.capabilities is not None:
-                previous = [] if name == "memory_loader" and state.get("routing_owner_run_id") != state["run_id"] else state.get("executed_path", [])
-                update["executed_path"] = [*previous, name][-64:]
+                update["executed_path"] = path
             return update
         return invoke
 
@@ -537,7 +541,8 @@ async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_
 
 def _event_attributes(state: Mapping[str, object], event_type: str) -> dict[str, object]:
     """Derive only numeric/enumerated projection fields from trusted graph state."""
-    attributes: dict[str, object] = {}
+    from agentic_rag.query.routing_policy import routing_summary
+    attributes: dict[str, object] = routing_summary(cast(QueryState, state))
     if event_type == "FAST_RAG_COMPLETED":
         attributes["retrieval_rounds"] = 1
     if event_type in {"FAST_RAG_COMPLETED", "RESEARCH_LOOP_COMPLETED"}:

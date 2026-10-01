@@ -120,6 +120,8 @@ _PUBLIC_EVENT_TYPES = {
     "USER_FEEDBACK",
 }
 _PUBLIC_DEGRADATION_EVENT_TYPES = {
+    "MEMORY_LOADED", "QUERY_ROUTED", "FAST_RAG_COMPLETED", "RESEARCH_LOOP_COMPLETED",
+    "EVIDENCE_GRADED", "ANSWER_GENERATED", "ANSWER_FINALIZED",
     "COMPONENT_DEGRADED",
     "COMPONENT_REFUSED",
     "RETRIEVAL_DEGRADED",
@@ -135,6 +137,7 @@ _PUBLIC_DEGRADATION_EVENT_TYPES = {
 }
 _PUBLIC_DEGRADATION_ATTRIBUTE_FIELDS = frozenset(
     {
+        "initial_route", "route", "executed_path", "gap_type", "response_mode", "termination_reason",
         "attempt",
         "component",
         "reason",
@@ -366,6 +369,8 @@ def _sse_event(event: AgentEvent, *, artifacts: object | None = None) -> str:
     attributes = _safe_degradation_attributes(event, artifacts)
     if event_type == "QUERY_ROUTED" and event.summary in {"chat", "fast_rag", "research"}:
         payload["route"] = event.summary
+    if attributes.get("route") in {"chat", "fast_rag", "research"}:
+        payload["route"] = attributes["route"]
     if attributes:
         payload["attributes"] = attributes
     return f"id: {event.id}\nevent: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"

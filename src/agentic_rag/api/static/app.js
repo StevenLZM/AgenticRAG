@@ -121,6 +121,19 @@
     const raw = event && typeof event.attributes === "object" && event.attributes
       ? event.attributes : {};
     const attributes = {};
+    ["initial_route", "route"].forEach((key) => {
+      if (safeRoute(raw[key])) attributes[key] = raw[key];
+    });
+    if (["conversation", "capability_unavailable", "clarify", "technical_error"].includes(raw.response_mode)) {
+      attributes.response_mode = raw.response_mode;
+    }
+    if (["none", "missing_facts", "multi_step_required", "query_ambiguous", "external_realtime_required", "external_lookup_required", "irrelevant_results", "unknown"].includes(raw.gap_type)) {
+      attributes.gap_type = raw.gap_type;
+    }
+    const nodes = new Set(["memory_loader", "route", "chat", "fast_rag", "record_fast_grade", "research_agent_loop", "evidence_builder", "evidence_grader", "generate", "faithfulness", "citation", "finalize"]);
+    if (Array.isArray(raw.executed_path) && raw.executed_path.length <= 64 && raw.executed_path.every((node) => nodes.has(node))) {
+      attributes.executed_path = raw.executed_path;
+    }
     if (SAFE_DEGRADATION_COMPONENTS.has(raw.component)) attributes.component = raw.component;
     if (SAFE_DEGRADATION_REASONS.has(raw.reason)) attributes.reason = raw.reason;
     if (SAFE_DEGRADATION_OUTCOMES.has(raw.outcome)) attributes.outcome = raw.outcome;
@@ -248,7 +261,7 @@
   function appendTimeline(event) {
     const presentation = eventPresentation(event);
     if (!presentation) return;
-    if (event.event_type === "QUERY_ROUTED" && safeRoute(event.route)) {
+    if (safeRoute(event.route)) {
       activeRoute = event.route;
       if (!answerSettled) setText(elements.answer, ROUTE_WAITING[activeRoute]);
     }

@@ -705,7 +705,7 @@ def _public_answer_projection(
     route = route_value if isinstance(route_value, str) else None
     projected = project_public_answer(
         answer,
-        evidence_parent_ids=parent_ids,
+        evidence_parent_ids=[] if route == "chat" else parent_ids,
         route=route,
         runtime_config_snapshot_id=(runtime_config_snapshot_id if require_audited else None),
         require_audited=require_audited and route != "chat",

@@ -105,3 +105,17 @@ def policy_update(state: QueryState, decision: PolicyDecision, *, normalized_que
     if decision.next_node == "end" and decision.termination_reason:
         update["answer"] = {"status": decision.termination_reason}
     return update
+
+
+def routing_summary(state: QueryState) -> dict[str, object]:
+    """Only bounded routing enums may enter durable telemetry or the UI."""
+    from agentic_rag.observability.logging import sanitize_attributes
+
+    route = state.get("route") or {}
+    grade = state.get("last_evidence_grade") or {}
+    return sanitize_attributes({
+        "initial_route": state.get("initial_route"), "route": route.get("route"),
+        "executed_path": state.get("executed_path"), "gap_type": grade.get("gap_type"),
+        "response_mode": state.get("response_mode"),
+        "termination_reason": state.get("termination_reason"),
+    })
