@@ -139,6 +139,12 @@ async def test_worker_entrypoint_receives_the_composed_concurrency_budget(
     """The entrypoint must not replace the graph's process-wide budget."""
     import scripts.run_query_worker as worker_entrypoint
 
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from agentic_rag.persistence.repositories import metadata
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(metadata.create_all)
     shared_concurrency = ConcurrencyManager()
     dependencies = SimpleNamespace(
         concurrency=shared_concurrency,
@@ -160,12 +166,13 @@ async def test_worker_entrypoint_receives_the_composed_concurrency_budget(
             yield object()
 
     class FakeContainer:
+        mysql_engine = engine
         checkpoints = FakeCheckpoints()
         broker = object()
         repositories = SimpleNamespace(session_factory=object())
 
         async def close(self) -> None:
-            return None
+            await engine.dispose()
 
     async def dependencies_factory(*_: object) -> object:
         return dependencies

@@ -69,3 +69,30 @@ async def test_second_precision_history_includes_prior_but_excludes_later_run():
         assert context.history[0].content == "previous entity"
     finally:
         await engine.dispose()
+
+
+async def test_long_history_keeps_only_six_public_messages_and_8000_characters():
+    from agentic_rag.persistence.conversations import SqlAlchemyConversationReader
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    anchor = datetime(2026, 10, 1)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(agent_runs.create)
+            for i in range(12):
+                status = "running" if i == 11 else ("failed" if i == 10 else "completed")
+                await conn.execute(insert(agent_runs).values(
+                    id=f"run-{i:02}", user_id="other" if i == 9 else "u",
+                    thread_id="other" if i == 8 else "t", checkpoint_thread_id="query:u:t",
+                    status=status, active_slot=1 if i == 11 else None,
+                    question=f"question-{i}:" + "问" * 2000,
+                    answer={"route": "chat", "segments": [{"kind": "content", "text": "答" * 2000}]},
+                    runtime_config_snapshot_id="s", runtime_config_snapshot={},
+                    created_at=anchor + timedelta(seconds=i),
+                    finished_at=anchor + timedelta(seconds=i) if i != 11 else None))
+        context = await SqlAlchemyConversationReader(async_sessionmaker(engine)).load(
+            UserScope(user_id="u"), run_id="run-11", thread_id="t")
+        assert len(context.history) <= 6
+        assert sum(len(turn.content) for turn in context.history) == 8000
+        assert all(any(f"run-{i:02}" in turn.id for i in (5, 6, 7)) for turn in context.history)
+    finally:
+        await engine.dispose()

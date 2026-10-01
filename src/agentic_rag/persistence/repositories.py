@@ -44,6 +44,7 @@ from agentic_rag.domain.models import (
     RunStatus,
     UserScope,
 )
+from agentic_rag.domain.chat_sessions import SessionNotFound, utc_datetime
 from agentic_rag.runtime.ids import new_id
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
@@ -440,6 +441,10 @@ class QueryRun:
     error_code: str | None = None
     question: str = ""
     answer: dict[str, Any] | None = None
+    client_request_id: str | None = None
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
+    answer_sources: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +533,7 @@ class RunRepository(Protocol):
         *,
         question: str = "",
         transaction: AsyncSession | None = None,
+        client_request_id: str | None = None,
     ) -> QueryRun: ...
 
     async def get(self, run_id: str, scope: UserScope) -> QueryRun | None: ...
@@ -561,6 +567,7 @@ class RunRepository(Protocol):
         owner: str,
         claim_generation: int,
         answer: dict[str, Any] | None = None,
+        answer_sources: dict[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -706,7 +713,51 @@ def _run_from_row(row: dict[str, Any]) -> QueryRun:
         error_code=row["error_code"],
         question=cast(str, row.get("question") or ""),
         answer=cast(dict[str, Any] | None, row.get("answer")),
+        client_request_id=row.get("client_request_id"),
+        created_at=utc_datetime(row["created_at"]) if row.get("created_at") else None,
+        finished_at=utc_datetime(row["finished_at"]) if row.get("finished_at") else None,
+        answer_sources=row.get("answer_sources"),
     )
+
+
+async def lock_chat_session(
+    session: AsyncSession, scope: UserScope, thread_id: str, *, allow_deleted: bool = False,
+) -> dict[str, Any] | None:
+    """Lock by globally unique thread before Run writes, rejecting foreign IDs."""
+    row = (await session.execute(select(chat_sessions).where(
+        chat_sessions.c.id == thread_id,
+    ).with_for_update())).mappings().one_or_none()
+    if row is None:
+        return None
+    if row["user_id"] != scope.user_id or (row["deleted_at"] is not None and not allow_deleted):
+        raise SessionNotFound(thread_id)
+    return dict(row)
+
+
+async def _lock_run_chat(session: AsyncSession, run_id: str, scope: UserScope | None = None,
+                         *, allow_deleted: bool = False) -> dict[str, Any] | None:
+    # This is a nonlocking identity read. Run identity is immutable; acquire
+    # the session lock before the subsequent Run UPDATE, never in reverse.
+    query = select(agent_runs.c.user_id, agent_runs.c.thread_id).where(agent_runs.c.id == run_id)
+    if scope is not None:
+        query = query.where(agent_runs.c.user_id == scope.user_id)
+    row = (await session.execute(query)).mappings().one_or_none()
+    if row is None:
+        return None
+    return await lock_chat_session(session, UserScope(user_id=row["user_id"]), row["thread_id"], allow_deleted=allow_deleted)
+
+
+async def _touch_chat(session: AsyncSession, chat: dict[str, Any] | None, now: datetime,
+                      *, question: str | None = None) -> None:
+    if chat is None:
+        return
+    values: dict[str, Any] = {"last_activity_at": now, "updated_at": now}
+    if question is not None and chat["title_source"] == "default":
+        title = " ".join(question.split())
+        if title:
+            values.update(title=title[:30] + ("…" if len(title) > 30 else ""), title_source="first_question")
+    await session.execute(update(chat_sessions).where(chat_sessions.c.id == chat["id"],
+        chat_sessions.c.user_id == chat["user_id"], chat_sessions.c.deleted_at.is_(None)).values(**values))
 
 
 class SqlAlchemyRunRepository(_SqlAlchemyRepository):
@@ -719,10 +770,14 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         question: str = "",
         transaction: AsyncSession | None = None,
         outbox_stream_name: str = DEFAULT_QUERY_OUTBOX_STREAM,
+        client_request_id: str | None = None,
     ) -> QueryRun:
         if not outbox_stream_name.strip():
             raise ValueError("query outbox stream name must not be blank")
         session = self._session(transaction)
+        chat = await lock_chat_session(session, scope, thread_id)
+        if chat is not None and snapshot.evaluation is not None:
+            raise ValueError("evaluation cannot use a chat session")
         now = _now()
         run = QueryRun(
             id=new_id(),
@@ -734,6 +789,8 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
             runtime_config_snapshot_id=snapshot.snapshot_id,
             runtime_config_snapshot=snapshot.model_dump(mode="json"),
             question=question.strip(),
+            client_request_id=client_request_id,
+            created_at=now,
         )
         try:
             await session.execute(
@@ -748,6 +805,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                     runtime_config_snapshot_id=run.runtime_config_snapshot_id,
                     runtime_config_snapshot=run.runtime_config_snapshot,
                     question=run.question,
+                    client_request_id=client_request_id,
                     created_at=now,
                 )
             )
@@ -769,6 +827,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                 created_at=now,
             )
         )
+        await _touch_chat(session, chat, now, question=run.question)
         return run
 
     async def get(self, run_id: str, scope: UserScope) -> QueryRun | None:
@@ -779,6 +838,10 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                     select(agent_runs).where(
                         agent_runs.c.id == run_id,
                         agent_runs.c.user_id == scope.user_id,
+                        ~exists(select(chat_sessions.c.id).where(
+                            chat_sessions.c.id == agent_runs.c.thread_id,
+                            or_(chat_sessions.c.deleted_at.is_not(None), chat_sessions.c.user_id != scope.user_id),
+                        )),
                     )
                 )
             )
@@ -906,6 +969,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
 
     async def request_cancel(self, run_id: str, scope: UserScope) -> RunStatus:
         session = self._session()
+        chat = await _lock_run_chat(session, run_id, scope)
         now = _now()
         queued_result = cast(
             CursorResult[Any],
@@ -926,6 +990,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
             ),
         )
         if queued_result.rowcount == 1:
+            await _touch_chat(session, chat, now)
             return RunStatus.CANCELLED
         running_result = cast(
             CursorResult[Any],
@@ -963,9 +1028,12 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         owner: str,
         claim_generation: int,
         answer: dict[str, Any] | None = None,
+        answer_sources: dict[str, Any] | None = None,
     ) -> None:
         if status not in TERMINAL_RUN_STATUSES:
             raise ValueError("finish requires a terminal RunStatus")
+        session = self._session()
+        chat = await _lock_run_chat(session, run_id, allow_deleted=True)
         now = _now()
         allowed_current_statuses = [RunStatus.RUNNING.value]
         if status is RunStatus.CANCELLED:
@@ -987,6 +1055,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
                     result_ref=result_ref,
                     error_code=error_code,
                     answer=answer,
+                    answer_sources=answer_sources,
                     finished_at=now,
                     lease_owner=None,
                     lease_expires_at=None,
@@ -995,6 +1064,7 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         )
         if result.rowcount != 1:
             raise LeaseLost(run_id)
+        await _touch_chat(session, chat, now)
 
     async def mark_completed(
         self,

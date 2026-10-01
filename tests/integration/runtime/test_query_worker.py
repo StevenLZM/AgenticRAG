@@ -173,30 +173,22 @@ async def test_create_stages_queued_run_and_outbox_in_one_transaction() -> None:
 
 
 async def test_sql_run_repository_stages_the_outbox_in_manager_transaction() -> None:
-    from agentic_rag.persistence.repositories import SqlAlchemyRunRepository
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from agentic_rag.persistence.repositories import SqlAlchemyRunRepository, metadata, agent_runs, task_outbox
     from agentic_rag.runtime.run_manager import RunManager
-
-    class Session:
-        statements: list[object] = []
-
-        async def execute(self, statement: object) -> object:
-            self.statements.append(statement)
-            return object()
-
-    session = Session()
-
-    @asynccontextmanager
-    async def transaction() -> AsyncIterator[object]:
-        yield session
-
-    class Sessions:
-        def begin(self) -> object:
-            return transaction()
-
-    manager = RunManager(session_factory=Sessions(), runs=SqlAlchemyRunRepository())  # type: ignore[arg-type]
-    await manager.create(SCOPE, "thread-1", "What notice applies?", SNAPSHOT)
-
-    assert [statement.table.name for statement in session.statements] == ["agent_runs", "task_outbox"]
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(metadata.create_all)
+        factory = async_sessionmaker(engine)
+        manager = RunManager(session_factory=factory, runs=SqlAlchemyRunRepository())
+        run = await manager.create(SCOPE, "thread-1", "What notice applies?", SNAPSHOT)
+        async with factory() as db:
+            assert (await db.execute(select(agent_runs.c.id))).scalar_one() == run.id
+            assert (await db.execute(select(task_outbox.c.aggregate_id))).scalar_one() == run.id
+    finally:
+        await engine.dispose()
 
 
 async def test_active_thread_conflict_does_not_create_a_second_outbox() -> None:

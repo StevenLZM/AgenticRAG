@@ -9,8 +9,9 @@ from agentic_rag.domain.chat_sessions import (
 )
 from agentic_rag.domain.models import UserScope
 from agentic_rag.persistence.chat_sessions import SqlAlchemyChatSessionRepository
-from agentic_rag.persistence.repositories import SqlAlchemyRunRepository, _is_mysql_duplicate_for
-from agentic_rag.runtime.run_manager import RunManager
+from agentic_rag.persistence.repositories import SqlAlchemyRunRepository, QueryRun, _is_mysql_duplicate_for
+from agentic_rag.runtime.run_manager import RunManager, RunSubmission
+from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
 class ChatSessionService:
@@ -81,3 +82,23 @@ class ChatSessionService:
             if active is not None:
                 raise SessionBusy(active.id)
             await repo.delete(scope, session_id)
+
+    async def submit(self, scope: UserScope, session_id: str, question: str,
+                     snapshot: RuntimeConfigSnapshot, *, client_request_id: str) -> RunSubmission:
+        return await self.run_manager.submit_chat(scope, session_id, question, snapshot, client_request_id=client_request_id)
+
+    async def turns(self, scope: UserScope, session_id: str, *, cursor: str | None = None,
+                    limit: int = 30) -> Page[QueryRun]:
+        async with self.session_factory() as db:
+            repo = SqlAlchemyChatSessionRepository(db)
+            if await repo.get_owned(scope, session_id) is None:
+                raise SessionNotFound(session_id)
+            return await repo.list_turns(scope, session_id, cursor=cursor, limit=limit)
+
+    async def find_submission(self, scope: UserScope, session_id: str, client_request_id: str) -> QueryRun | None:
+        key = request_uuid(client_request_id)
+        async with self.session_factory() as db:
+            repo = SqlAlchemyChatSessionRepository(db)
+            if await repo.get_owned(scope, session_id) is None:
+                raise SessionNotFound(session_id)
+            return await repo.find_submission(scope, session_id, key)

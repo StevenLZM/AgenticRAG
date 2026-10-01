@@ -74,6 +74,13 @@ class RecordingSession:
 
     async def execute(self, statement: Any) -> Any:
         self.statements.append(statement)
+        if getattr(statement, "is_select", False):
+            # These legacy fixtures have no registered chat session. Preserve
+            # the scripted outcomes for their Run writes, not the new guards.
+            if any(getattr(table, "name", None) == "chat_sessions" for table in statement.get_final_froms()):
+                return RecordingResult()
+            if list(statement.selected_columns.keys()) == ["user_id", "thread_id"]:
+                return RecordingResult([{"user_id": "user-1", "thread_id": "thread-1"}])
         if self._scripted:
             outcome = self._scripted.pop(0)
             if isinstance(outcome, BaseException):
@@ -107,7 +114,7 @@ class RecordingResult:
 
 
 def _statement_tables(session: RecordingSession) -> list[str]:
-    return [statement.table.name for statement in session.statements]
+    return [statement.table.name for statement in session.statements if statement.is_dml]
 
 
 def _run_row(
@@ -211,7 +218,7 @@ async def test_run_creation_stages_run_and_matching_outbox_in_same_transaction()
     assert run.active_slot == 1
     assert _statement_tables(transaction) == ["agent_runs", "task_outbox"]
     assert transaction.commit_called is False
-    outbox_values = transaction.statements[1].compile().params
+    outbox_values = [s for s in transaction.statements if s.is_insert][1].compile().params
     assert outbox_values["aggregate_type"] == "query_run"
     assert outbox_values["aggregate_id"] == run.id
 
@@ -230,7 +237,7 @@ async def test_run_creation_can_stage_an_isolated_query_outbox_stream() -> None:
         outbox_stream_name=private_stream,
     )
 
-    assert transaction.statements[1].compile().params["stream_name"] == private_stream
+    assert [s for s in transaction.statements if s.is_insert][1].compile().params["stream_name"] == private_stream
 
 
 @pytest.mark.asyncio
@@ -553,7 +560,7 @@ async def test_queued_cancellation_atomically_releases_active_slot() -> None:
     status = await repository.request_cancel("run-1", UserScope(user_id="user-1"))
 
     assert status is RunStatus.CANCELLED
-    values = transaction.statements[0].compile().params
+    values = next(s for s in transaction.statements if s.is_update).compile().params
     assert values["status"] == RunStatus.CANCELLED.value
     assert values["active_slot"] is None
 

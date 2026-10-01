@@ -12,7 +12,7 @@ from agentic_rag.domain.chat_sessions import (
     ChatSession, ChatSessionSummary, Page, decode_cursor, encode_cursor, page_limit, utc_datetime,
 )
 from agentic_rag.domain.models import RunStatus, UserScope
-from agentic_rag.persistence.repositories import agent_runs, chat_sessions
+from agentic_rag.persistence.repositories import agent_runs, chat_sessions, QueryRun, _run_from_row
 from agentic_rag.runtime.ids import new_id
 
 
@@ -85,3 +85,24 @@ class SqlAlchemyChatSessionRepository:
                       RunStatus(row["active_run_status"]) if row["active_run_status"] else None) for row in rows[:limit])
         next_cursor = encode_cursor("sessions", items[-1].session.last_activity_at, items[-1].session.id) if len(rows) > limit else None
         return Page(items, next_cursor)
+
+    async def find_submission(self, scope: UserScope, session_id: str, client_request_id: str) -> QueryRun | None:
+        row = (await self.session.execute(select(agent_runs).where(
+            agent_runs.c.user_id == scope.user_id, agent_runs.c.thread_id == session_id,
+            agent_runs.c.client_request_id == client_request_id,
+        ))).mappings().one_or_none()
+        return _run_from_row(dict(row)) if row else None
+
+    async def list_turns(self, scope: UserScope, session_id: str, *, cursor: str | None = None,
+                         limit: int = 30) -> Page[QueryRun]:
+        limit = page_limit(limit)
+        query = select(agent_runs).where(agent_runs.c.user_id == scope.user_id, agent_runs.c.thread_id == session_id)
+        if cursor is not None:
+            stamp, item_id = decode_cursor(cursor, "turns")
+            query = query.where(or_(agent_runs.c.created_at < stamp, and_(
+                agent_runs.c.created_at == stamp, agent_runs.c.id < item_id)))
+        rows = (await self.session.execute(query.order_by(agent_runs.c.created_at.desc(), agent_runs.c.id.desc())
+                                           .limit(limit + 1))).mappings().all()
+        selected = rows[:limit]
+        next_cursor = encode_cursor("turns", selected[-1]["created_at"], selected[-1]["id"]) if len(rows) > limit else None
+        return Page(tuple(_run_from_row(dict(row)) for row in reversed(selected)), next_cursor)

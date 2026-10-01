@@ -3,23 +3,33 @@
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Protocol, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agentic_rag.domain.models import RunStatus, UserScope
+from agentic_rag.domain.chat_sessions import IdempotencyConflict, SessionBusy, SessionNotFound, request_uuid
+from agentic_rag.persistence.chat_sessions import SqlAlchemyChatSessionRepository
 from agentic_rag.persistence.repositories import (
     DEFAULT_QUERY_OUTBOX_STREAM,
     ActiveRunConflict,
     QueryRun,
     RunRepository,
     SqlAlchemyRunRepository,
+    lock_chat_session,
 )
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
 class TransactionFactory(Protocol):
     def begin(self) -> AbstractAsyncContextManager[object]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunSubmission:
+    run: QueryRun
+    created: bool
 
 
 class RunManager:
@@ -69,6 +79,29 @@ class RunManager:
     async def request_cancel(self, scope: UserScope, run_id: str) -> RunStatus:
         return await self.runs.request_cancel(run_id, scope)
 
+    async def submit_chat(self, scope: UserScope, session_id: str, question: str,
+                          snapshot: RuntimeConfigSnapshot, *, client_request_id: str) -> RunSubmission:
+        key, normalized = request_uuid(client_request_id), question.strip()
+        if not 1 <= len(normalized) <= 32_000:
+            raise ValueError("query must contain 1 to 32000 characters")
+        if snapshot.evaluation is not None:
+            raise ValueError("evaluation cannot use a chat session")
+        async with self.session_factory.begin() as transaction:
+            db = cast(AsyncSession, transaction)
+            if await lock_chat_session(db, scope, session_id) is None:
+                raise SessionNotFound(session_id)
+            existing = await SqlAlchemyChatSessionRepository(db).find_submission(scope, session_id, key)
+            if existing is not None:
+                if existing.question != normalized:
+                    raise IdempotencyConflict("The request was used for another query.")
+                return RunSubmission(existing, False)
+            active = await SqlAlchemyRunRepository(db).get_active(scope, session_id)
+            if active is not None:
+                raise SessionBusy(active.id)
+            run = await self.runs.create_queued(scope, session_id, snapshot, question=normalized,
+                                                client_request_id=key, transaction=db)
+            return RunSubmission(run, True)
+
     async def get(self, run_id: str, scope: UserScope) -> QueryRun | None:
         """Read one user-owned Run for API status and cancellation responses."""
         return await self.runs.get(run_id, scope)
@@ -95,6 +128,7 @@ class TransactionalRunRepository:
     async def create_queued(
         self, scope: UserScope, thread_id: str, snapshot: RuntimeConfigSnapshot,
         *, question: str = "", transaction: AsyncSession | None = None,
+        client_request_id: str | None = None,
     ) -> QueryRun:
         if transaction is not None:
             return await SqlAlchemyRunRepository(transaction).create_queued(
@@ -102,6 +136,7 @@ class TransactionalRunRepository:
                 thread_id,
                 snapshot,
                 question=question,
+                client_request_id=client_request_id,
                 transaction=transaction,
                 outbox_stream_name=(
                     self._outbox_stream_name or DEFAULT_QUERY_OUTBOX_STREAM
@@ -113,6 +148,7 @@ class TransactionalRunRepository:
                 thread_id,
                 snapshot,
                 question=question,
+                client_request_id=client_request_id,
                 outbox_stream_name=(
                     self._outbox_stream_name or DEFAULT_QUERY_OUTBOX_STREAM
                 ),
@@ -152,10 +188,12 @@ class TransactionalRunRepository:
         self, run_id: str, status: RunStatus, result_ref: str | None,
         error_code: str | None, *, owner: str, claim_generation: int,
         answer: dict[str, object] | None = None,
+        answer_sources: dict[str, object] | None = None,
     ) -> None:
         async with self._factory.begin() as session:
             await SqlAlchemyRunRepository(session).finish(
                 run_id, status, result_ref, error_code,
                 owner=owner, claim_generation=claim_generation,
                 answer=answer,
+                answer_sources=answer_sources,
             )
