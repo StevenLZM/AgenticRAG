@@ -1,91 +1,167 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Agentic RAG 控制台</title>
-    <link rel="stylesheet" href="/static/app.css">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agentic RAG · 对话</title>
+    <link rel="stylesheet" href="/static/app.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div>
-        <p class="eyebrow">AGENTIC RAG</p>
-        <h1>知识检索控制台</h1>
+    <button
+      id="sidebar-backdrop"
+      class="sidebar-backdrop"
+      aria-label="关闭会话列表"
+      hidden
+    ></button>
+    <aside id="session-sidebar" class="session-sidebar" aria-label="会话列表">
+      <div class="brand">
+        <span class="brand-mark">A</span>
+        <div>Agentic RAG<small>与知识对话</small></div>
+        <button
+          id="close-sidebar"
+          class="icon-button mobile-only"
+          aria-label="关闭会话列表"
+        >
+          ×
+        </button>
       </div>
-      <div class="runtime-meta" aria-label="运行时配置">
-        <span>运行快照</span>
-        <code id="snapshot-id">加载中…</code>
+      <button id="new-chat" class="new-chat">＋ 新建对话</button>
+      <p class="section-label">最近对话</p>
+      <nav id="session-list" aria-label="历史对话"></nav>
+      <button id="more-sessions" class="text-button" hidden>
+        加载更多对话
+      </button>
+      <div class="sidebar-tools">
+        <button id="open-documents">文档知识库</button
+        ><button id="open-memory">长期记忆</button
+        ><button id="open-system">系统状态</button>
       </div>
-    </header>
-
-    <main class="console-grid">
-      <aside class="sidebar" aria-label="辅助工具">
-        <section class="panel">
-          <h2>运行状态</h2>
-          <div id="health-grid" class="health-grid" aria-live="polite"></div>
-        </section>
-
-        <section class="panel">
-          <h2>文档入库</h2>
-          <form id="document-upload">
-            <label for="document-file">选择 PDF、文本或 Excel 文件</label>
-            <input id="document-file" name="file" type="file" required>
-            <button type="submit">上传并入库</button>
-          </form>
-          <p id="ingestion-status" class="muted" aria-live="polite">尚未上传文档</p>
-        </section>
-
-        <section class="panel">
-          <div class="panel-heading">
-            <h2>Mem0 记忆</h2>
-            <button id="reload-memories" type="button" class="secondary">刷新</button>
-          </div>
-          <ul id="memory-list" class="record-list" aria-live="polite"></ul>
-        </section>
-      </aside>
-
-      <section class="workspace" aria-label="查询工作区">
-        <section id="degradation-banner" class="degradation-banner" hidden role="status"></section>
-        <section class="panel query-panel">
-          <h2>提问</h2>
-          <form id="query-form">
-            <label class="sr-only" for="query-input">问题</label>
-            <textarea id="query-input" rows="4" maxlength="32000" placeholder="请输入需要在知识库中检索的问题" required></textarea>
-            <div class="query-actions">
-              <button type="submit">开始检索</button>
-              <button id="cancel-run" type="button" class="secondary" disabled>取消当前任务</button>
-              <span id="run-status" class="muted" aria-live="polite">等待提问</span>
+      <p class="sidebar-footnote">对话分别保存 · 记忆按用户共享</p>
+    </aside>
+    <main class="chat-workspace">
+      <header class="chat-header">
+        <button
+          id="open-sidebar"
+          class="icon-button mobile-only"
+          aria-label="打开会话列表"
+        >
+          ☰
+        </button>
+        <h1 id="session-title">新对话</h1>
+        <div class="header-actions">
+          <button id="rename-chat" class="text-button">重命名</button
+          ><button id="delete-chat" class="text-button">删除</button>
+        </div>
+      </header>
+      <div id="chat-notice" class="chat-notice" role="status" hidden></div>
+      <div
+        id="chat-scroll"
+        class="chat-scroll"
+        tabindex="0"
+        aria-label="对话消息"
+      >
+        <div class="message-column">
+          <button id="older-turns" class="text-button older-turns" hidden>
+            加载更早消息
+          </button>
+          <section id="chat-empty" class="chat-empty">
+            <span class="empty-mark">A</span>
+            <h2>从一个问题开始</h2>
+            <p>结合你的知识库与长期记忆，继续深入讨论。</p>
+            <div class="empty-hints">
+              <span>分析已上传的资料</span><span>追问与补充上下文</span
+              ><span>按需查看引用来源</span>
             </div>
-          </form>
-        </section>
-
-        <section class="panel">
-          <h2>执行时间线</h2>
-          <ol id="timeline" class="timeline" aria-live="polite"></ol>
-        </section>
-
-        <section class="panel">
-          <h2>回答</h2>
-          <div id="answer" class="answer" aria-live="polite">检索结果将在此显示。</div>
-        </section>
-      </section>
-
-      <aside class="details" aria-label="证据与审计信息">
-        <section class="panel">
-          <h2>证据</h2>
-          <div id="evidence" class="detail-content">等待可引用证据。</div>
-        </section>
-        <section class="panel">
-          <h2>审计</h2>
-          <div id="audit" class="detail-content">回答完成后展示审计状态。</div>
-        </section>
-        <section class="panel">
-          <h2>溯源</h2>
-          <div id="provenance" class="detail-content">仅展示服务端响应中提供的溯源信息。</div>
-        </section>
-      </aside>
+          </section>
+          <div
+            id="chat-messages"
+            role="log"
+            aria-label="用户问题和系统回答"
+          ></div>
+        </div>
+      </div>
+      <div class="composer-area">
+        <button id="scroll-latest" class="latest-button" hidden>
+          ↓ 回到最新
+        </button>
+        <div id="pending-actions" class="pending-actions" hidden>
+          <span>提交结果尚未确认</span
+          ><button id="check-submission" class="text-button">
+            检查提交状态</button
+          ><button id="retry-submission" class="text-button" hidden>
+            重试原提交
+          </button>
+        </div>
+        <form id="query-form" class="composer">
+          <label class="sr-only" for="query-input">输入问题</label
+          ><textarea
+            id="query-input"
+            rows="2"
+            placeholder="发送消息，或继续追问…"
+            required
+          ></textarea>
+          <div class="composer-toolbar">
+            <span id="composer-status" role="status"
+              >Enter 发送 · Shift + Enter 换行</span
+            >
+            <div>
+              <button
+                id="cancel-button"
+                type="button"
+                class="stop-button"
+                hidden
+              >
+                停止</button
+              ><button id="send-button" type="submit">发送 ↑</button>
+            </div>
+          </div>
+        </form>
+        <p class="composer-footnote">
+          回答完成后整体展示，引用来源可按需展开。
+        </p>
+      </div>
     </main>
-
-    <script src="/static/app.js?v=20260913-chat-ui" defer></script>
+    <dialog
+      id="tools-drawer"
+      class="tools-drawer"
+      aria-labelledby="tools-title"
+    >
+      <header>
+        <h2 id="tools-title">工具</h2>
+        <button id="close-tools" class="icon-button" aria-label="关闭工具">
+          ×
+        </button>
+      </header>
+      <section id="documents-tool" hidden>
+        <p class="muted">知识库在你的所有会话中共享。</p>
+        <form id="document-upload">
+          <label for="document-file">上传 PDF、文本或 Excel</label
+          ><input id="document-file" type="file" required /><button
+            type="submit"
+          >
+            上传文档
+          </button>
+        </form>
+        <p id="ingestion-status" role="status"></p>
+        <h3>本页上传记录</h3>
+        <ul id="upload-list" class="record-list"></ul>
+      </section>
+      <section id="memory-tool" hidden>
+        <p class="muted">长期记忆按用户保存，切换会话后仍然可用。</p>
+        <button id="reload-memories" class="secondary">刷新记忆</button>
+        <ul id="memory-list" class="record-list"></ul>
+      </section>
+      <section id="system-tool" hidden>
+        <p id="health-status" role="status"></p>
+        <div id="health-grid"></div>
+        <h3>运行快照</h3>
+        <code id="snapshot-id"></code>
+      </section>
+    </dialog>
+    <script src="/static/chat-state.js?v=20261001" defer></script>
+    <script src="/static/chat-api.js?v=20261001" defer></script>
+    <script src="/static/chat-view.js?v=20261001" defer></script>
+    <script src="/static/console-tools.js?v=20261001" defer></script>
+    <script src="/static/app.js?v=20261001" defer></script>
   </body>
 </html>

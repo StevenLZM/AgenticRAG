@@ -7,23 +7,43 @@ const sa = state.sessions.get("session-a");
 sa.draft = "问题秘密";
 const pending = S.beginSubmission(state, a.sessionId, sa.draft, "request-a");
 S.markSubmissionUnknown(state, a.sessionId, pending.requestId);
-assert.equal(S.beginSubmission(state, a.sessionId, "后来输入", "another-id").requestId, "request-a");
+assert.equal(
+  S.beginSubmission(state, a.sessionId, "后来输入", "another-id").requestId,
+  "request-a",
+);
 sa.draft = "下一条草稿";
 const b = S.activateSession(state, "session-b");
-assert.equal(S.applyRun(state, a, {run_id: "a", status: "completed"}), false);
+assert.equal(S.applyRun(state, a, { run_id: "a", status: "completed" }), false);
 assert.equal(state.selectedSessionId, "session-b");
 assert.equal(sa.draft, "下一条草稿");
-const turn = {run_id: "b", question: "q", status: "running", created_at: "2026-10-01T00:00:00.000002Z"};
+const turn = {
+  run_id: "b",
+  question: "q",
+  status: "running",
+  created_at: "2026-10-01T00:00:00.000002Z",
+};
 assert.equal(S.applyRun(state, b, turn), true);
 assert.equal(S.applyPhase(state, b, "b", 2, "auditing"), true);
 assert.equal(S.applyPhase(state, b, "b", 2, "retrieving"), false);
 assert.equal(S.applyPhase(state, b, "b", 3, "private"), false);
 assert.equal(S.applyPhase(state, a, "b", 4, "auditing"), false);
-S.applyRun(state, b, {...turn, status: "completed", answer: {segments: [{kind: "content", text: "正文秘密"}]}});
+S.applyRun(state, b, {
+  ...turn,
+  status: "completed",
+  answer: { segments: [{ kind: "content", text: "正文秘密" }] },
+});
 assert.equal(S.applyPhase(state, b, "b", 99, "auditing"), false);
-assert.equal(S.applyRun(state, b, {...turn, status: "running"}), false);
-S.applyRun(state, b, {...turn, run_id: "z", created_at: "2026-10-01T00:00:00.000001Z"});
-S.applyRun(state, b, {...turn, run_id: "z", created_at: "2026-10-01T00:00:00.000001Z"});
+assert.equal(S.applyRun(state, b, { ...turn, status: "running" }), false);
+S.applyRun(state, b, {
+  ...turn,
+  run_id: "z",
+  created_at: "2026-10-01T00:00:00.000001Z",
+});
+S.applyRun(state, b, {
+  ...turn,
+  run_id: "z",
+  created_at: "2026-10-01T00:00:00.000001Z",
+});
 assert.deepEqual(state.sessions.get("session-b").orderedRunIds, ["z", "b"]);
 S.acknowledgeSubmission(state, "session-a", "request-a");
 assert.equal(sa.draft, "下一条草稿");
@@ -35,16 +55,44 @@ sa.draft = "问题秘密";
 S.beginSubmission(state, "session-a", sa.draft, "request-c");
 S.markSubmissionUnknown(state, "session-a", "request-c");
 let serialized = "";
-const storage = {setItem(k, v) {serialized = v;}, getItem() {return serialized;}};
+const storage = {
+  setItem(k, v) {
+    serialized = v;
+  },
+  getItem() {
+    return serialized;
+  },
+};
 S.saveResumeMetadata(storage, state);
-assert(!serialized.includes("秘密") && !serialized.includes("草稿") && !serialized.includes("segments"));
+assert(
+  !serialized.includes("秘密") &&
+    !serialized.includes("草稿") &&
+    !serialized.includes("segments"),
+);
 const resume = S.loadResumeMetadata(storage);
-assert.equal(resume.sessions.find(s => s.sessionId === "session-a").pendingRequestId, "request-c");
-const broken = {setItem() {throw new Error("SecurityError");}, getItem() {throw new Error("SecurityError");}};
+assert.equal(
+  resume.sessions.find((s) => s.sessionId === "session-a").pendingRequestId,
+  "request-c",
+);
+const broken = {
+  setItem() {
+    throw new Error("SecurityError");
+  },
+  getItem() {
+    throw new Error("SecurityError");
+  },
+};
 S.saveResumeMetadata(broken, state);
 assert.equal(state.storageWarning, true);
 assert.equal(S.loadResumeMetadata(broken).sessions.length, 0);
-assert.equal(S.loadResumeMetadata({getItem() {return '{"version":1,"sessions":[{"sessionId":"x","question":"secret"}]}';}}).sessions[0].question, undefined);
+assert.equal(
+  S.loadResumeMetadata({
+    getItem() {
+      return '{"version":1,"sessions":[{"sessionId":"x","question":"secret"}]}';
+    },
+  }).sessions[0].question,
+  undefined,
+);
 const aa = S.activateSession(state, "session-a");
 assert.equal(S.applyRun(state, a, turn), false); // even after returning to A
 assert.equal(S.isCurrent(state, aa), true);

@@ -26,7 +26,7 @@ from agentic_rag.config import Settings
 class ConsoleStaticFiles(StaticFiles):
     """Serve only the console assets, never the HTML source through ``/static``."""
 
-    _allowed_assets = frozenset({"app.css", "app.js"})
+    _allowed_assets = frozenset({"app.css", "app.js", "chat-state.js", "chat-api.js", "chat-view.js", "console-tools.js"})
 
     async def get_response(self, path: str, scope: Any):
         if path not in self._allowed_assets:

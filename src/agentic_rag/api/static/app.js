@@ -1,592 +1,714 @@
-(() => {
+/* Persistent chat controller: every asynchronous view write checks its generation. */
+(function (root) {
   "use strict";
-
-  const PUBLIC_EVENT_TYPES = new Set([
-    "RUN_STARTED", "RUN_COMPLETED", "RUN_FAILED",
-    "MEMORY_LOADED", "QUERY_ROUTED", "FAST_RAG_COMPLETED",
-    "RESEARCH_LOOP_COMPLETED", "RETRIEVAL_COMPLETED", "EVIDENCE_GRADED",
-    "FAITHFULNESS_AUDITED", "CITATION_VALIDATED", "ANSWER_GENERATED",
-    "ANSWER_FINALIZED", "TODO_UPDATED", "TOOL_STARTED", "TOOL_COMPLETED",
-    "COMPONENT_DEGRADED", "COMPONENT_REFUSED", "RETRIEVAL_DEGRADED",
-    "CIRCUIT_OPEN", "OUTBOX_RETRY", "WORKER_DLQ", "QUERY_REFUSED",
-    "QUERY_CANCELLED", "QUERY_TIMEOUT", "LEASE_LOST", "MODEL_RETRY",
-    "MODEL_RETRY_EXHAUSTED", "MODEL_REPAIR_EXHAUSTED", "AUDIT_REFUSED",
-    "RUN_CANCEL_REQUESTED", "RUN_CANCELLED", "USER_FEEDBACK"
-  ]);
-  const NOTICES = {
-    RETRIEVAL_DEGRADED: "检索能力降级：结果可能不完整，请稍后重试或检查索引。",
-    CIRCUIT_OPEN: "熔断器已打开：对应依赖暂时被隔离。",
-    MODEL_REPAIR_EXHAUSTED: "模型结构化响应修复已耗尽，系统已安全拒绝本次结果。",
-    WORKER_DLQ: "任务已进入死信队列，需要运维处理后重试。",
-    LEASE_LOST: "任务租约已丢失，执行已停止以避免重复处理。",
-    COMPONENT_DEGRADED: "部分组件已降级，回答可能受影响。",
-    research_action_invalid: "研究动作不符合安全约束，系统未继续执行。",
-    audit_failed: "回答未通过审计，系统不会展示未审计结果。",
-    research_round_limit: "已达到全局研究轮次上限，系统停止继续研究。",
-    cannot_answer: "现有证据不足以安全回答，系统未展示草稿。",
-    refuse: "该请求已被安全拒绝，系统未继续生成回答。",
-    clarify: "需要补充问题或上下文后才能继续检索。",
-    subagent_unavailable: "子 Agent 当前不可用，系统将显示已降级的处理状态。",
-    todo_creation_empty: "未生成可执行的 Todo，任务拆分没有继续。"
-  };
-  const EVENT_NOTICE_CODES = {
-    AUDIT_REFUSED: "audit_failed",
-    QUERY_REFUSED: "refuse"
-  };
-  const SAFE_DEGRADATION_COMPONENTS = new Set([
-    "dense", "bm25", "reranker", "memory", "mem0", "llm", "elasticsearch",
-    "redis", "artifact_store", "retrieval", "router", "generation", "audit",
-    "citation", "outbox", "query_worker", "worker", "mysql", "checkpoint", "unknown"
-  ]);
-  const SAFE_DEGRADATION_REASONS = new Set([
-    "lane_failure", "lane_timeout", "retrieval_unavailable", "reranker_unavailable",
-    "memory_unavailable", "router_unavailable", "router_schema_invalid",
-    "model_unavailable", "model_schema_invalid", "generation_unavailable", "audit_failed",
-    "subagent_unavailable", "research_action_invalid",
-    "authorization_unavailable", "provider_outage", "circuit_open", "outbox_retry",
-    "lease_lost", "cancelled", "worker_timeout", "worker_dlq", "invalid_input", "unknown"
-  ]);
-  const SAFE_DEGRADATION_OUTCOMES = new Set(["degraded", "refused", "dlq"]);
-  const SAFE_MODEL_TEXT = /^[A-Za-z0-9_.:-]{1,128}$/;
-  const TERMINAL_NOTICE_CODES = new Set([
-    "research_action_invalid", "research_round_limit", "audit_failed",
-    "cannot_answer", "refuse", "clarify"
-  ]);
-
-  const elements = {};
-  let activeRunId = null;
-  let lastEventId = 0;
-  let streamCancelled = false;
-  let activeRoute = null;
-  let answerSettled = false;
-  const ROUTE_LABELS = {chat: "聊天", fast_rag: "快速检索", research: "深入研究"};
-  const ROUTE_WAITING = {
-    chat: "正在生成聊天回复…", fast_rag: "正在检索资料…", research: "正在深入研究…"
-  };
-
-  function safeRoute(route) {
-    return typeof route === "string" && Object.hasOwn(ROUTE_LABELS, route) ? route : null;
-  }
-
-  function byId(id) {
-    return document.getElementById(id);
-  }
-
-  function initializeElements() {
-    [
-      "snapshot-id", "health-grid", "document-upload", "document-file",
-      "ingestion-status", "memory-list", "reload-memories", "query-form",
-      "query-input", "run-status", "cancel-run", "timeline", "answer",
-      "evidence", "audit", "provenance", "degradation-banner"
-    ].forEach((id) => { elements[id] = byId(id); });
-  }
-
-  function setText(element, value) {
-    if (element) element.textContent = value;
-  }
-
-  function showNotice(code) {
-    const message = NOTICES[code];
-    if (!message || !elements["degradation-banner"]) return;
-    elements["degradation-banner"].hidden = false;
-    elements["degradation-banner"].textContent = message;
-  }
-
-  function clearNotice() {
-    if (elements["degradation-banner"]) {
-      elements["degradation-banner"].hidden = true;
-      elements["degradation-banner"].textContent = "";
-    }
-  }
-
-  function buildQueryPayload(question) {
-    const query = String(question || "").trim();
-    return query ? { query, wait_seconds: 0 } : null;
-  }
-
-  function buildSseHeaders(cursor) {
-    const headers = { Accept: "text/event-stream" };
-    if (Number.isInteger(cursor) && cursor > 0) {
-      headers["Last-Event-ID"] = String(cursor);
-    }
-    return headers;
-  }
-
-  function noticeCodeForEvent(eventType) {
-    if (EVENT_NOTICE_CODES[eventType]) return EVENT_NOTICE_CODES[eventType];
-    return Object.prototype.hasOwnProperty.call(NOTICES, eventType) ? eventType : null;
-  }
-
-  function degradationAttributes(event) {
-    const raw = event && typeof event.attributes === "object" && event.attributes
-      ? event.attributes : {};
-    const attributes = {};
-    ["initial_route", "route"].forEach((key) => {
-      if (safeRoute(raw[key])) attributes[key] = raw[key];
-    });
-    if (["conversation", "capability_unavailable", "clarify", "technical_error"].includes(raw.response_mode)) {
-      attributes.response_mode = raw.response_mode;
-    }
-    if (["none", "missing_facts", "multi_step_required", "query_ambiguous", "external_realtime_required", "external_lookup_required", "irrelevant_results", "unknown"].includes(raw.gap_type)) {
-      attributes.gap_type = raw.gap_type;
-    }
-    const nodes = new Set(["memory_loader", "route", "chat", "fast_rag", "record_fast_grade", "research_agent_loop", "evidence_builder", "evidence_grader", "generate", "faithfulness", "citation", "finalize"]);
-    if (Array.isArray(raw.executed_path) && raw.executed_path.length <= 64 && raw.executed_path.every((node) => nodes.has(node))) {
-      attributes.executed_path = raw.executed_path;
-    }
-    if (SAFE_DEGRADATION_COMPONENTS.has(raw.component)) attributes.component = raw.component;
-    if (SAFE_DEGRADATION_REASONS.has(raw.reason)) attributes.reason = raw.reason;
-    if (SAFE_DEGRADATION_OUTCOMES.has(raw.outcome)) attributes.outcome = raw.outcome;
-    if (typeof raw.retryable === "boolean") attributes.retryable = raw.retryable;
-    if (Number.isInteger(raw.attempt) && raw.attempt >= 0) attributes.attempt = raw.attempt;
-    ["operation", "requested_model", "protocol", "error_class", "provider_request_id"].forEach((key) => {
-      if (typeof raw[key] === "string" && SAFE_MODEL_TEXT.test(raw[key])) {
-        attributes[key] = raw[key];
-      }
-    });
-    if (Number.isInteger(raw.http_status) && raw.http_status >= 100 && raw.http_status <= 599) {
-      attributes.http_status = raw.http_status;
-    }
-    if (typeof raw.client_timeout_seconds === "number"
-      && Number.isFinite(raw.client_timeout_seconds)
-      && raw.client_timeout_seconds >= 0) {
-      attributes.client_timeout_seconds = raw.client_timeout_seconds;
-    }
-    return attributes;
-  }
-
-  function eventPresentation(event) {
-    const known = PUBLIC_EVENT_TYPES.has(event.event_type);
-    if (!known) return null;
-    const attributes = known ? degradationAttributes(event) : {};
-    const presentation = {
-      label: known ? event.event_type : "进度更新",
-      summary: known ? (event.summary || "执行中") : "进度更新",
-      noticeCode: noticeCodeForEvent(event.event_type)
-    };
-    if (Object.keys(attributes).length) presentation.attributes = attributes;
-    if (event.event_type === "QUERY_ROUTED" && safeRoute(event.route)) {
-      presentation.label = "路由选择";
-      presentation.summary = ROUTE_LABELS[event.route];
-    }
-    return presentation;
-  }
-
-  function terminalNoticeCode(run) {
-    const answer = run && run.answer;
-    const details = answer && typeof answer === "object" ? answer : {};
-    const candidates = [details.status, run && run.error_code];
-    return candidates.find((candidate) => (
-      typeof candidate === "string" && TERMINAL_NOTICE_CODES.has(candidate)
-    )) || null;
-  }
-
-  function memoryErrorPresentation(detail) {
-    return {
-      className: "error-card",
-      message: `Mem0 不可用：${detail || "请检查 provider 状态。"}`
-    };
-  }
-
-  function provenanceFor(details, run) {
-    const provenance = {};
-    if (Array.isArray(details.evidence_parent_ids)) {
-      provenance.evidence_parent_ids = details.evidence_parent_ids.filter((value) => typeof value === "string");
-    }
-    if (["chat", "fast_rag", "research"].includes(details.route)) provenance.route = details.route;
-    if (typeof details.runtime_config_snapshot_id === "string") {
-      provenance.runtime_config_snapshot_id = details.runtime_config_snapshot_id;
-    } else if (typeof run.runtime_config_snapshot_id === "string") {
-      provenance.runtime_config_snapshot_id = run.runtime_config_snapshot_id;
-    }
-    if (["api", "fixture", "real_query_api", "real_query_graph"].includes(details.client_provenance)) {
-      provenance.client_provenance = details.client_provenance;
-    }
-    return provenance;
-  }
-
-  function answerPresentation(run) {
-    const details = run && run.answer && typeof run.answer === "object" ? run.answer : null;
-    if (!details || !Array.isArray(details.segments)) return null;
-    const isChat = details.route === "chat";
-    if (isChat) {
-      if (details.audited != null || details.citation_coverage != null
-        || (details.evidence_parent_ids || []).length
-        || details.segments.some(s => !s || s.kind !== "content" || (s.evidence_ids || []).length)) return null;
-    } else if (details.audited !== true) return null;
-    const segments = details.segments.filter((segment) => (
-      segment && typeof segment === "object"
-      && ["content", "heading", "separator", "references"].includes(segment.kind)
-      && typeof segment.text === "string"
-    ));
-    if (!segments.length) return null;
-    const evidenceIds = [];
-    segments.forEach((segment) => {
-      if (!Array.isArray(segment.evidence_ids)) return;
-      segment.evidence_ids.forEach((value) => {
-        if (typeof value === "string" && !evidenceIds.includes(value)) evidenceIds.push(value);
-      });
-    });
-    const parentIds = Array.isArray(details.evidence_parent_ids)
-      ? details.evidence_parent_ids.filter((value) => typeof value === "string") : [];
-    const audit = isChat ? {} : { audited: true };
-    if (typeof details.citation_coverage === "number" && details.citation_coverage >= 0 && details.citation_coverage <= 1) {
-      audit.citation_coverage = details.citation_coverage;
-    }
-    return {
-      text: segments.map((segment) => segment.text).join("\n"),
-      evidence: { evidence_ids: evidenceIds, evidence_parent_ids: parentIds },
-      audit,
-      provenance: provenanceFor(details, run)
-    };
-  }
-
-  function renderSafeTerminalNotice(code) {
-    answerSettled = true;
-    showNotice(code);
-    setText(elements.answer, NOTICES[code]);
-  }
-
-  async function responseJson(response) {
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const error = new Error(payload.message || "服务请求失败，请稍后重试。");
-      error.payload = payload;
-      error.status = response.status;
-      throw error;
-    }
-    return payload;
-  }
-
-  function appendTimeline(event) {
-    const presentation = eventPresentation(event);
-    if (!presentation) return;
-    if (safeRoute(event.route)) {
-      activeRoute = event.route;
-      if (!answerSettled) setText(elements.answer, ROUTE_WAITING[activeRoute]);
-    }
-    const item = document.createElement("li");
-    const detail = presentation.attributes
-      ? `（${Object.entries(presentation.attributes).map(([key, value]) => `${key}=${value}`).join(", ")}）`
-      : "";
-    item.textContent = `${presentation.label}：${presentation.summary}${detail}`;
-    const time = document.createElement("time");
-    time.dateTime = event.created_at || "";
-    time.textContent = event.created_at || "";
-    item.appendChild(time);
-    elements.timeline.appendChild(item);
-    if (presentation.noticeCode) {
-      if (TERMINAL_NOTICE_CODES.has(presentation.noticeCode)) {
-        renderSafeTerminalNotice(presentation.noticeCode);
-      } else {
-        showNotice(presentation.noticeCode);
-      }
-    }
-  }
-
-  function renderObject(target, value, fallback) {
-    if (value === undefined || value === null || value === "") {
-      setText(target, fallback);
-      return;
-    }
-    setText(target, typeof value === "string" ? value : JSON.stringify(value, null, 2));
-  }
-
-  function displayAnswer(run) {
-    const answer = run.answer;
-    const termination = terminalNoticeCode(run);
-    const presentation = answerPresentation(run);
-    const isChat = presentation && presentation.provenance.route === "chat";
-    // Validated chat explanations are final replies, not unaudited RAG drafts.
-    const chatExplanation = isChat && run.status === "completed" && !run.error_code
-      && ["cannot_answer", "clarify"].includes(answer.status);
-    activeRoute = safeRoute(answer && answer.route) || activeRoute;
-    answerSettled = !!presentation || !!termination || ["completed", "failed", "cancelled"].includes(run.status);
-    if (chatExplanation) {
-      renderObject(elements.answer, presentation.text, "未返回可展示的回答。");
-    } else if (termination) {
-      renderSafeTerminalNotice(termination);
-    } else if (presentation) {
-      renderObject(elements.answer, presentation.text, "未返回可展示的回答。");
-    } else if (run.error_code) {
-      setText(elements.answer, "任务未完成，请查看执行状态。");
-    } else if (answerSettled) {
-      setText(elements.answer, run.status === "cancelled" ? "任务已取消。" : "任务已结束，暂无可展示的回答。");
-    } else {
-      setText(elements.answer, ROUTE_WAITING[activeRoute] || "正在处理消息…");
-    }
-    renderObject(elements.evidence, isChat ? "不适用：聊天回复不引用文档证据。" : presentation && presentation.evidence, "服务端响应中暂无可展示的证据。");
-    renderObject(elements.audit, isChat ? "不适用：聊天回复不进行文档证据审计。" : presentation && presentation.audit, "服务端响应中暂无审计信息。");
-    renderObject(elements.provenance, presentation && presentation.provenance, "服务端响应中暂无溯源信息。");
-  }
-
-  async function loadRuntimeSummary() {
-    try {
-      const summary = await responseJson(await fetch("/v1/runtime/summary"));
-      setText(elements["snapshot-id"], summary.runtime_config_snapshot_id);
-      elements["health-grid"].replaceChildren();
-      Object.entries(summary.dependencies).forEach(([name, state]) => {
-        const chip = document.createElement("div");
-        chip.className = `health-chip ${state}`;
-        chip.textContent = `${name}: ${state === "available" ? "可用" : "不可用"}`;
-        elements["health-grid"].appendChild(chip);
-      });
-      if (!summary.memory_available) showNotice("COMPONENT_DEGRADED");
-      return summary;
-    } catch (error) {
-      setText(elements["snapshot-id"], "运行时摘要不可用");
-      renderError(elements["health-grid"], error);
-      return null;
-    }
-  }
-
-  async function loadHealth() {
-    try {
-      const [live, ready] = await Promise.all([
-        responseJson(await fetch("/health/live")),
-        responseJson(await fetch("/health/ready"))
-      ]);
-      setText(elements["run-status"], ready.status === "ready" ? "服务就绪" : "服务尚未就绪");
-      return { live, ready };
-    } catch (error) {
-      setText(elements["run-status"], "健康检查不可用");
-      return null;
-    }
-  }
-
-  async function submitQuery(question) {
-    const payload = buildQueryPayload(question);
-    if (!payload) {
-      setText(elements["run-status"], "请输入问题后再提交。");
-      return null;
-    }
-    clearNotice();
-    activeRunId = null;
-    activeRoute = null;
-    answerSettled = false;
-    elements.timeline.replaceChildren();
-    displayAnswer({status: "queued"});
-    lastEventId = 0;
-    streamCancelled = false;
-    try {
-      const run = await responseJson(await fetch("/v1/query", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      }));
-      activeRunId = run.run_id;
-      setText(elements["run-status"], `任务 ${run.status}`);
-      elements["cancel-run"].disabled = false;
-      displayAnswer(run);
-      if (run.status === "completed" || run.status === "failed" || run.status === "cancelled") {
-        elements["cancel-run"].disabled = true;
-      }
-      // Replaying the scoped event stream after a synchronous completion is
-      // required to surface safe audit-refusal/degradation notices.
-      void streamRun(run.run_id);
-      return run;
-    } catch (error) {
-      setText(elements["run-status"], "创建任务失败");
-      renderError(elements.answer, error);
-      return null;
-    }
-  }
-
-  function parseSseBlock(block) {
-    const values = { id: null, data: "" };
-    block.split("\n").forEach((line) => {
-      if (line.startsWith("id:")) values.id = line.slice(3).trim();
-      if (line.startsWith("data:")) values.data += line.slice(5).trim();
-    });
-    if (!values.data) return null;
-    try { return { id: values.id, payload: JSON.parse(values.data) }; } catch { return null; }
-  }
-
-  async function streamRun(runId) {
-    let retries = 0;
-    while (!streamCancelled && activeRunId === runId && retries < 3) {
+  const common = typeof module !== "undefined" && module.exports;
+  const S = common ? require("./chat-state.js") : root.AgenticRagChatState;
+  const A = common ? require("./chat-api.js") : root.AgenticRagChatApi;
+  const V = common ? require("./chat-view.js") : root.AgenticRagChatView;
+  const T = common
+    ? require("./console-tools.js")
+    : root.AgenticRagConsoleTools;
+  function createChatController({
+    document,
+    window = root,
+    api = A.createChatApi(),
+    storage,
+    tools,
+    uuid = () => globalThis.crypto.randomUUID(),
+  } = {}) {
+    const state = S.createChatState(),
+      view = V.createChatView(document),
+      byId = (id) => document.getElementById(id);
+    if (storage === undefined) {
       try {
-        const headers = buildSseHeaders(lastEventId);
-        const response = await fetch(`/v1/query-runs/${encodeURIComponent(runId)}/events`, { headers });
-        if (!response.ok || !response.body) throw new Error("无法连接任务事件流。");
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (streamCancelled || activeRunId !== runId) {
-            await reader.cancel();
-            return null;
-          }
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const blocks = buffer.split("\n\n");
-          buffer = blocks.pop() || "";
-          blocks.forEach((block) => {
-            const event = parseSseBlock(block);
-            if (!event) return;
-            const numericId = Number(event.id);
-            if (Number.isInteger(numericId) && numericId > 0) lastEventId = numericId;
-            appendTimeline(event.payload);
-          });
+        storage = window.localStorage;
+      } catch (_) {
+        storage = null;
+      }
+    }
+    let token = null,
+      viewAbort = null,
+      observer = null,
+      listGeneration = 0,
+      sessionCursor = null,
+      creating = false,
+      composing = false,
+      disposed = false,
+      sourceGeneration = 0,
+      sourceCounter = 0;
+    let summaries = new Map();
+    const openSources = new Map();
+    const current = () =>
+      state.selectedSessionId
+        ? S.sessionState(state, state.selectedSessionId)
+        : null;
+    const valid = (t) => !disposed && S.isCurrent(state, t);
+    function save() {
+      S.saveResumeMetadata(storage, state);
+      if (state.storageWarning)
+        view.notice(
+          "浏览器无法保存恢复标识。已受理的对话仍保存在服务器，可从会话列表找回。",
+        );
+    }
+    function updateComposer() {
+      const session = current();
+      byId("query-input").disabled = !session;
+      view.setComposer({
+        draft: session?.draft || "",
+        canSend:
+          !!session &&
+          session.loaded &&
+          !session.activeRunId &&
+          !session.pendingSubmission,
+        canStop: !!session?.activeRunId,
+      });
+      const pending = session?.pendingSubmission;
+      byId("pending-actions").hidden = pending?.status !== "unknown";
+      byId("retry-submission").hidden = !pending?.question;
+      byId("rename-chat").disabled = !session;
+      byId("delete-chat").disabled = !session;
+    }
+    function renderList() {
+      view.renderSessionList([...summaries.values()], state.selectedSessionId);
+      byId("more-sessions").hidden = !sessionCursor;
+      byId("session-title").textContent =
+        summaries.get(state.selectedSessionId)?.title ||
+        current()?.metadata?.title ||
+        "新对话";
+    }
+    async function refreshSessions(append = false) {
+      const stamp = ++listGeneration;
+      try {
+        const page = await api.listSessions({
+          cursor: append ? sessionCursor : null,
+        });
+        if (disposed || stamp !== listGeneration) return;
+        if (!append) summaries = new Map();
+        for (const item of page.items) summaries.set(item.session_id, item);
+        sessionCursor = page.next_cursor;
+        renderList();
+      } catch (_) {
+        if (!disposed && stamp === listGeneration)
+          view.notice("会话列表暂不可用，请稍后重试。");
+      }
+    }
+    function stopObservation() {
+      observer?.abort();
+      observer = null;
+    }
+    function clearSources() {
+      sourceGeneration++;
+      for (const id of openSources.keys()) view.setSourcesOpen(id, false);
+      openSources.clear();
+    }
+    async function authorizeSource(runId, t, stamp) {
+      const generation = sourceGeneration;
+      view.renderSources(runId, { status: "loading" });
+      try {
+        const result = await api.getSources(
+          t.sessionId,
+          runId,
+          viewAbort?.signal,
+        );
+        if (
+          valid(t) &&
+          !document.hidden &&
+          generation === sourceGeneration &&
+          openSources.get(runId) === stamp
+        )
+          view.renderSources(runId, result);
+      } catch (_) {
+        if (
+          valid(t) &&
+          generation === sourceGeneration &&
+          openSources.get(runId) === stamp
+        )
+          view.renderSources(runId, { status: "unavailable" });
+      }
+    }
+    function toggleSource(runId) {
+      if (!current()) return;
+      if (openSources.has(runId)) {
+        openSources.delete(runId);
+        view.setSourcesOpen(runId, false);
+        return;
+      }
+      const stamp = ++sourceCounter;
+      openSources.set(runId, stamp);
+      view.setSourcesOpen(runId, true);
+      void authorizeSource(runId, token, stamp);
+    }
+    function documentsChanged() {
+      sourceGeneration++;
+      for (const id of openSources.keys()) {
+        const stamp = ++sourceCounter;
+        openSources.set(id, stamp);
+        view.renderSources(id, { status: "loading" });
+        if (!document.hidden) void authorizeSource(id, token, stamp);
+      }
+    }
+    const toolView =
+      tools ||
+      T.createConsoleTools({ document, onDocumentsChanged: documentsChanged });
+    async function refreshLatest(t) {
+      try {
+        const page = await api.listTurns(t.sessionId, {
+          signal: viewAbort?.signal,
+        });
+        if (!valid(t)) return;
+        for (const run of page.items) {
+          if (S.applyRun(state, t, run))
+            view.updateTurn(current().turns.get(run.run_id));
         }
-        const run = await loadRun(runId);
-        if (run && ["completed", "failed", "cancelled"].includes(run.status)) return run;
-        retries += 1;
-      } catch (error) {
-        retries += 1;
-        setText(elements["run-status"], `事件流重连中（${retries}/3）`);
-        await new Promise((resolve) => window.setTimeout(resolve, 500 * retries));
+        updateComposer();
+        save();
+      } catch (_) {
+        if (valid(t)) view.notice("最新回答暂未同步，可重新打开会话继续查看。");
       }
     }
-    return loadRun(runId);
-  }
-
-  async function loadRun(runId) {
-    try {
-      const run = await responseJson(await fetch(`/v1/query-runs/${encodeURIComponent(runId)}`));
-      setText(elements["run-status"], `任务 ${run.status}`);
-      displayAnswer(run);
-      if (["completed", "failed", "cancelled"].includes(run.status)) {
-        elements["cancel-run"].disabled = true;
-      }
-      return run;
-    } catch (error) {
-      setText(elements["run-status"], "读取任务状态失败");
-      renderError(elements.answer, error);
-      return null;
+    function observe(runId, t) {
+      stopObservation();
+      if (!runId || document.hidden || !valid(t)) return;
+      const control = new AbortController();
+      observer = control;
+      const session = current();
+      void api
+        .watchRun({
+          runId,
+          cursor: session.turns.get(runId)?.eventCursor || session.eventCursor,
+          signal: control.signal,
+          onPhase(event) {
+            if (
+              valid(t) &&
+              S.applyPhase(state, t, event.run_id, event.id, event.phase)
+            ) {
+              view.updateTurn(current().turns.get(event.run_id));
+              save();
+            }
+          },
+          async onRun(run) {
+            if (control.signal.aborted || !valid(t)) return;
+            if (S.applyRun(state, t, run)) {
+              view.updateTurn(current().turns.get(run.run_id));
+              updateComposer();
+              save();
+            }
+            if (S.isTerminal(run)) {
+              await refreshLatest(t);
+              void refreshSessions();
+            }
+          },
+          onConnection(status) {
+            if (valid(t) && status === "polling")
+              view.notice("连接暂时不稳定，正在定时检查任务状态。");
+          },
+        })
+        .catch((error) => {
+          if (!valid(t) || control.signal.aborted) return;
+          if ([404, 410].includes(error.status)) {
+            view.notice("当前会话已不可用，请从列表选择其他对话。");
+            current().activeRunId = null;
+            void refreshSessions();
+          } else view.notice("暂时无法获取任务状态，可重新打开会话继续查看。");
+          updateComposer();
+        });
     }
-  }
-
-  async function cancelActiveRun() {
-    if (!activeRunId) return;
-    streamCancelled = true;
-    try {
-      const run = await responseJson(await fetch(`/v1/query-runs/${encodeURIComponent(activeRunId)}/cancel`, { method: "POST" }));
-      displayAnswer(run);
-      setText(elements["run-status"], `任务 ${run.status}`);
-    } catch (error) {
-      renderError(elements.answer, error);
-    }
-  }
-
-  async function uploadDocument(file) {
-    if (!file) return null;
-    const body = new FormData();
-    body.append("file", file);
-    setText(elements["ingestion-status"], "正在上传文档…");
-    try {
-      const job = await responseJson(await fetch("/v1/documents", { method: "POST", body }));
-      setText(elements["ingestion-status"], `入库任务 ${job.job_id}：${job.status}`);
-      if (!["completed", "failed", "cancelled"].includes(job.status)) void pollIngestionJob(job.job_id);
-      return job;
-    } catch (error) {
-      renderError(elements["ingestion-status"], error);
-      return null;
-    }
-  }
-
-  async function pollIngestionJob(jobId) {
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    async function checkSubmission(t = token) {
+      if (!valid(t)) return;
+      const session = current(),
+        pending = session.pendingSubmission;
+      if (!pending) return;
       try {
-        const job = await responseJson(await fetch(`/v1/ingestion-jobs/${encodeURIComponent(jobId)}`));
-        setText(elements["ingestion-status"], `入库任务 ${job.job_id}：${job.status}`);
-        if (["completed", "failed", "cancelled"].includes(job.status)) return job;
+        const turn = await api.findSubmission(
+          t.sessionId,
+          pending.requestId,
+          viewAbort?.signal,
+        );
+        S.acknowledgeSubmission(state, t.sessionId, pending.requestId);
+        if (!valid(t)) return;
+        view.clearPending();
+        S.applyRun(state, t, turn);
+        view.updateTurn(current().turns.get(turn.run_id));
+        view.notice("");
+        updateComposer();
+        save();
+        if (!S.isTerminal(turn)) observe(turn.run_id, t);
       } catch (error) {
-        renderError(elements["ingestion-status"], error);
-        return null;
+        if (!valid(t)) return;
+        S.markSubmissionUnknown(state, t.sessionId, pending.requestId);
+        view.notice(
+          error.status === 404
+            ? "尚未确认这次提交是否受理，请继续检查状态；系统不会重复发问。"
+            : "暂时无法核验提交状态，请稍后再检查。",
+        );
+        updateComposer();
+        save();
       }
     }
-    setText(elements["ingestion-status"], "入库任务仍在执行，请稍后刷新状态。");
-    return null;
-  }
-
-  function renderError(target, error) {
-    const message = error && error.message ? error.message : "服务暂时不可用。";
-    setText(target, message);
-    if (target && target.classList) target.classList.add("error-card");
-    if (error && error.payload && error.payload.error_code) showNotice(error.payload.error_code);
-  }
-
-  async function loadMemories() {
-    elements["memory-list"].replaceChildren();
-    try {
-      const payload = await responseJson(await fetch("/v1/memories"));
-      if (!payload.memories.length) {
-        const item = document.createElement("li");
-        item.textContent = "暂无已保存的 Mem0 记忆。";
-        elements["memory-list"].appendChild(item);
-        return payload.memories;
+    function closeSidebar() {
+      byId("session-sidebar").classList.remove("is-open");
+      byId("sidebar-backdrop").hidden = true;
+      byId("session-sidebar").removeAttribute("aria-modal");
+      byId("session-sidebar").removeAttribute("role");
+    }
+    async function selectSession(id) {
+      stopObservation();
+      viewAbort?.abort();
+      viewAbort = new AbortController();
+      clearSources();
+      token = S.activateSession(state, id);
+      const t = token;
+      current().loaded = false;
+      closeSidebar();
+      view.notice("");
+      view.renderSession(current());
+      renderList();
+      updateComposer();
+      save();
+      try {
+        const [summary, page] = await Promise.all([
+          api.getSession(id, viewAbort.signal),
+          api.listTurns(id, { signal: viewAbort.signal }),
+        ]);
+        if (!valid(t)) return;
+        summaries.set(id, summary);
+        const session = current();
+        session.metadata = summary;
+        session.activeRunId = summary.active_run_id;
+        for (const run of page.items) S.applyRun(state, t, run);
+        session.historyCursor = page.next_cursor;
+        session.loaded = true;
+        if (session.pendingSubmission) {
+          const accepted = page.items.find(
+            (run) =>
+              run.client_request_id === session.pendingSubmission.requestId,
+          );
+          if (accepted)
+            S.acknowledgeSubmission(
+              state,
+              id,
+              session.pendingSubmission.requestId,
+            );
+        }
+        view.renderSession(session);
+        view.scrollToLatest();
+        renderList();
+        updateComposer();
+        save();
+        if (session.pendingSubmission) await checkSubmission(t);
+        if (valid(t) && current().activeRunId)
+          observe(current().activeRunId, t);
+      } catch (error) {
+        if (!valid(t)) return;
+        view.notice(
+          [404, 410].includes(error.status)
+            ? "此对话已删除或不可访问，请选择其他对话。"
+            : "对话加载失败，请重新选择以重试。",
+        );
+        if ([404, 410].includes(error.status)) {
+          state.sessions.delete(id);
+          summaries.delete(id);
+          token = S.activateSession(state, null);
+          view.renderSession({
+            turns: new Map(),
+            orderedRunIds: [],
+            historyCursor: null,
+          });
+          renderList();
+        }
+        updateComposer();
       }
-      payload.memories.forEach((memory) => {
-        const item = document.createElement("li");
-        const label = document.createElement("span");
-        label.textContent = memory.text || memory.id;
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.className = "secondary";
-        remove.textContent = "删除";
-        remove.addEventListener("click", () => { void deleteMemory(memory.id); });
-        item.append(label, remove);
-        elements["memory-list"].appendChild(item);
+    }
+    async function newChat() {
+      if (creating) return;
+      creating = true;
+      byId("new-chat").disabled = true;
+      stopObservation();
+      viewAbort?.abort();
+      clearSources();
+      token = S.activateSession(state, null);
+      const generation = token.generation;
+      state.creationRequestId = state.creationRequestId || uuid();
+      const key = state.creationRequestId;
+      save();
+      updateComposer();
+      try {
+        const summary = await api.createSession(key);
+        if (state.creationRequestId === key) state.creationRequestId = null;
+        summaries.set(summary.session_id, summary);
+        save();
+        if (!disposed && state.viewGeneration === generation)
+          await selectSession(summary.session_id);
+        void refreshSessions();
+      } catch (_) {
+        if (!disposed)
+          view.notice(
+            "新建对话尚未确认。再次点击新建会使用同一个请求标识继续确认。",
+          );
+      } finally {
+        creating = false;
+        byId("new-chat").disabled = false;
+      }
+    }
+    async function send(retry = false) {
+      const session = current(),
+        t = token;
+      if (!session || !session.loaded || session.activeRunId) return;
+      const existing = session.pendingSubmission;
+      if (existing && (!retry || !existing.question)) return;
+      const question = (existing?.question || session.draft).trim();
+      if (!question || Array.from(question).length > 32000) return;
+      const pending = S.beginSubmission(state, t.sessionId, question, uuid());
+      pending.status = "submitting";
+      view.notice("");
+      view.renderPending(pending);
+      updateComposer();
+      save();
+      try {
+        const turn = await api.submitTurn(
+          t.sessionId,
+          pending.question,
+          pending.requestId,
+        );
+        S.acknowledgeSubmission(state, t.sessionId, pending.requestId);
+        save();
+        if (!valid(t)) return;
+        view.clearPending();
+        S.applyRun(state, t, turn);
+        view.updateTurn(current().turns.get(turn.run_id));
+        updateComposer();
+        void refreshSessions();
+        if (!S.isTerminal(turn)) observe(turn.run_id, t);
+      } catch (error) {
+        if ([400, 401, 403, 404, 409, 410, 422].includes(error.status)) {
+          S.rejectSubmission(state, t.sessionId, pending.requestId);
+          if (valid(t)) {
+            view.clearPending();
+            view.notice(
+              error.errorCode === "SESSION_BUSY"
+                ? "这个对话正在处理另一条问题，你的草稿已保留。"
+                : error.errorCode === "IDEMPOTENCY_CONFLICT"
+                  ? "提交标识冲突，原问题未被覆盖。"
+                  : "本次提交未受理，请检查输入或重新打开对话。",
+            );
+            if (error.errorCode === "SESSION_BUSY") {
+              const match = error.location?.match(
+                /^\/v1\/query-runs\/([A-Za-z0-9_-]+)$/,
+              );
+              if (match) {
+                current().activeRunId = match[1];
+                observe(match[1], t);
+              }
+            }
+          }
+        } else {
+          S.markSubmissionUnknown(state, t.sessionId, pending.requestId);
+          if (valid(t)) {
+            view.renderPending(current().pendingSubmission);
+            view.notice("提交结果尚未确认，请检查状态，或使用原请求重试。");
+          }
+        }
+        if (valid(t)) updateComposer();
+        save();
+      }
+    }
+    async function stop() {
+      const t = token,
+        id = current()?.activeRunId;
+      if (!id) return;
+      byId("cancel-button").disabled = true;
+      try {
+        const run = await api.cancelRun(id);
+        if (valid(t)) {
+          S.applyRun(state, t, run);
+          view.updateTurn(current().turns.get(id));
+          updateComposer();
+          if (S.isTerminal(run)) {
+            stopObservation();
+            await refreshLatest(t);
+            void refreshSessions();
+          }
+        }
+      } catch (_) {
+        if (valid(t)) view.notice("停止请求暂未确认，任务状态仍在同步。");
+      } finally {
+        if (valid(t)) byId("cancel-button").disabled = false;
+      }
+    }
+    async function older() {
+      const session = current(),
+        t = token;
+      if (!session?.historyCursor) return;
+      const button = byId("older-turns");
+      button.disabled = true;
+      try {
+        const page = await api.listTurns(t.sessionId, {
+          cursor: session.historyCursor,
+          signal: viewAbort?.signal,
+        });
+        if (!valid(t)) return;
+        const added = page.items.filter(
+          (run) => !session.turns.has(run.run_id),
+        );
+        for (const run of page.items) S.applyRun(state, t, run);
+        session.historyCursor = page.next_cursor;
+        view.prependTurns(added);
+        button.hidden = !page.next_cursor;
+      } catch (_) {
+        if (valid(t)) view.notice("更早消息加载失败，请重试。");
+      } finally {
+        if (valid(t)) button.disabled = false;
+      }
+    }
+    async function rename() {
+      const id = state.selectedSessionId;
+      if (!id) return;
+      const title = window.prompt("对话名称", summaries.get(id)?.title || "");
+      if (title === null) return;
+      if (!title.trim() || Array.from(title.trim()).length > 100) {
+        view.notice("名称应为 1–100 个字符。");
+        return;
+      }
+      try {
+        const summary = await api.renameSession(id, title.trim());
+        summaries.set(id, summary);
+        if (state.selectedSessionId === id) renderList();
+      } catch (_) {
+        view.notice("重命名失败，请稍后重试。");
+      }
+    }
+    async function remove() {
+      const id = state.selectedSessionId;
+      if (
+        !id ||
+        !window.confirm("删除这个对话？对话将从列表隐藏，用户长期记忆会保留。")
+      )
+        return;
+      try {
+        await api.deleteSession(id);
+        state.sessions.delete(id);
+        summaries.delete(id);
+        if (state.selectedSessionId === id) {
+          stopObservation();
+          clearSources();
+          token = S.activateSession(state, null);
+          await refreshSessions();
+          const first = summaries.keys().next().value;
+          if (first) await selectSession(first);
+          else await newChat();
+        }
+        save();
+      } catch (error) {
+        view.notice(
+          error.errorCode === "SESSION_BUSY"
+            ? "请先停止正在进行的回答，再删除对话。"
+            : "删除失败，请稍后重试。",
+        );
+      }
+    }
+    byId("query-input").addEventListener("input", () => {
+      if (current()) {
+        current().draft = byId("query-input").value;
+        updateComposer();
+      }
+    });
+    byId("query-input").addEventListener("compositionstart", () => {
+      composing = true;
+    });
+    byId("query-input").addEventListener("compositionend", () => {
+      composing = false;
+    });
+    byId("query-input").addEventListener("keydown", (event) => {
+      if (
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        !event.isComposing &&
+        !composing &&
+        event.keyCode !== 229
+      ) {
+        event.preventDefault();
+        void send();
+      }
+    });
+    byId("query-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!composing) void send();
+    });
+    byId("new-chat").addEventListener("click", () => void newChat());
+    byId("cancel-button").addEventListener("click", () => void stop());
+    byId("rename-chat").addEventListener("click", () => void rename());
+    byId("delete-chat").addEventListener("click", () => void remove());
+    byId("older-turns").addEventListener("click", () => void older());
+    byId("more-sessions").addEventListener(
+      "click",
+      () => void refreshSessions(true),
+    );
+    byId("session-list").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-session-id]");
+      if (button) void selectSession(button.dataset.sessionId);
+    });
+    byId("chat-messages").addEventListener("click", (event) => {
+      const button = event.target.closest('button[data-action="sources"]');
+      if (button) toggleSource(button.dataset.runId);
+    });
+    byId("check-submission").addEventListener(
+      "click",
+      () => void checkSubmission(),
+    );
+    byId("retry-submission").addEventListener("click", () => void send(true));
+    for (const kind of ["documents", "memory", "system"])
+      byId(`open-${kind}`).addEventListener("click", () => {
+        closeSidebar();
+        toolView.open(kind);
       });
-      return payload.memories;
-    } catch (error) {
-      const item = document.createElement("li");
-      const presentation = memoryErrorPresentation(error.message);
-      item.className = presentation.className;
-      item.textContent = presentation.message;
-      elements["memory-list"].appendChild(item);
-      showNotice("COMPONENT_DEGRADED");
-      return null;
-    }
-  }
-
-  async function deleteMemory(memoryId) {
-    try {
-      const response = await fetch(`/v1/memories/${encodeURIComponent(memoryId)}`, { method: "DELETE" });
-      if (!response.ok) await responseJson(response);
-      return loadMemories();
-    } catch (error) {
-      const item = document.createElement("li");
-      item.className = "error-card";
-      item.textContent = `删除记忆失败：${error.message || "服务暂时不可用。"}`;
-      elements["memory-list"].prepend(item);
-      return null;
-    }
-  }
-
-  function bindEvents() {
-    elements["query-form"].addEventListener("submit", (event) => {
-      event.preventDefault();
-      void submitQuery(elements["query-input"].value);
+    byId("open-sidebar").addEventListener("click", () => {
+      byId("session-sidebar").classList.add("is-open");
+      byId("session-sidebar").setAttribute("role", "dialog");
+      byId("session-sidebar").setAttribute("aria-modal", "true");
+      byId("sidebar-backdrop").hidden = false;
+      byId("new-chat").focus();
     });
-    elements["document-upload"].addEventListener("submit", (event) => {
-      event.preventDefault();
-      void uploadDocument(elements["document-file"].files[0]);
+    for (const id of ["close-sidebar", "sidebar-backdrop"])
+      byId(id).addEventListener("click", () => {
+        closeSidebar();
+        byId("open-sidebar").focus();
+      });
+    document.addEventListener("keydown", (event) => {
+      if (!byId("session-sidebar").classList.contains("is-open")) return;
+      if (event.key === "Escape") {
+        closeSidebar();
+        byId("open-sidebar").focus();
+      }
+      if (event.key === "Tab") {
+        const focusable = [
+          ...byId("session-sidebar").querySelectorAll("button"),
+        ].filter((b) => !b.hidden && !b.disabled);
+        const first = focusable[0],
+          last = focusable.at(-1);
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }
     });
-    elements["reload-memories"].addEventListener("click", () => { void loadMemories(); });
-    elements["cancel-run"].addEventListener("click", () => { void cancelActiveRun(); });
-  }
-
-  function initialize() {
-    initializeElements();
-    bindEvents();
-    void loadRuntimeSummary();
-    void loadHealth();
-    void loadMemories();
-  }
-
-  Object.assign(window, {
-    loadRuntimeSummary, submitQuery, streamRun, loadRun, uploadDocument, loadMemories, deleteMemory,
-    AgenticRagConsole: {
-      contract: {
-        buildQueryPayload, buildSseHeaders, eventPresentation, noticeCodeForEvent,
-        terminalNoticeCode, memoryErrorPresentation, provenanceFor, degradationAttributes,
-        answerPresentation
+    let foregroundGeneration = 0;
+    async function refreshVisible() {
+      const t = token,
+        session = current(),
+        stamp = ++foregroundGeneration;
+      if (!session) return;
+      const wasLoaded = session.loaded;
+      session.loaded = false;
+      stopObservation();
+      updateComposer();
+      try {
+        const [summary, page] = await Promise.all([
+          api.getSession(t.sessionId, viewAbort?.signal),
+          api.listTurns(t.sessionId, { signal: viewAbort?.signal }),
+        ]);
+        if (!valid(t) || stamp !== foregroundGeneration) return;
+        session.metadata = summary;
+        session.activeRunId = summary.active_run_id;
+        summaries.set(t.sessionId, summary);
+        for (const run of page.items) {
+          if (S.applyRun(state, t, run))
+            view.updateTurn(session.turns.get(run.run_id));
+        }
+        session.loaded = true;
+        renderList();
+        updateComposer();
+        save();
+        if (session.activeRunId) observe(session.activeRunId, t);
+      } catch (error) {
+        if (!valid(t) || stamp !== foregroundGeneration) return;
+        if ([404, 410].includes(error.status)) {
+          clearSources();
+          state.sessions.delete(t.sessionId);
+          summaries.delete(t.sessionId);
+          token = S.activateSession(state, null);
+          view.renderSession({ turns: new Map(), orderedRunIds: [] });
+          view.notice("此对话已删除或不可访问，请选择其他对话。");
+          renderList();
+        } else {
+          session.loaded = wasLoaded;
+          view.notice("会话状态暂未同步，可重新选择此对话以重试。");
+          if (session.activeRunId) observe(session.activeRunId, t);
+        }
+        updateComposer();
       }
     }
-  });
-  document.addEventListener("DOMContentLoaded", initialize);
-})();
+    const onFocus = () => {
+      if (disposed || document.hidden) return;
+      documentsChanged();
+      void refreshSessions();
+      void refreshVisible();
+    };
+    window.addEventListener("focus", onFocus);
+    const onVisibility = () => {
+      if (document.hidden) {
+        stopObservation();
+        sourceGeneration++;
+        for (const id of openSources.keys())
+          view.renderSources(id, { status: "loading" });
+      } else onFocus();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    async function start() {
+      updateComposer();
+      const resume = S.loadResumeMetadata(storage);
+      state.creationRequestId = resume.creationRequestId;
+      for (const item of resume.sessions) {
+        const session = S.sessionState(state, item.sessionId);
+        session.activeRunId = item.activeRunId;
+        session.eventCursor = item.eventCursor;
+        if (item.pendingRequestId)
+          session.pendingSubmission = {
+            requestId: item.pendingRequestId,
+            question: null,
+            status: "unknown",
+          };
+      }
+      await refreshSessions();
+      if (state.creationRequestId) {
+        await newChat();
+        return;
+      }
+      const selected =
+        resume.selectedSessionId || summaries.keys().next().value;
+      if (selected) await selectSession(selected);
+      else await newChat();
+    }
+    function dispose() {
+      disposed = true;
+      stopObservation();
+      viewAbort?.abort();
+      clearSources();
+      toolView.dispose?.();
+      window.removeEventListener?.("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    }
+    return {
+      start,
+      selectSession,
+      newChat,
+      send,
+      checkSubmission,
+      documentsChanged,
+      dispose,
+      state,
+    };
+  }
+  const exported = { createChatController };
+  if (common) module.exports = exported;
+  else {
+    root.AgenticRagChat = exported;
+    document.addEventListener("DOMContentLoaded", () => {
+      const controller = createChatController({ document, window: root });
+      root.AgenticRagChat.controller = controller;
+      void controller.start();
+    });
+  }
+})(typeof window !== "undefined" ? window : globalThis);
