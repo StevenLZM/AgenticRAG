@@ -94,3 +94,12 @@ def test_numeric_schema_is_finite_and_strict():
     row["critical_fields"][0]["tolerance"] = float("inf")
     with pytest.raises(ValueError):
         GoldCaseV2.model_validate(row)
+
+
+def test_valid_arithmetic_cannot_replace_original_formula_inputs(tmp_path):
+    row = gold_payload()
+    row["derivation"]["inputs"] = {"2025": 500, "2026": 600}
+    row["critical_fields"][0]["value"] = 100
+    row["reference_answer"] = "增加100元。"
+    with pytest.raises(ValueError, match="source anchor"):
+        load(tmp_path, [row])

@@ -55,3 +55,42 @@ def test_multiple_calls_keep_separate_rankings():
     result = project_case_trace(run, state, snapshot_id=SNAPSHOT.snapshot_id)
     assert len(result["retrieval_rounds"]) == 2
     assert result["ranking_scope"] == "per-retrieval"
+
+
+def test_final_answer_includes_every_display_segment():
+    run, state = observed()
+    segments = [{"kind": "heading", "text": "2025年标准", "evidence_ids": []},
+                {"kind": "content", "text": "470元/人/晚", "evidence_ids": []},
+                {"kind": "references", "text": "来源：2026版政策", "evidence_ids": []}]
+    state["answer"]["segments"] = segments
+    run["answer"]["segments"] = segments
+    result = project_case_trace(run, state, snapshot_id=SNAPSHOT.snapshot_id)
+    assert result["answer"] == "2025年标准\n470元/人/晚\n来源：2026版政策"
+
+
+def test_safe_terminal_projection_matches_api_snapshot():
+    run, state = observed()
+    state.update(termination_reason="clarify", answer={"status": "clarify"})
+    run["answer"] = {"status": "clarify", "route": "research"}
+    result = project_case_trace(run, state, snapshot_id=SNAPSHOT.snapshot_id)
+    assert result["public_answer"]["runtime_config_snapshot_id"] == SNAPSHOT.snapshot_id
+
+
+def test_provider_failure_is_not_a_correct_evidence_refusal():
+    run, state = observed()
+    state.update(termination_reason="cannot_answer", answer={"status": "cannot_answer"},
+                 research={"observations": [{"kind": "cannot_answer", "reason": "model_unavailable",
+                                               "error_code": "model_unavailable"}]})
+    run["answer"] = {"status": "cannot_answer", "route": "research"}
+    result = project_case_trace(run, state, snapshot_id=SNAPSHOT.snapshot_id)
+    assert result["outcome"] == "model_unavailable"
+    assert result["terminal_status"] == "cannot_answer"
+    assert result["answer"] == ""
+
+
+def test_degraded_components_preserved_in_actual_retrieval_stages():
+    run, state = observed()
+    state["retrieval_batches"][0]["degraded_components"] = ["dense", "reranker"]
+    result = project_case_trace(run, state, snapshot_id=SNAPSHOT.snapshot_id)
+    assert result["retrieval_rounds"][0]["stage_status"]["dense"] == "failed"
+    assert result["retrieval_rounds"][0]["stage_status"]["rerank"] == "fallback"

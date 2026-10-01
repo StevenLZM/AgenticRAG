@@ -43,11 +43,15 @@ class Reranker:
         timeout_seconds: float = 30.0,
         max_concurrent_reranks: int = 1,
         executor: Executor | None = None,
+        max_candidates: int = 30,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if max_concurrent_reranks <= 0:
             raise ValueError("max_concurrent_reranks must be positive")
+        if type(max_candidates) is not int or not 1 <= max_candidates <= 200:
+            raise ValueError("max_candidates must be in [1, 200]")
+        self.max_candidates = max_candidates
         self.model = model
         self._model_version = model_version
         self._timeout_seconds = timeout_seconds

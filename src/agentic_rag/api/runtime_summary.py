@@ -29,6 +29,7 @@ class RuntimeSummaryResponse(BaseModel):
     memory_enabled: bool
     memory_available: bool
     dependencies: dict[str, DependencyStatus]
+    evaluation_requests_enabled: bool = False
 
 
 runtime_summary_router = APIRouter(prefix="/v1", tags=["runtime"])
@@ -72,4 +73,5 @@ async def runtime_summary(request: Request) -> RuntimeSummaryResponse:
         memory_enabled=memory_enabled,
         memory_available=memory_available,
         dependencies=dependencies,
+        evaluation_requests_enabled=bool(getattr(settings, "allow_evaluation_requests", False)),
     )

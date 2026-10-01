@@ -8,6 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 import json
 import math
 import os
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
@@ -34,6 +35,8 @@ class JudgeConfig(BaseModel):
     max_attempts: int = Field(default=2, ge=1, le=3)
     timeout_seconds: float = Field(default=90, gt=0, le=300)
     retry_delay_seconds: float = Field(default=0.25, ge=0, le=5)
+    max_output_tokens: int = Field(default=4096, ge=512, le=32768)
+    thinking_mode: Literal["default", "disabled", "enabled"] = "default"
 
     @classmethod
     def from_settings(cls, settings) -> JudgeConfig:
@@ -93,8 +96,11 @@ class RagasJudge:
         embedding_client = AsyncOpenAI(api_key=cfg.embedding_api_key.get_secret_value(),
                                       base_url=cfg.embedding_base_url, timeout=cfg.timeout_seconds, max_retries=0)
         self._clients = [llm_client, embedding_client]
+        self._instrument_client(llm_client, "llm")
+        self._instrument_client(embedding_client, "embedding")
+        options = {"extra_body": {"thinking": {"type": cfg.thinking_mode}}} if cfg.thinking_mode != "default" else {}
         llm = llm_factory(cfg.judge_model, client=llm_client, temperature=0,
-                          max_tokens=4096, max_retries=1)
+                          max_tokens=cfg.max_output_tokens, max_retries=1, **options)
 
         class FloatEmbeddings(OpenAIEmbeddings):
             async def aembed_text(self, text, **kwargs):
@@ -120,6 +126,9 @@ class RagasJudge:
         return {"faithfulness": Faithfulness(llm=llm),
                 "answer_relevancy": AnswerRelevancy(llm=llm, embeddings=embeddings),
                 "context_precision": ContextPrecision(llm=llm), "correct_refusal": RefusalMetric()}
+
+    def _instrument_client(self, client, kind):
+        """Extension point before instructor captures the SDK create function."""
 
     async def evaluate(self, *, question, answer, contexts, reference_answer, answerable=True):
         if any(not isinstance(v, str) or not v.strip() for v in (question, answer, reference_answer)):

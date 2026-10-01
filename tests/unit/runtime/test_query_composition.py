@@ -120,6 +120,19 @@ async def test_composed_child_worker_inherits_server_scope_and_current_snapshot(
     assert retrieval.requests[0][2] == SNAPSHOT
 
 
+async def test_composed_child_inherits_evaluation_snapshot_not_process_baseline() -> None:
+    from agentic_rag.runtime.models import EvaluationMetadata
+    retrieval = RecordingRetrieval()
+    dispatcher = query_composition.build_subagent_dispatcher(
+        retrieval=retrieval, evidence_builder=EvidenceBuilder(), snapshot=SNAPSHOT,
+        concurrency=ConcurrencyManager())
+    evaluation = EvaluationMetadata(session_id="e", dataset_sha256="a" * 64, corpus_snapshot_id="b" * 64)
+    current = SNAPSHOT.model_copy(update={"evaluation": evaluation})
+    await dispatcher.delegate((TodoItem(id="todo", title="Find fact", owner="supervisor"),),
+                              ResearchContext(scope=UserScope(user_id="server-owned-user"), snapshot=current))
+    assert retrieval.requests[0][2].snapshot_id == current.snapshot_id
+
+
 async def test_worker_entrypoint_receives_the_composed_concurrency_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

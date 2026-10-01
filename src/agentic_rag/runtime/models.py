@@ -68,6 +68,10 @@ class RuntimeConfigSnapshot(BaseModel):
     # None is excluded from snapshot_id, keeping all pre-evaluation snapshot
     # hashes stable. This metadata is persisted in the existing Run JSON.
     evaluation: EvaluationMetadata | None = None
+    # Legacy checkpoints remain readable with their original content hash.
+    # New Runs bind endpoints and concurrency as well as model names.
+    provider_config_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    query_implementation_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="before")
     @classmethod

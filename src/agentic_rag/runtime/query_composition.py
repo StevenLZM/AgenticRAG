@@ -106,6 +106,7 @@ def _credential(value: object, name: str) -> str:
 
 
 def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
+    from agentic_rag.runtime.evaluation_identity import evaluation_config_fingerprint, query_implementation_fingerprint
     try:
         hashes = prompt_hashes(_PROMPTS)
     except (OSError, ValueError) as error:
@@ -133,6 +134,8 @@ def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
         max_evidence_tokens=settings.max_evidence_tokens,
         research_context_soft_limit_tokens=settings.research_context_soft_limit_tokens,
         max_parallel_subagents_per_run=settings.max_parallel_subagents_per_run,
+        provider_config_fingerprint=evaluation_config_fingerprint(settings),
+        query_implementation_fingerprint=query_implementation_fingerprint(),
     )
 
 
@@ -151,7 +154,8 @@ def build_subagent_dispatcher(
         child_tools: SubagentTools,
     ) -> tuple[EvidenceBatch, PackedEvidence]:
         child_scope = UserScope.model_validate(dict(child.scope))
-        context = ResearchContext(scope=child_scope, snapshot=snapshot)
+        inherited = RuntimeConfigSnapshot.model_validate(dict(child.runtime_config_snapshot))
+        context = ResearchContext(scope=child_scope, snapshot=inherited)
         return await child_tools.retrieve_evidence(
             query=child.question,
             context=context,
@@ -212,6 +216,9 @@ async def build_query_dependencies(
     )
     qwen = AsyncOpenAI(api_key=qwen_key, base_url=settings.qwen_embedding_base_url, timeout=30.0, max_retries=0)
     try:
+        from agentic_rag.observability.provider_usage import install_provider_meter
+        install_provider_meter(deepseek)
+        install_provider_meter(qwen)
         # ModelGateway derives the diagnostic client timeout from the configured
         # provider client when the SDK exposes it.  Keep construction positional
         # for lightweight test doubles and alternate gateway adapters.
@@ -222,6 +229,7 @@ async def build_query_dependencies(
             cross_encoder,
             model_version=settings.reranker_model,
             max_concurrent_reranks=settings.max_concurrent_reranks,
+            max_candidates=200,
         )
         parents = _SessionParentRepository(repositories.session_factory)
         retrieval = RetrievalService(
@@ -278,6 +286,7 @@ async def build_query_dependencies(
             event_emitter=emitter,
             concurrency=shared_concurrency,
             owned_resources=(deepseek, qwen, reranker),
+            deployment_snapshot_id=snapshot.snapshot_id,
             capabilities=RuntimeCapabilities(knowledge_base=True),
             conversations=SqlAlchemyConversationReader(repositories.session_factory),
         )

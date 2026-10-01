@@ -13,6 +13,7 @@ from agentic_rag.observability.logging import (
     AgentEventEmitter,
     emit_degradation,
     event_emission_scope,
+    emit_model_usage,
 )
 from agentic_rag.observability.metrics import MetricsProjector
 from agentic_rag.persistence.artifacts import LocalArtifactStore
@@ -166,3 +167,13 @@ async def test_llm_degradation_event_key_and_attributes_include_operation() -> N
     assert repository.events[0].event_key != repository.events[1].event_key
     assert repository.events[0].event_key != repository.events[2].event_key
     assert repository.events[0].payload_ref is None
+
+
+@pytest.mark.asyncio
+async def test_distinct_research_invocations_do_not_deduplicate_paid_model_usage():
+    repository = RecordingEventRepository()
+    emitter = AgentEventEmitter(repository, None, runtime_config_snapshot_id="snapshot-1")
+    for _ in range(2):
+        async with event_emission_scope(emitter, "run-1", "graph.node.research_agent_loop", user_id="user-1"):
+            await emit_model_usage(input_tokens=100, output_tokens=20, attempts=1, latency_ms=30)
+    assert len({event.event_key for event in repository.events}) == 2

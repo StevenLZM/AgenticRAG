@@ -85,6 +85,7 @@ class QueryGraphDependencies:
     event_emitter: AgentEventEmitter | None = None
     concurrency: ConcurrencyManager | None = None
     owned_resources: tuple[object, ...] = ()
+    deployment_snapshot_id: str | None = None
     capabilities: RuntimeCapabilities | None = None
     conversations: ConversationReader | None = None
 
@@ -417,9 +418,13 @@ async def _trace_span(
     dependencies: QueryGraphDependencies, state: QueryState, name: str
 ) -> AsyncIterator[None]:
     """Record a safe local span only when it matches the Run's snapshot."""
-    snapshot_id = snapshot_from_state(state).snapshot_id
+    snapshot = snapshot_from_state(state)
+    if (dependencies.deployment_snapshot_id is not None
+            and snapshot.model_copy(update={"evaluation": None}).snapshot_id != dependencies.deployment_snapshot_id):
+        raise ValueError("query deployment configuration does not match Run snapshot")
+    snapshot_id = snapshot.snapshot_id
     recorder = dependencies.trace_recorder
-    emitter = dependencies.event_emitter
+    emitter = _run_emitter(dependencies, state)
     safe_recorder = (
         recorder if recorder is not None and recorder.runtime_config_snapshot_id == snapshot_id else None
     )
@@ -489,14 +494,26 @@ async def _span_event(
         pass
 
 
+def _run_emitter(dependencies: QueryGraphDependencies, state: QueryState):
+    emitter = dependencies.event_emitter
+    snapshot = snapshot_from_state(state)
+    # Only a validated evaluation extension of this exact process baseline can
+    # rebind telemetry. Arbitrary stale/foreign snapshots still emit nothing.
+    if (isinstance(emitter, AgentEventEmitter) and snapshot.evaluation is not None
+            and snapshot.model_copy(update={"evaluation": None}).snapshot_id == emitter.runtime_config_snapshot_id):
+        return emitter.with_snapshot(snapshot.snapshot_id)
+    return emitter
+
+
 async def _event(dependencies: QueryGraphDependencies, state: QueryState, event_type: str, summary: str) -> None:
     if event_type == "QUERY_ROUTED":
         summary = {"chat": "chat", "fast_rag": "fast_rag", "research_agent": "research"}.get(summary, "completed")
-    if dependencies.event_emitter is not None:
-        if dependencies.event_emitter.runtime_config_snapshot_id != snapshot_from_state(state).snapshot_id:
+    emitter = _run_emitter(dependencies, state)
+    if emitter is not None:
+        if emitter.runtime_config_snapshot_id != snapshot_from_state(state).snapshot_id:
             return
         try:
-            await dependencies.event_emitter.emit(
+            await emitter.emit(
                 run_id=state["run_id"],
                 user_id=scope_from_state(state).user_id,
                 event_type=event_type,

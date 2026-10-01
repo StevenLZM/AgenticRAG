@@ -29,7 +29,7 @@ from agentic_rag.retrieval.parents import aggregate_parents
 from agentic_rag.retrieval.ports import LexicalIndex, VectorIndex
 from agentic_rag.retrieval.reranker import RerankResult
 from agentic_rag.retrieval.state import LaneFailure, RetrievalState
-from agentic_rag.runtime.models import RuntimeConfigSnapshot
+from agentic_rag.runtime.models import RetrievalBudget, RuntimeConfigSnapshot
 
 
 class RerankerPort(Protocol):
@@ -55,6 +55,11 @@ class RetrievalUnavailable(RuntimeError):
         self.failures = dict(failures)
         components = ", ".join(sorted(failures))
         super().__init__(f"all retrieval lanes failed: {components}")
+
+
+def _budget(state: RetrievalState) -> RetrievalBudget:
+    evaluation = state["snapshot"].evaluation
+    return evaluation.retrieval_budget if evaluation and evaluation.retrieval_budget else RetrievalBudget()
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,15 +139,18 @@ def build_retrieval_graph(
         started = perf_counter()
         request = state["request"]
         search_filter = state["search_filter"]
-        recall_limit = request.top_k_override or 40
+        budget = _budget(state)
+        fixed = state["snapshot"].evaluation is not None and state["snapshot"].evaluation.retrieval_budget is not None
+        dense_limit = budget.dense_k if fixed else request.top_k_override or budget.dense_k
+        bm25_limit = budget.bm25_k if fixed else request.top_k_override or budget.bm25_k
 
         async def dense() -> list[ChildHit]:
             vector = await dependencies.embedding.embed_query(request.query)
-            return await dependencies.vector.search(vector, search_filter, recall_limit)
+            return await dependencies.vector.search(vector, search_filter, dense_limit)
 
         async def bm25() -> list[ChildHit]:
             return await dependencies.lexical.search(
-                request.query, search_filter, recall_limit
+                request.query, search_filter, bm25_limit
             )
 
         dense_result, bm25_result = await asyncio.gather(
@@ -202,7 +210,8 @@ def build_retrieval_graph(
     async def rrf_fusion(state: RetrievalState) -> dict[str, object]:
         started = perf_counter()
         fused = rrf_fuse(
-            [state.get("dense_hits", []), state.get("bm25_hits", [])], limit=30
+            [state.get("dense_hits", []), state.get("bm25_hits", [])],
+            limit=_budget(state).rrf_k, k=_budget(state).rrf_constant
         )
         return _stage_update(
             state, "rrf_fusion", started, fused_hits=fused, rrf=len(fused)
@@ -211,7 +220,7 @@ def build_retrieval_graph(
     async def cross_encoder(state: RetrievalState) -> dict[str, object]:
         started = perf_counter()
         result = await dependencies.reranker.rerank(
-            state["request"].query, state["fused_hits"], limit=10
+            state["request"].query, state["fused_hits"], limit=_budget(state).rerank_k
         )
         degraded = state["degraded_components"]
         if result.degraded:
@@ -237,7 +246,7 @@ def build_retrieval_graph(
     async def parent_aggregation(state: RetrievalState) -> dict[str, object]:
         started = perf_counter()
         selected = aggregate_parents(
-            state["reranked_hits"], max_children_per_parent=2, limit=6
+            state["reranked_hits"], max_children_per_parent=2, limit=_budget(state).parent_k
         )
         return _stage_update(
             state,
@@ -274,12 +283,15 @@ def build_retrieval_graph(
                 stages={name: tuple(RankedHitRef(
                     child_id=hit.child_id, parent_id=hit.parent_id, user_id=hit.user_id,
                     document_id=hit.document_id, document_version_id=hit.document_version_id,
+                    retrieval_score=hit.retrieval_score, rrf_score=hit.rrf_score, rerank_score=hit.rerank_score,
                 ) for hit in state.get(key, [])) for name, key in (
                     ("dense", "dense_hits"), ("bm25", "bm25_hits"),
                     ("rrf", "fused_hits"), ("rerank", "reranked_hits"),
                 )},
                 selected_parent_ids=tuple(p.parent_id for p in state["selected_parents"]),
                 hydrated_parent_ids=tuple(p.parent_id for p in state["hydrated_parents"]),
+                candidate_budget=_budget(state).model_dump(), timings_ms=state["timings_ms"],
+                candidate_counts=state["candidate_counts"],
             ),
         )
         return _stage_update(state, "evidence_batch", started, evidence_batch=batch)

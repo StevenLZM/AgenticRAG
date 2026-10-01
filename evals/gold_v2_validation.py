@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from evals.gold_v2_models import CorpusSnapshot, GoldCaseV2, finite_number
@@ -28,6 +29,12 @@ def validate_derivation(case: GoldCaseV2):
     operation, inputs = case.derivation.operation, case.derivation.inputs
     if operation == "2026_limit-2025_limit":
         expected = finite_number(inputs["2026"]) - finite_number(inputs["2025"])
+        # Arithmetic alone does not bind the operands to original evidence.
+        # Anchors are separately verified against the hashed originals.
+        for value in inputs.values():
+            pattern = r"(?<![\d.])" + re.escape(format(finite_number(value), "g")) + r"(?![\d.])"
+            if not any(re.search(pattern, anchor) for group in case.required_evidence_groups_all_of for anchor in group.source_anchors):
+                raise ValueError("calculation input has no matching source anchor")
     elif operation == "B6+C6-D6":
         # Frozen inputs are the original A6:D6 row: A is the inventory key.
         expected = finite_number(inputs[1]) + finite_number(inputs[2]) - finite_number(inputs[3])

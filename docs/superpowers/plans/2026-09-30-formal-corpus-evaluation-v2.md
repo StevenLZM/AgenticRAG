@@ -8,6 +8,10 @@
 
 **技术：** Python、现有 MySQL/ES/API、现有持久化查询轨迹、固定版本 Ragas 0.4.2。
 
+## 最新执行索引（2026-10-01）
+
+下文保留原实施清单与历史统计；逐项当前状态以`docs/formal-rag-evaluation-v2-progress.md`为准，可执行命令见`docs/formal-rag-evaluation-v2.md`。v2契约、正式CLI、真实轨迹、端到端裁判、关键字段、阶段指标、成本账本、恢复核验、调参CLI及人工审核入口均已有实现。最新回归951 passed/47 skipped，正式20题真实测评正在`formal-v2-smoke-20261001`运行；不是4453题全量成绩。人工语义审核、graded qrels、Judge校准、自然问法/困难负例扩充、完整validation/test与参数验收仍未完成。
+
 ## 2026-09-30 完整正式处理与定位修复进展
 
 - [x] 原1000份合成文档普通上传全部completed，经API8000/MySQL/正式ES9200核验；两份旧index-v2原文通过正常reprocess接口发布新版本，旧原文和版本保留。

@@ -16,7 +16,7 @@ import re
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 from uuid import uuid4
@@ -70,6 +70,7 @@ _NUMERIC_ATTRIBUTES = frozenset(
         "concurrent_saturation",
         "input_tokens",
         "output_tokens",
+        "cached_input_tokens",
         "estimated_cost",
         "cited_claim_count",
         "claim_count",
@@ -92,6 +93,7 @@ _MODEL_TEXT_ATTRIBUTES = frozenset(
         "output_sha256",
         "skip_reason",
         "phase",
+        "invocation_id",
     }
 )
 _SAFE_MODEL_TEXT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -104,6 +106,7 @@ class _EmissionScope:
     operation: str
     user_id: str | None
     sequence: int = 0
+    invocation_id: str = field(default_factory=lambda: uuid4().hex)
 
 
 _EMISSION_SCOPE: ContextVar[_EmissionScope | None] = ContextVar(
@@ -269,6 +272,10 @@ class AgentEventEmitter:
         """Expose the immutable baseline identity for safe producer injection."""
         return self._snapshot_id
 
+    def with_snapshot(self, snapshot_id: str) -> "AgentEventEmitter":
+        """Reuse persistence boundaries without mutating another Run's emitter."""
+        return AgentEventEmitter(self._repository, self._artifacts, runtime_config_snapshot_id=snapshot_id)
+
     async def emit(
         self,
         *,
@@ -378,13 +385,14 @@ async def emit_model_usage(
             node_name=scope.operation,
             summary="model_completed",
             event_key=stable_event_key(
-                scope.run_id, scope.operation, str(scope.sequence), "LLM_COMPLETED"
+                scope.run_id, scope.operation, scope.invocation_id, str(scope.sequence), "LLM_COMPLETED"
             ),
             attributes={
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "attempts": attempts,
                 "latency_ms": latency_ms,
+                "invocation_id": scope.invocation_id,
             },
         )
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):

@@ -361,12 +361,14 @@ async def test_real_graph_model_gateway_call_emits_usage_inside_graph_scope() ->
     assert result["termination_reason"] == "completed"
     model_events = [call for call in emitter.calls if call["event_type"] == "LLM_COMPLETED"]
     assert model_events
+    assert len(model_events[0]["attributes"]["invocation_id"]) == 32
     assert model_events[0]["node_name"] == "graph.node.route.llm"
     assert model_events[0]["attributes"] == {
         "input_tokens": 7,
         "output_tokens": 3,
         "attempts": 1,
         "latency_ms": model_events[0]["attributes"]["latency_ms"],
+        "invocation_id": model_events[0]["attributes"]["invocation_id"],
     }
 
 

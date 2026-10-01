@@ -177,6 +177,12 @@ def render_report(summary, *, verified, error=None):
 
 
 async def run(args):
+    if (getattr(args, "dataset", None) is not None or getattr(args, "corpus_snapshot", None) is not None
+            or getattr(args, "replay_from", None) is not None
+            or getattr(args, "continue_from", None) is not None
+            or (args.resume and read_json(args.resume / "experiment.json").get("schema_version") == 2)):
+        from evals.formal_command import run_formal
+        return await run_formal(args)
     # Resume resolves inputs from its immutable manifest; caller overrides still must match.
     saved = read_json(args.resume.resolve() / "experiment.json") if args.resume else {}
     root = (args.source_run or Path(saved.get("source_run", DEFAULT_SOURCE))).resolve()
@@ -230,6 +236,24 @@ def main(argv=None):
     parser.add_argument("--source-run", type=Path, help="existing ingestion run containing allocation and upload ledgers")
     parser.add_argument("--docs-dir", type=Path, help="existing frozen documents directory (QA subdirectory excluded)")
     parser.add_argument("--gold", type=Path, help="existing mapped gold JSON; must match frozen corpus")
+    parser.add_argument("--dataset", type=Path, help="strict formal gold v2 JSONL, no generation/upload")
+    parser.add_argument("--corpus-snapshot", type=Path, help="frozen full formal SQL/ES snapshot JSON")
+    parser.add_argument("--api-url", help="formal API URL; default http://127.0.0.1:8000 for v2")
+    parser.add_argument("--split", choices=("dev", "validation", "test", "all"), help="company-held-out split, default dev")
+    parser.add_argument("--smoke", type=int, choices=range(1, 101), metavar="N", help="deterministic category-stratified sample")
+    parser.add_argument("--limit", type=int, help="explicit maximum selected cases (not stratified)")
+    parser.add_argument("--case-id", action="append", help="explicit v2 cases within the requested split")
+    parser.add_argument("--snapshot-mode", choices=("strict", "robustness"))
+    parser.add_argument("--retrieval-budget", type=Path, help="validated JSON experiment budgets, not production defaults")
+    parser.add_argument("--pricing", type=Path, help="pinned provider tariff JSON; estimate from actual usage, not invoice")
+    parser.add_argument("--answer-spec", type=Path, help="frozen source-bound scoring specification JSONL, separate from gold")
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--replay-from", type=Path, help="NEW scoring experiment reusing only source Run IDs; never submits queries")
+    sources.add_argument("--continue-from", type=Path, help="NEW judge experiment reuses known Runs and submits pending cases only with identical query deployment")
+    parser.add_argument("--max-cases", type=int, default=1000, help="hard query budget; explicit increase required for larger splits")
+    parser.add_argument("--max-judge-requests", type=int, default=50000, help="maximum attempted judge/embedding HTTP requests")
+    parser.add_argument("--max-wall-seconds", type=int, default=14400, help="stop starting new cases after this wall budget")
+    parser.add_argument("--query-timeout", type=int, default=330, help="poll timeout; does not resubmit or cancel the Run")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--output-dir", type=Path, help="NEW experiment directory")
     group.add_argument("--resume", type=Path, help="resume a previously created experiment")

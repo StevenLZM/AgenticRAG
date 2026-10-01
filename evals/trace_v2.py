@@ -13,7 +13,7 @@ def project_case_trace(run: dict, state: dict, *, snapshot_id: str) -> dict:
             or run["runtime_config_snapshot_id"] != snapshot_id):
         raise ValueError("trace scope/run/question/snapshot mismatch")
     route = state.get("route", {}).get("route")
-    answer = project_public_answer(run.get("answer"))
+    answer = project_public_answer(run.get("answer"), runtime_config_snapshot_id=snapshot_id)
     outcome = state.get("termination_reason") or run["status"]
     if run["status"] == "completed":
         from evals.collector import project_verified_state
@@ -37,18 +37,33 @@ def project_case_trace(run: dict, state: dict, *, snapshot_id: str) -> dict:
         parent_ids = [p["parent_id"] for p in batch.get("parents", [])]
         if parent_ids != list(observation.hydrated_parent_ids):
             raise ValueError("actual Parent order mismatch")
+        degraded = set(batch.get("degraded_components", []))
+        stage_status = {name: "failed" if name in degraded else "available" for name in ("dense", "bm25")}
+        stage_status.update(rrf="degraded" if degraded & {"dense", "bm25"} else "available",
+                            rerank="fallback" if "reranker" in degraded else "available", parent="available")
         rounds.append({"ordinal": ordinal, "query": batch.get("query"), "target_ids": batch.get("target_ids", []),
                        "stages": {k: [h.child_id for h in v] for k, v in observation.stages.items()},
+                       "stage_status": stage_status, "degraded_components": sorted(degraded),
                        "parent_ids": parent_ids, "observation": observation.model_dump(mode="json")})
     research = state.get("research", {})
     # Deliberately omit model thinking/planning prompts. Only public actions,
     # immutable evidence refs, and constrained Todo state belong in this trace.
-    observations = [{k: o[k] for k in ("type", "tool", "todo_id", "todo_ids", "status", "action", "reason") if k in o}
+    observations = [{k: o[k] for k in ("kind", "ok", "type", "tool", "todo_id", "todo_ids", "completed_todo_ids", "blocked_todo_ids", "status", "action", "reason", "error_code") if k in o}
                     for o in research.get("observations", []) if isinstance(o, dict)]
+    terminal_status = outcome
+    # The public terminal status intentionally hides operational errors. The
+    # evaluator must retain that distinction, rather than credit an outage as
+    # an evidence-grounded refusal.
+    if outcome == "cannot_answer" and observations:
+        final = observations[-1]
+        cause = final.get("error_code") or final.get("reason")
+        if cause in {"model_unavailable", "research_evidence_invalid", "research_action_invalid",
+                     "subagent_failed", "tool_unavailable"}:
+            outcome = cause
     return {"schema_version": 2, "run_id": run["id"], "user_id": run["user_id"],
             "runtime_config_snapshot_id": snapshot_id, "route": route, "outcome": outcome,
-            "run_status": run["status"], "question": run["question"],
-            "answer": "\n".join(s.text for s in answer.segments if s.kind == "content") if answer else "",
+            "run_status": run["status"], "question": run["question"], "terminal_status": terminal_status,
+            "answer": "\n".join(s.text for s in answer.segments) if answer else "",
             "answer_origin": "model" if answer and answer.segments else "terminal_status",
             "public_answer": answer.model_dump(mode="json") if answer else None,
             "context_items": items, "rendered_context": pack.get("rendered_context") if pack else None,

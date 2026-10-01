@@ -5,7 +5,7 @@ from pathlib import Path
 
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from sqlalchemy import select
-from agentic_rag.persistence.repositories import agent_runs
+from agentic_rag.persistence.repositories import agent_events, agent_runs
 
 from agentic_rag.retrieval.models import RetrievalObservation
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
@@ -15,9 +15,10 @@ from agentic_rag.query.public_answer import project_public_answer
 class RuntimeCollector:
     """Read only explicitly scoped Run fields and its local checkpoint."""
 
-    def __init__(self, engine, checkpoint_path: Path):
+    def __init__(self, engine, checkpoint_path: Path, artifact_root: Path | None = None):
         self.engine = engine
         self.checkpoint_path = checkpoint_path
+        self.artifact_root = artifact_root
 
     async def collect(self, *, run_id, user_id, snapshot_id, question):
         fields = ("id", "user_id", "runtime_config_snapshot_id", "question", "status", "answer", "route", "checkpoint_thread_id")
@@ -47,11 +48,57 @@ class RuntimeCollector:
             raise ValueError("scoped isolated evaluation run unavailable")
         state = await asyncio.to_thread(read_checkpoint, self.checkpoint_path, run["checkpoint_thread_id"])
         trace = project_case_trace(dict(run), state, snapshot_id=snapshot_id)
+        trace["todo_history"] = await asyncio.to_thread(read_todo_history, self.checkpoint_path, run["checkpoint_thread_id"])
+        async with self.engine.connect() as connection:
+            events = (await connection.execute(select(agent_events).where(agent_events.c.run_id == run_id,
+                agent_events.c.user_id == user_id, agent_events.c.runtime_config_snapshot_id == snapshot_id
+            ).order_by(agent_events.c.id))).mappings().all()
+        timeline, usage = [], []
+        from agentic_rag.persistence.artifacts import LocalArtifactStore
+        artifacts = LocalArtifactStore(self.artifact_root) if self.artifact_root else None
+        for event in events:
+            attributes = {}
+            if artifacts and event["payload_ref"] and event["payload_ref"].startswith("artifact://observability/events/"):
+                attributes = artifacts.read_json(artifacts.describe(event["payload_ref"])).get("attributes", {})
+            timeline.append({"event_type": event["event_type"], "node_name": event["node_name"],
+                             "created_at": event["created_at"].isoformat(), "attributes": attributes})
+            if event["event_type"] == "LLM_COMPLETED":
+                usage.append(attributes)
+        trace["timeline"] = timeline
+        from evals.costs_v2 import provider_requests
+        trace["provider_requests"] = provider_requests(timeline)
+        trace["model_operations"] = len(usage)
+        if usage and all(type(u.get("input_tokens")) is int and u["input_tokens"] > 0
+                         and type(u.get("output_tokens")) is int and u["output_tokens"] >= 0 for u in usage):
+            trace["provider_usage"] = {"status": "observed_partial",
+                "input_tokens": sum(u["input_tokens"] for u in usage),
+                "output_tokens": sum(u["output_tokens"] for u in usage), "cost": None,
+                "embedding_usage_status": "unknown", "completeness": "unverified",
+                "requests": sum(u.get("attempts", 1) for u in usage),
+                "invocation_tracking": "available" if all(u.get("invocation_id") for u in usage) else "legacy_may_deduplicate"}
         if trace["memory_policy"] != "disabled":
             raise ValueError("evaluation was not memory isolated")
         if run["created_at"] and run["finished_at"]:
             trace["total_seconds"] = (run["finished_at"] - run["created_at"]).total_seconds()
         return trace
+
+
+def read_todo_history(path: Path, thread_id: str):
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        rows = connection.execute("SELECT type,checkpoint FROM checkpoints WHERE thread_id=? AND checkpoint_ns='' "
+                                  "ORDER BY checkpoint_id DESC LIMIT 200", (thread_id,)).fetchall()
+        history = []
+        for kind, payload in reversed(rows):
+            if len(payload) > 20_000_000:
+                raise ValueError("checkpoint oversized")
+            state = JsonPlusSerializer(pickle_fallback=False).loads_typed((kind, payload)).get("channel_values", {})
+            todos = state.get("research", {}).get("todos", [])
+            if todos and (not history or history[-1]["todos"] != todos):
+                history.append({"research_round": state.get("research_attempt_count"), "todos": todos})
+        return history
+    finally:
+        connection.close()
 
 
 def read_checkpoint(path: Path, thread_id: str):

@@ -71,3 +71,23 @@ def test_multi_round_union_is_coverage_not_fabricated_ranking():
     assert result["union"]["dense"]["complete_evidence"] == 1
     assert "mrr" not in result["union"]["dense"]
     assert result["new_fact_gain"]["dense"] == [1, 1]
+
+
+def test_failed_lane_and_rerank_fallback_have_separate_denominators():
+    case = case_with_two_facts()
+    result = score_rounds(case, [{"stages": {"dense": [], "bm25": ["old"], "rrf": ["old"], "rerank": ["old"]},
+        "stage_status": {"dense": "failed", "bm25": "available", "rrf": "degraded", "rerank": "fallback"}}])
+    assert result["rounds"][0]["dense"]["metrics"]["mrr"] is None
+    assert result["rounds"][0]["rerank"]["metrics"]["mrr"] is None
+    assert result["rounds"][0]["bm25"]["metrics"]["mrr"] == 1
+    assert result["stage_counts"]["dense"]["failed"] == 1
+    assert result["stage_counts"]["rerank"]["fallback"] == 1
+
+
+def test_final_context_rank_uses_actual_cropped_fact_text():
+    case = GoldCaseV2.model_validate(gold_payload())
+    result = score_context(case, [{"parent_id": "p", "content": "无关前言"}, {"parent_id": "p", "content": "旧410新470"}])
+    assert result["metrics"]["mrr"] == .5
+    assert result["metrics"]["fact_recall@1"] == 0
+    assert result["metrics"]["fact_recall@3"] == 1
+    assert result["metrics"]["binary_ndcg@3"] == pytest.approx(1 / math.log2(3))

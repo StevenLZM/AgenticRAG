@@ -1,0 +1,8 @@
+{
+  "dense_k": 40,
+  "bm25_k": 40,
+  "rrf_k": 30,
+  "rerank_k": 10,
+  "parent_k": 6,
+  "rrf_constant": 60
+}

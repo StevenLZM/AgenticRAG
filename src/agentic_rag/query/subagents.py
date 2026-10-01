@@ -41,6 +41,7 @@ class ChildResearchState:
     dependency_inputs: tuple[TodoDependencyInput, ...] = ()
     dependency_context: str = ""
     dependency_results: Mapping[str, object] = field(default_factory=dict)
+    runtime_config_snapshot: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +225,7 @@ class SubagentDispatcher:
             dependency_inputs=dependency_inputs,
             dependency_context="\n".join(dependency_text),
             dependency_results=_freeze_mapping(dependency_results),
+            runtime_config_snapshot=_freeze_mapping(context.snapshot.model_dump(mode="json")),
         )
 
 

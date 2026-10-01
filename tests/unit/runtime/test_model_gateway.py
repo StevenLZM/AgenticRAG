@@ -181,7 +181,10 @@ async def test_gateway_emits_real_usage_only_inside_task_local_event_scope() -> 
     assert len(emitter.calls) == 1
     event = emitter.calls[0]
     assert event["event_type"] == "LLM_COMPLETED"
-    assert event["attributes"] == {"input_tokens": 7, "output_tokens": 3, "attempts": 1, "latency_ms": event["attributes"]["latency_ms"]}
+    assert len(event["attributes"]["invocation_id"]) == 32
+    assert event["attributes"] == {"input_tokens": 7, "output_tokens": 3, "attempts": 1,
+                                   "latency_ms": event["attributes"]["latency_ms"],
+                                   "invocation_id": event["attributes"]["invocation_id"]}
     assert event["event_key"]
 
 

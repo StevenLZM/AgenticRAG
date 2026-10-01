@@ -68,6 +68,7 @@ async def test_runtime_summary_exposes_snapshot_without_secrets() -> None:
         "memory_enabled": True,
         "memory_available": True,
         "dependencies": {"mysql": "available", "memory": "available"},
+        "evaluation_requests_enabled": False,
     }
     assert "mysql_dsn" not in response.text
     assert "api_key" not in response.text

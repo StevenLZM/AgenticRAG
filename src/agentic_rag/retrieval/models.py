@@ -112,6 +112,9 @@ class RankedHitRef(BaseModel):
     user_id: str
     document_id: str
     document_version_id: str
+    retrieval_score: float | None = None
+    rrf_score: float | None = None
+    rerank_score: float | None = None
 
 
 class RetrievalObservation(BaseModel):
@@ -125,6 +128,9 @@ class RetrievalObservation(BaseModel):
     stages: dict[Literal["dense", "bm25", "rrf", "rerank"], tuple[RankedHitRef, ...]]
     selected_parent_ids: tuple[str, ...]
     hydrated_parent_ids: tuple[str, ...]
+    candidate_budget: dict[str, int] = Field(default_factory=dict)
+    timings_ms: dict[str, float] = Field(default_factory=dict)
+    candidate_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class EvidenceBatch(BaseModel):

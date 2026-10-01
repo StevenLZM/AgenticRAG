@@ -32,7 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["httpx", "mypy", "pytest", "pytest-asyncio", "ruff"]
-eval = ["ragas==0.4.2", "langchain-community==0.4.1"]
+eval = ["ragas==0.4.2", "langchain-community==0.4.1", "pypdf==6.10.0", "openpyxl==3.1.5"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
