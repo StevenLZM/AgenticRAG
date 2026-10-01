@@ -1,18 +1,18 @@
 """Short, caller-owned SQL operations for scoped chat sessions."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy import and_, insert, or_, select, update, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agentic_rag.domain.chat_sessions import (
-    ChatSession, ChatSessionSummary, Page, decode_cursor, encode_cursor, page_limit, utc_datetime,
+    ChatSession, ChatSessionSummary, Page, SourceDocumentAccess, decode_cursor, encode_cursor, page_limit, utc_datetime,
 )
 from agentic_rag.domain.models import RunStatus, UserScope
-from agentic_rag.persistence.repositories import agent_runs, chat_sessions, QueryRun, _run_from_row
+from agentic_rag.persistence.repositories import agent_runs, chat_sessions, documents, document_versions, QueryRun, _run_from_row
 from agentic_rag.runtime.ids import new_id
 
 
@@ -106,3 +106,14 @@ class SqlAlchemyChatSessionRepository:
         selected = rows[:limit]
         next_cursor = encode_cursor("turns", selected[-1]["created_at"], selected[-1]["id"]) if len(rows) > limit else None
         return Page(tuple(_run_from_row(dict(row)) for row in reversed(selected)), next_cursor)
+
+    async def source_documents(self, scope: UserScope, pairs: Sequence[tuple[str, str]]) -> dict[tuple[str, str], SourceDocumentAccess]:
+        if not pairs:
+            return {}
+        rows = (await self.session.execute(select(
+            documents.c.id, document_versions.c.id.label("version_id"), documents.c.filename, documents.c.active_version_id,
+        ).select_from(documents.join(document_versions, documents.c.id == document_versions.c.document_id)).where(
+            documents.c.user_id == scope.user_id, documents.c.status != "deleted", documents.c.deletion_status.is_(None),
+            tuple_(documents.c.id, document_versions.c.id).in_(pairs),
+        ))).mappings().all()
+        return {(row["id"], row["version_id"]): SourceDocumentAccess(row["id"], row["version_id"], row["filename"], row["active_version_id"]) for row in rows}

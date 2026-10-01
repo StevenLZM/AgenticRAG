@@ -91,3 +91,11 @@ def decode_cursor(value: str, kind: str) -> tuple[datetime, str]:
         return utc_datetime(stamp), request_uuid(payload[3])
     except (ValueError, TypeError, OverflowError, binascii.Error) as error:
         raise ValueError("invalid page cursor") from error
+
+
+@dataclass(frozen=True)
+class SourceDocumentAccess:
+    document_id: str
+    document_version_id: str
+    filename: str
+    active_version_id: str | None

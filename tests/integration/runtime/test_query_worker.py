@@ -102,7 +102,7 @@ class Runs:
         self.runs[run_id] = self.run
         return self.run.status
 
-    async def finish(self, run_id: str, status: RunStatus, result_ref: str | None, error_code: str | None, *, owner: str, claim_generation: int, answer: dict[str, object] | None = None) -> None:
+    async def finish(self, run_id: str, status: RunStatus, result_ref: str | None, error_code: str | None, *, owner: str, claim_generation: int, answer: dict[str, object] | None = None, answer_sources: dict[str, object] | None = None) -> None:
         del result_ref, error_code, owner, claim_generation
         assert run_id in self.runs
         self.finishes.append(status)
@@ -405,6 +405,7 @@ async def test_worker_does_not_emit_terminal_event_after_lease_loss() -> None:
             owner: str,
             claim_generation: int,
             answer: dict[str, object] | None = None,
+            answer_sources: dict[str, object] | None = None,
         ) -> None:
             del run_id, status, result_ref, error_code, owner, claim_generation, answer
             raise LeaseLost("run-1")
@@ -758,3 +759,30 @@ async def test_missing_graph_termination_fails_closed_after_maximum_attempts() -
 
     assert runs.finishes == [RunStatus.FAILED]
     assert broker.dead == ["1-0"]
+
+
+@pytest.mark.parametrize("damaged", [False, True])
+async def test_worker_persists_only_valid_sources_alongside_final_answer(damaged):
+    from agentic_rag.runtime.query_worker import QueryWorker
+    from tests.unit.query.test_answer_sources import answer, payload
+    packed = payload()
+    if damaged:
+        packed = packed.model_copy(update={"manifest": {}})
+    class Graph:
+        async def ainvoke(self, state, config):
+            return {"termination_reason": "completed", "answer": answer().model_dump(mode="json"),
+                    "packed_context": packed.model_dump(mode="json")}
+    class SourceRuns(Runs):
+        async def finish(self, *args, answer_sources=None, **kwargs):
+            self.saved_sources = answer_sources
+            await super().finish(*args, **kwargs)
+    runs = SourceRuns()
+    run = await runs.create_queued(SCOPE, "thread-1", SNAPSHOT, question="问")
+    broker = Broker(messages=[StreamMessage("1-0", run.id, datetime.now(UTC))])
+    await QueryWorker(runs=runs, broker=broker, graph_factory=lambda **_: Graph(), worker_id="w").run_one()
+    assert runs.finishes == [RunStatus.COMPLETED] and runs.answers[0]["audited"] is True
+    if damaged:
+        assert runs.saved_sources is None
+    else:
+        assert [item["evidence_id"] for item in runs.saved_sources["items"]] == ["e2", "e1"]
+        assert runs.saved_sources["run_id"] == run.id

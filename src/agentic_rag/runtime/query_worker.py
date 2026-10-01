@@ -11,6 +11,10 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from pydantic import ValidationError
+
+from agentic_rag.query.answer_sources import build_answer_sources, InvalidAnswerSources
+from agentic_rag.query.evidence_builder import PackedEvidence
 
 from agentic_rag.domain.models import RunStatus, UserScope
 from agentic_rag.observability.logging import (
@@ -359,6 +363,17 @@ class QueryWorker:
                     started_monotonic=started_monotonic,
                 )
                 return
+        sources = None
+        if terminal is RunStatus.COMPLETED and answer is not None:
+            try:
+                public = project_public_answer(answer)
+                packed = PackedEvidence.model_validate(result.get("packed_context"))
+                projection = build_answer_sources(public, packed, run_id=claim.id,
+                    snapshot_id=claim.runtime_config_snapshot_id) if public else None
+                sources = projection.model_dump(mode="json") if projection else None
+            except (ValidationError, InvalidAnswerSources, TypeError):
+                # Optional display projection cannot invalidate an audited answer.
+                sources = None
         await self._finish_and_ack(
             message,
             claim,
@@ -367,6 +382,7 @@ class QueryWorker:
             started_monotonic=started_monotonic,
             termination_reason=termination,
             answer=cast(dict[str, object] | None, answer),
+            answer_sources=sources,
         )
     async def run_forever(self, *, stop_event: asyncio.Event | None = None) -> None:
         stop = stop_event or asyncio.Event()
@@ -479,32 +495,14 @@ class QueryWorker:
         started_monotonic: float,
         termination_reason: str,
         answer: dict[str, object] | None = None,
+        answer_sources: dict[str, object] | None = None,
     ) -> None:
         try:
-            try:
-                await self._runs.finish(
-                    claim.id,
-                    status,
-                    None,
-                    error_code,
-                    owner=self._worker_id,
-                    claim_generation=claim.claim_generation,
-                    answer=answer,
-                )
-            except TypeError as error:
-                # Keep deployment-owned lightweight Run ports source-compatible
-                # while they migrate to the answer projection.  Do not swallow
-                # unrelated TypeErrors raised inside repository implementations.
-                if "unexpected keyword argument 'answer'" not in str(error):
-                    raise
-                await self._runs.finish(
-                    claim.id,
-                    status,
-                    None,
-                    error_code,
-                    owner=self._worker_id,
-                    claim_generation=claim.claim_generation,
-                )
+            await self._runs.finish(
+                claim.id, status, None, error_code,
+                owner=self._worker_id, claim_generation=claim.claim_generation,
+                answer=answer, answer_sources=answer_sources,
+            )
         except LeaseLost:
             # The lease fence is authoritative.  Leave the Redis delivery
             # pending for reclaim and do not append or acknowledge a terminal
