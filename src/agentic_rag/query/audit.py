@@ -11,7 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.observability.logging import emit_degradation
-from agentic_rag.models.schemas import EvidenceGrade
+from agentic_rag.models.schemas import EvidenceGrade, EvidenceGradeV2
+from agentic_rag.query.routing_context import RoutingContext
+from agentic_rag.query.routing_policy import RuntimeCapabilities
 from agentic_rag.persistence.repositories import ParentRepository
 from agentic_rag.query.evidence_builder import (
     EvidenceItem,
@@ -105,6 +107,10 @@ class ParentRepositoryAuthorizationResolver:
         }
 
 
+class EvidenceGradingUnavailable(RuntimeError):
+    """A technical grading failure, never a claim about document coverage."""
+
+
 class EvidenceGrader:
     """Light-model evidence coverage decision, conservative for empty evidence."""
 
@@ -118,8 +124,13 @@ class EvidenceGrader:
         *,
         scope: UserScope,
         snapshot: RuntimeConfigSnapshot,
+        routing_context: RoutingContext | None = None,
+        capabilities: RuntimeCapabilities | None = None,
     ) -> EvidenceGrade:
         if not packed_evidence.items or not packed_evidence.manifest:
+            if capabilities is not None:
+                return EvidenceGradeV2(decision="insufficient", gap_type="unknown",
+                                       gaps=("no verified evidence is available",))
             return EvidenceGrade(
                 decision="insufficient", gaps=("no verified evidence is available",)
             )
@@ -136,6 +147,8 @@ class EvidenceGrader:
                 "index_generation": packed_evidence.index_generation,
             },
             "user_scope": scope.model_dump(mode="json"),
+            "routing_context": routing_context.model_dump(mode="json") if routing_context else None,
+            "capabilities": capabilities.model_dump(mode="json") if capabilities else None,
         }
         call = ModelCall(
             model_role="light",
@@ -144,7 +157,7 @@ class EvidenceGrader:
             messages=(
                 {
                     "role": "system",
-                    "content": load_prompt("evidence_grader_v1").content,
+                    "content": load_prompt("evidence_grader_v2" if capabilities is not None else "evidence_grader_v1").content,
                 },
                 {
                     "role": "user",
@@ -155,13 +168,10 @@ class EvidenceGrader:
             ),
         )
         try:
-            response = await self._gateway.complete_structured(call, EvidenceGrade)
+            schema = EvidenceGradeV2 if capabilities is not None else EvidenceGrade
+            response = await self._gateway.complete_structured(call, schema)
             value = getattr(response, "value", response)
-            grade = (
-                value
-                if isinstance(value, EvidenceGrade)
-                else EvidenceGrade.model_validate(value)
-            )
+            grade = schema.model_validate(value)
             if grade.decision == "sufficient" and not packed_evidence.items:
                 return EvidenceGrade(
                     decision="insufficient", gaps=("no verified evidence is available",)
@@ -171,7 +181,9 @@ class EvidenceGrader:
             raise
         except (KeyboardInterrupt, SystemExit):
             raise
-        except Exception:
+        except Exception as error:
+            if capabilities is not None:
+                raise EvidenceGradingUnavailable("evidence_grader_unavailable") from error
             return EvidenceGrade(
                 decision="insufficient", gaps=("evidence grading unavailable",)
             )

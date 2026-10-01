@@ -15,6 +15,10 @@ from agentic_rag.query.evidence_builder import EvidenceBuilder, EvidenceCoverage
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.retrieval.graph import RetrievalService, RetrievalUnavailable
 from agentic_rag.retrieval.models import RetrievalRequest
+from agentic_rag.models.schemas import RouteAssessment
+from agentic_rag.query.audit import EvidenceGradingUnavailable
+from agentic_rag.query.routing_context import RoutingContext, reasoning_question
+from agentic_rag.query.routing_policy import RuntimeCapabilities, decide_grade, policy_update, technical_failure
 
 
 class EvidenceGrader(Protocol):
@@ -27,6 +31,8 @@ class EvidenceGrader(Protocol):
         *,
         scope: object,
         snapshot: object,
+        routing_context: RoutingContext | None = None,
+        capabilities: RuntimeCapabilities | None = None,
     ) -> EvidenceGrade | object: ...
 
 
@@ -37,6 +43,7 @@ class FastRagDependencies:
     retrieval: RetrievalService
     evidence_builder: EvidenceBuilder
     evidence_grader: EvidenceGrader
+    capabilities: RuntimeCapabilities | None = None
 
 
 async def run_fast_rag(
@@ -48,7 +55,7 @@ async def run_fast_rag(
         return {"next_node": "research_agent"}
     scope = scope_from_state(state)
     snapshot = snapshot_from_state(state)
-    question = question_from_state(state)
+    question = reasoning_question(state) if dependencies.capabilities is not None else question_from_state(state)
     request = RetrievalRequest(query=route.normalized_query)
     try:
         batch = await dependencies.retrieval.retrieve(request, scope, snapshot)
@@ -65,6 +72,9 @@ async def run_fast_rag(
             outcome="degraded",
             event_type="RETRIEVAL_DEGRADED",
         )
+        if dependencies.capabilities is not None:
+            return {**policy_update(state, technical_failure("retrieval_unavailable")),
+                    "errors": [*state.get("errors", []), {"code": "retrieval_unavailable"}]}
         return {
             "research": {"gaps": ["fast retrieval unavailable"]},
             "errors": [
@@ -83,14 +93,18 @@ async def run_fast_rag(
         "retrieval_batches": [batch.model_dump(mode="json")],
     }
     try:
+        kwargs = {}
+        if dependencies.capabilities is not None:
+            kwargs = {"capabilities": dependencies.capabilities, "routing_context": (
+                RoutingContext.model_validate(state["routing_context"]) if state.get("routing_context") else None)}
         grade = _grade(
             await dependencies.evidence_grader.grade(
-                question, packed, scope=scope, snapshot=snapshot
+                question, packed, scope=scope, snapshot=snapshot, **kwargs
             )
         )
     except asyncio.CancelledError:
         raise
-    except (OSError, TimeoutError, ConnectionError, ValidationError, TypeError, ValueError) as error:
+    except (OSError, TimeoutError, ConnectionError, ValidationError, TypeError, ValueError, EvidenceGradingUnavailable) as error:
         await emit_degradation(
             component="llm",
             reason="model_unavailable",
@@ -100,6 +114,9 @@ async def run_fast_rag(
             retryable=True,
             outcome="degraded",
         )
+        if dependencies.capabilities is not None:
+            return {**base, **policy_update(state, technical_failure("evidence_grader_unavailable")),
+                    "errors": [*state.get("errors", []), {"code": "evidence_grader_unavailable"}]}
         return {
             **base,
             "research": {"gaps": ["evidence grading unavailable"]},
@@ -109,6 +126,13 @@ async def run_fast_rag(
             ],
             "next_node": "research_agent",
         }
+    if dependencies.capabilities is not None:
+        assessment = RouteAssessment.model_validate(state["route_assessment"]) if state.get("route_assessment") else None
+        decision = decide_grade(grade, assessment, dependencies.capabilities,
+                                research_attempts=state.get("research_attempt_count", 0),
+                                max_research_rounds=snapshot.max_research_rounds)
+        return {**base, **policy_update(state, decision), "last_evidence_grade": grade.model_dump(mode="json"),
+                "research": {**state.get("research", {}), "gaps": list(grade.gaps)}}
     if grade.decision == "sufficient":
         return {**base, "next_node": "generate"}
     if grade.decision == "insufficient":
