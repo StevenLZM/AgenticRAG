@@ -296,9 +296,15 @@
     const answer = run.answer;
     const termination = terminalNoticeCode(run);
     const presentation = answerPresentation(run);
+    const isChat = presentation && presentation.provenance.route === "chat";
+    // Validated chat explanations are final replies, not unaudited RAG drafts.
+    const chatExplanation = isChat && run.status === "completed" && !run.error_code
+      && ["cannot_answer", "clarify"].includes(answer.status);
     activeRoute = safeRoute(answer && answer.route) || activeRoute;
     answerSettled = !!presentation || !!termination || ["completed", "failed", "cancelled"].includes(run.status);
-    if (termination) {
+    if (chatExplanation) {
+      renderObject(elements.answer, presentation.text, "未返回可展示的回答。");
+    } else if (termination) {
       renderSafeTerminalNotice(termination);
     } else if (presentation) {
       renderObject(elements.answer, presentation.text, "未返回可展示的回答。");
@@ -309,7 +315,6 @@
     } else {
       setText(elements.answer, ROUTE_WAITING[activeRoute] || "正在处理消息…");
     }
-    const isChat = presentation && presentation.provenance.route === "chat";
     renderObject(elements.evidence, isChat ? "不适用：聊天回复不引用文档证据。" : presentation && presentation.evidence, "服务端响应中暂无可展示的证据。");
     renderObject(elements.audit, isChat ? "不适用：聊天回复不进行文档证据审计。" : presentation && presentation.audit, "服务端响应中暂无审计信息。");
     renderObject(elements.provenance, presentation && presentation.provenance, "服务端响应中暂无溯源信息。");

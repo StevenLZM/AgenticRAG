@@ -282,3 +282,84 @@ def test_console_route_timeline_and_chat_dom_flow() -> None:
         ["node", str(Path(__file__).with_name("console_flow.cjs")), str(CONSOLE_PATH)],
         check=True, capture_output=True, text=True,
     )
+
+
+def _terminal_dom(answer: dict, mode: str, *, events: list | None = None, **run_fields) -> dict:
+    completed = subprocess.run(
+        ["node", str(Path(__file__).with_name("console_terminal_flow.cjs")), str(CONSOLE_PATH)],
+        input=json.dumps({
+            "run": {"run_id": "run-terminal", "status": "completed", "error_code": None,
+                    "answer": answer, **run_fields},
+            "mode": mode, "events": events or [],
+        }),
+        check=True, capture_output=True, text=True, timeout=5,
+    )
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.parametrize("mode", ["load", "sync", "stream"])
+@pytest.mark.parametrize(("status", "text"), [
+    ("cannot_answer", "目前尚未接入实时数据或外部查询服务，无法核实你请求的信息。"),
+    ("clarify", "我可以分析已上传的资料，但目前无法查询外部实时信息。是否先分析文档部分？"),
+    ("cannot_answer", "本次处理所需的服务暂时不可用，未能完成回答，请稍后重试。"),
+])
+def test_console_preserves_safe_chat_terminal_explanation(mode, status, text) -> None:
+    answer = {"route": "chat", "status": status, "audited": None,
+              "segments": [{"kind": "content", "text": text, "evidence_ids": []}],
+              "evidence_parent_ids": [], "citation_coverage": None}
+
+    for view in _terminal_dom(answer, mode).values():
+        assert view["text"] == text
+        assert view["notice"] is None
+        assert "不适用" in view["evidence"]
+        assert "不适用" in view["audit"]
+
+
+@pytest.mark.parametrize("mode", ["load", "sync", "stream"])
+@pytest.mark.parametrize("overrides", [
+    {"segments": []},
+    {"audited": True},
+    {"evidence_parent_ids": ["parent-1"]},
+    {"citation_coverage": 1},
+    {"segments": [{"kind": "content", "text": "unsafe draft", "evidence_ids": ["e1"]}]},
+    {"route": "fast_rag"},
+    {"route": "research", "audited": True},
+])
+def test_console_terminal_fallback_still_blocks_unsafe_or_rag_drafts(mode, overrides) -> None:
+    answer = {"route": "chat", "status": "cannot_answer",
+              "segments": [{"kind": "content", "text": "unsafe draft", "evidence_ids": []}],
+              **overrides}
+
+    for view in _terminal_dom(answer, mode).values():
+        assert view["text"] == "现有证据不足以安全回答，系统未展示草稿。"
+        assert view["notice"] == view["text"]
+
+
+@pytest.mark.parametrize("status", ["audit_failed", "refuse", "research_round_limit", "research_action_invalid"])
+def test_console_chat_route_does_not_bypass_other_terminal_guards(status) -> None:
+    answer = {"route": "chat", "status": status,
+              "segments": [{"kind": "content", "text": "unsafe draft", "evidence_ids": []}]}
+
+    for view in _terminal_dom(answer, "stream").values():
+        assert "unsafe draft" not in view["text"]
+        assert view["notice"] == view["text"]
+
+
+def test_console_chat_explanation_preserves_unrelated_degradation_notice() -> None:
+    answer = {"route": "chat", "status": "cannot_answer",
+              "segments": [{"kind": "content", "text": "尚未接入实时服务。", "evidence_ids": []}]}
+    events = [{"event_type": "COMPONENT_DEGRADED", "summary": "degraded"}]
+
+    for view in _terminal_dom(answer, "stream", events=events).values():
+        assert view["text"] == "尚未接入实时服务。"
+        assert view["notice"] == "部分组件已降级，回答可能受影响。"
+
+
+@pytest.mark.parametrize("run_fields", [{"status": "failed"}, {"status": "cancelled"}, {"error_code": "audit_failed"}])
+def test_console_chat_explanation_does_not_hide_run_failure(run_fields) -> None:
+    answer = {"route": "chat", "status": "cannot_answer",
+              "segments": [{"kind": "content", "text": "unsafe draft", "evidence_ids": []}]}
+
+    for view in _terminal_dom(answer, "load", **run_fields).values():
+        assert "unsafe draft" not in view["text"]
+        assert view["notice"] == view["text"]
