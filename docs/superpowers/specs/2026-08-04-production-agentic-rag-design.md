@@ -257,19 +257,25 @@ Clarify 与 Refuse 路径不生成知识性答案，因此不进入 Faithfulness
 
 ### 5.1 路由
 
-路由使用 `deepseek-v4-flash` 输出结构化结果：
+> 2026-10-01 修订方案已记录于[信息来源路由与检索升级控制设计](./2026-10-01-capability-aware-routing-design.md)，书面设计待审阅，尚未实现。该方案以“所需信息来源 + 当前实际能力 + 检索复杂度”替代直接选择快慢检索，保留一次分类模型任务；tool/MCP 权限治理明确延期，现有数据隔离保持不变。
+
+修订前实现使用轻量模型输出结构化结果（实际模型以运行配置快照为准）：
 
 ```text
-route: fast_rag | research
+route: chat | fast_rag | research
 normalized_query: string
 reason_code: string
 ```
+
+拟议修订增加 `RouteAssessment`（required_sources、retrieval_complexity、needs_clarification 等），由服务端策略派生最终路由。无实时执行能力的天气问题应进入受控 Chat 能力说明；上传天气报告仍进入知识库；混合请求保留完整意图并澄清。完整状态、错误处理、兼容和真实模型验收口径以上述修订文档为准，不能将其视为当前已上线行为。
 
 V1 不设置单独的结构化 SQL 路由。结构化 Metadata 只作为 Dense 与 BM25 的 Filter；MySQL 只由内部 Repository 获取 Parent。
 
 ### 5.2 Fast RAG
 
-Fast RAG 只执行一次 RetrievalPipelineGraph。Evidence Grader 判定不足时自动升级到 ResearchAgentLoop，而不是直接生成低质量答案。
+Fast RAG 只执行一次 RetrievalPipelineGraph。修订前实现对 Evidence Grader 的 `insufficient` 自动升级到 ResearchAgentLoop；2026-09-28 天气请求证明，缺少外部实时能力时这种升级会导致无效重复检索。
+
+2026-10-01 拟议修订将不足原因结构化，并让 Fast RAG 与 Research 后评估共用升级策略：相关证据不完整或需要多步分析时，按现有预算继续研究；明确缺少不可执行的外部来源时，停止并说明能力限制；指代不清时澄清。单次不相关召回不代表全库无答案，知识库证据缺失也不得转为通用模型猜测。技术故障与语义缺口分别处理，不再以启动研究循环替代故障重试。此项仍待实现和回归验证。
 
 ### 5.3 状态
 
