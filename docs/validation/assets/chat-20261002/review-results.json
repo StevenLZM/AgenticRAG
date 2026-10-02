@@ -1,0 +1,11 @@
+{
+  "status": "PASS",
+  "browser": "154.0.8037.93",
+  "checks": [
+    "cached history gap fills chronologically, preserving viewport anchor and expanded sources",
+    "real HttpError 410 clears deleted creation key; next explicit click creates a fresh session",
+    "503 readiness preserves dependency diagnostics in system drawer",
+    "real SESSION_BUSY catch-up observes the other tab and inserts missed turns chronologically",
+    "mobile tools close restores focus to visible navigation"
+  ]
+}

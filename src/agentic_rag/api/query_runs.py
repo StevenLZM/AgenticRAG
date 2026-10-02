@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from agentic_rag.api.errors import ApiException
 from agentic_rag.api.query_context import request_scope as _scope, runtime_snapshot as _snapshot, require_dependency as _dependency
+from agentic_rag.domain.chat_sessions import utc_datetime
 from agentic_rag.domain.models import RunStatus
 from agentic_rag.observability.logging import sanitize_attributes, sanitize_summary
 from agentic_rag.persistence.repositories import ActiveRunConflict, AgentEvent, QueryRun
@@ -53,6 +54,7 @@ class QueryRunResponse(BaseModel):
     thread_id: str
     runtime_config_snapshot_id: str
     question: str = ""
+    created_at: str | None = None
     result_ref: str | None = None
     error_code: str | None = None
     answer: PublicAnswer | None = None
@@ -73,6 +75,10 @@ class QueryRunResponse(BaseModel):
             thread_id=run.thread_id,
             runtime_config_snapshot_id=run.runtime_config_snapshot_id,
             question=run.question,
+            created_at=(
+                utc_datetime(run.created_at).isoformat(timespec="microseconds").replace("+00:00", "Z")
+                if run.created_at else None
+            ),
             result_ref=run.result_ref,
             error_code=run.error_code,
             answer=answer,
@@ -229,20 +235,15 @@ async def get_query_run(request: Request, run_id: str, response: Response) -> Qu
 
 @query_runs_router.post("/query-runs/{run_id}/cancel", response_model=QueryRunResponse)
 async def cancel_query_run(request: Request, run_id: str) -> QueryRunResponse:
-    run = await _owned_run(request, run_id)
+    await _owned_run(request, run_id)
     manager = _dependency(request, "run_manager")
     try:
-        updated_status = await manager.request_cancel(_scope(request), run_id)
+        await manager.request_cancel(_scope(request), run_id)
     except ActiveRunConflict:
-        updated_status = run.status
-    return QueryRunResponse.from_run(replace_run_status(run, updated_status))
-
-
-def replace_run_status(run: QueryRun, status_value: RunStatus) -> QueryRun:
-    """Keep cancellation responses portable across lightweight Run fakes."""
-    from dataclasses import replace
-
-    return replace(run, status=status_value, active_slot=1 if status_value in {RunStatus.QUEUED, RunStatus.RUNNING, RunStatus.CANCEL_REQUESTED} else None)
+        pass
+    # Completion may win the cancellation race. Read its durable payload as well
+    # as its status, and recheck access if the session was deleted meanwhile.
+    return QueryRunResponse.from_run(await _owned_run(request, run_id))
 
 
 @query_runs_router.get("/query-runs/{run_id}/events")

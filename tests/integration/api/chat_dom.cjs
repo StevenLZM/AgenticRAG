@@ -44,6 +44,20 @@ class Element {
       this.children.push(n);
     }
   }
+  getBoundingClientRect() {
+    return { top: 0, bottom: 0 };
+  }
+  insertBefore(node, reference) {
+    node.remove();
+    node.parentElement = this;
+    const index =
+      reference === null
+        ? this.children.length
+        : this.children.indexOf(reference);
+    if (index < 0) throw new Error("Reference is not a child");
+    this.children.splice(index, 0, node);
+    return node;
+  }
   appendChild(n) {
     this.append(n);
     return n;

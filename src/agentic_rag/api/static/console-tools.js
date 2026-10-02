@@ -19,9 +19,10 @@
       e.className = className || "";
       return e;
     }
-    async function request(url, options = {}) {
+    async function request(url, options = {}, acceptedStatuses = []) {
       const response = await fetchImpl(url, { cache: "no-store", ...options });
-      if (!response.ok) throw new Error("服务暂时不可用，请稍后重试。");
+      if (!response.ok && !acceptedStatuses.includes(response.status))
+        throw new Error("服务暂时不可用，请稍后重试。");
       return response.status === 204 ? null : response.json();
     }
     function close() {
@@ -75,7 +76,7 @@
         const [summary, live, ready] = await Promise.all([
           request("/v1/runtime/summary"),
           request("/health/live"),
-          request("/health/ready"),
+          request("/health/ready", {}, [503]),
         ]);
         if (stamp !== generation) return;
         byId("health-status").textContent =
@@ -197,11 +198,11 @@
       () => void loadMemories(),
     );
     return {
-      open(next) {
+      open(next, returnFocus = document.activeElement) {
         if (!["documents", "memory", "system"].includes(next)) return;
         generation++;
         kind = next;
-        focusBefore = document.activeElement;
+        focusBefore = returnFocus;
         for (const value of ["documents", "memory", "system"])
           byId(`${value}-tool`).hidden = value !== next;
         byId("tools-title").textContent = {

@@ -1,0 +1,27 @@
+{
+  "base_commit": "a6d500f",
+  "date": "2026-10-02",
+  "chat_regression": {
+    "passed": 1203,
+    "skipped": 5,
+    "failed": 0,
+    "skip_reason": "SQLite concurrent cases; MySQL counterparts executed"
+  },
+  "real_query_pipeline": {
+    "passed": 5,
+    "failed": 0,
+    "providers": "deterministic"
+  },
+  "full_suite_comparison": {
+    "passed": 1267,
+    "skipped": 38,
+    "failed": 9,
+    "baseline_failures": "same 3 ParentFetchFixture API and 6 logger/caplog failures as prior validation",
+    "note": "Subsequent additive created_at contract covered by final chat regression"
+  },
+  "browser": {
+    "existing_groups": 12,
+    "additional_groups": 5,
+    "uncaught_errors": 0
+  }
+}

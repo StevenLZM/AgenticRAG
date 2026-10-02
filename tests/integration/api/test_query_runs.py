@@ -650,3 +650,42 @@ async def test_run_phase_is_safe_optional_and_never_overrides_terminal(status_va
         app.state.container.query_phase_reader = Reader()
         live = await client.get("/v1/query-runs/run-1")
         assert live.json()["phase"] == ("auditing" if status_value == RunStatus.RUNNING else None)
+
+
+@pytest.mark.integration
+async def test_cancel_racing_completion_returns_durable_answer() -> None:
+    final_answer = {
+        "route": "chat",
+        "audited": None,
+        "segments": [{"kind": "content", "text": "Final answer", "evidence_ids": []}],
+    }
+
+    class CompletesDuringCancel(FakeRunManager):
+        async def request_cancel(self, scope: UserScope, run_id: str) -> RunStatus:
+            self.runs[run_id] = replace(
+                self.runs[run_id], status=RunStatus.COMPLETED,
+                active_slot=None, answer=final_answer,
+            )
+            return RunStatus.COMPLETED
+
+    app, _, _, _ = _app(CompletesDuringCancel(runs={"run-1": _run(status=RunStatus.RUNNING)}))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        cancelled = await client.post("/v1/query-runs/run-1/cancel")
+        durable = await client.get("/v1/query-runs/run-1")
+    assert cancelled.status_code == 200
+    assert cancelled.json() == durable.json()
+    assert cancelled.json()["answer"]["segments"][0]["text"] == "Final answer"
+
+
+@pytest.mark.integration
+async def test_run_observation_preserves_microsecond_chronology() -> None:
+    created = datetime(2026, 10, 2, 1, 2, 3, 123456, tzinfo=UTC)
+    runs = FakeRunManager(runs={"run-1": replace(_run(), created_at=created)})
+    app, _, _, _ = _app(runs)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test",
+    ) as client:
+        response = await client.get("/v1/query-runs/run-1")
+    assert response.json().get("created_at") == "2026-10-02T01:02:03.123456Z"

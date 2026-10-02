@@ -12,6 +12,7 @@ STATIC = Path(__file__).resolve().parents[3] / "src/agentic_rag/api/static"
     "script",
     [
         "chat_state.cjs",
+        "chat_tools.cjs",
         "chat_transport.cjs",
         "chat_view_flow.cjs",
         "chat_recovery_flow.cjs",
@@ -28,7 +29,23 @@ def test_chat_client_contract(script):
 
 
 @pytest.mark.parametrize(
-    "case", ["lateCancel", "crossSessionCancel", "historySwitch", "deletedCreation"]
+    "case",
+    [
+        "lateCancel",
+        "crossSessionCancel",
+        "historySwitch",
+        "deletedCreation",
+        "lateSubmissionCheck",
+        "lateSubmissionError",
+        "deleteNavigation",
+        "historyGap",
+        "revokedObservation",
+        "foregroundDuringSubmit",
+        "overlappingForegroundRefresh",
+        "acknowledgedAfterReopen",
+        "missedTurnCatchup",
+        "revokedSubmission",
+    ],
 )
 def test_chat_controller_lifecycle(case):
     result = subprocess.run(

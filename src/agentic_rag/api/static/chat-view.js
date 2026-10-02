@@ -116,12 +116,40 @@
       records.set(turn.run_id, record);
       return record;
     }
-    function updateTurn(turn, follow = true) {
+    function preserveViewport() {
+      const before = scroll.scrollHeight,
+        top = scroll.scrollTop,
+        viewportTop = scroll.getBoundingClientRect().top,
+        anchor = [...list.children].find(
+          (node) => node.getBoundingClientRect().bottom > viewportTop,
+        ),
+        anchorTop = anchor?.getBoundingClientRect().top;
+      return () => {
+        scroll.scrollTop =
+          top +
+          (anchor
+            ? anchor.getBoundingClientRect().top - anchorTop
+            : scroll.scrollHeight - before);
+      };
+    }
+    function insertRecord(runId, record, order) {
+      const nextId = order
+        ?.slice(order.indexOf(runId) + 1)
+        .find((id) => records.has(id));
+      const next =
+        records.get(nextId)?.user || records.get("pending")?.user || null;
+      list.insertBefore(record.user, next);
+      list.insertBefore(record.assistant, next);
+    }
+    function updateTurn(turn, follow = true, orderedRunIds) {
       const shouldFollow = follow && nearBottom();
       let record = records.get(turn.run_id);
+      const restore =
+        !record && !shouldFollow && orderedRunIds ? preserveViewport() : null;
       if (!record) {
         record = makeTurn(turn);
-        list.append(record.user, record.assistant);
+        if (orderedRunIds) insertRecord(turn.run_id, record, orderedRunIds);
+        else list.append(record.user, record.assistant);
       }
       record.question.textContent =
         turn.question || record.question.textContent;
@@ -139,6 +167,7 @@
       record.button.hidden = !answerPresentation(turn)?.hasSources;
       byId("chat-empty").hidden = list.children.length > 0;
       if (shouldFollow) scrollToLatest();
+      else restore?.();
     }
     function clearPending() {
       const pending = records.get("pending");
@@ -166,18 +195,20 @@
       byId("chat-empty").hidden = list.children.length > 0;
       byId("older-turns").hidden = !session.historyCursor;
     }
-    function prependTurns(turns) {
-      const before = scroll.scrollHeight,
-        top = scroll.scrollTop,
-        nodes = [];
+    function prependTurns(turns, orderedRunIds) {
+      const restore = preserveViewport();
+      // Retain existing DOM/source expansion when filling gaps between cached pages.
+      const order = orderedRunIds || [
+        ...turns.map((turn) => turn.run_id),
+        ...records.keys(),
+      ];
       for (const turn of turns) {
         if (records.has(turn.run_id)) continue;
-        const r = makeTurn(turn);
+        const record = makeTurn(turn);
         updateTurn(turn, false);
-        nodes.push(r.user, r.assistant);
+        insertRecord(turn.run_id, record, order);
       }
-      list.prepend(...nodes);
-      scroll.scrollTop = top + (scroll.scrollHeight - before);
+      restore();
     }
     function renderSessionList(items, selectedId) {
       const target = byId("session-list"),

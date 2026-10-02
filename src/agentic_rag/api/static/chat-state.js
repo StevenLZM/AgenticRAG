@@ -40,6 +40,7 @@
         activeRunId: null,
         eventCursor: 0,
         loaded: false,
+        runRevision: 0,
       });
     return state.sessions.get(id);
   }
@@ -71,6 +72,7 @@
       return false;
     const merged = { ...previous, ...turn };
     if (isTerminal(merged)) merged.phase = null;
+    session.runRevision++;
     session.turns.set(turn.run_id, merged);
     session.orderedRunIds = [...session.turns.values()]
       .sort(compareTurns)

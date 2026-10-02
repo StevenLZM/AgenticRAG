@@ -4,6 +4,7 @@ const path = require("node:path");
 const { fromFile, flush } = require("./chat_dom.cjs");
 const dir = process.argv[2];
 const { createChatController } = require(path.join(dir, "app.js"));
+const { createChatApi, HttpError } = require(path.join(dir, "chat-api.js"));
 const deferred = () => {
   let resolve, reject;
   const promise = new Promise((yes, no) => {
@@ -38,6 +39,7 @@ function setup({ resume = null } = {}) {
     { session_id: "s2", title: "B", active_run_id: "b1" },
   ];
   const histories = { s1: [turn("r1")], s2: [turn("b1")] };
+  const listeners = {};
   const watches = [],
     creates = [];
   const api = {
@@ -63,9 +65,12 @@ function setup({ resume = null } = {}) {
     api,
     storage,
     window: {
-      addEventListener() {},
+      addEventListener(name, fn) {
+        listeners[name] = fn;
+      },
       removeEventListener() {},
       matchMedia: () => ({ matches: false }),
+      confirm: () => true,
     },
     tools: { open() {}, dispose() {} },
     uuid: () => `fresh-${++sequence}`,
@@ -73,6 +78,7 @@ function setup({ resume = null } = {}) {
   return {
     document,
     api,
+    listeners,
     controller,
     histories,
     sessions,
@@ -201,15 +207,20 @@ async function deletedCreation() {
       sessions: [],
     }),
   });
-  h.api.createSession = async (key) => {
-    h.creates.push(key);
-    if (key === "deleted-key")
-      throw Object.assign(new Error("deleted"), {
-        status: 410,
-        code: "SESSION_GONE",
-      });
-    return h.sessions[0];
-  };
+  h.api.createSession = createChatApi({
+    fetchImpl: async (_, options) => {
+      const key = JSON.parse(options.body).creation_request_id;
+      h.creates.push(key);
+      return new Response(
+        JSON.stringify(
+          key === "deleted-key"
+            ? { error_code: "SESSION_GONE" }
+            : h.sessions[0],
+        ),
+        { status: key === "deleted-key" ? 410 : 201 },
+      );
+    },
+  }).createSession;
   await h.controller.start();
   assert.deepEqual(
     h.creates,
@@ -227,7 +238,293 @@ async function deletedCreation() {
   assert.equal(h.controller.state.selectedSessionId, "s1");
   h.controller.dispose();
 }
+function draft(h, text) {
+  const input = h.document.getElementById("query-input");
+  input.value = text;
+  input.dispatchEvent({ type: "input" });
+}
+async function lateSubmissionCheck() {
+  const h = setup(),
+    first = deferred(),
+    second = deferred();
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [];
+  h.api.submitTurn = async () => {
+    throw new TypeError("connection lost");
+  };
+  let calls = 0;
+  h.api.findSubmission = () => (++calls === 1 ? first.promise : second.promise);
+  await h.controller.start();
+  draft(h, "第一轮");
+  await h.controller.send();
+  const p1 = h.controller.checkSubmission(),
+    p2 = h.controller.checkSubmission();
+  first.resolve({ ...turn("r1", "completed"), answer });
+  await p1;
+  h.api.submitTurn = async (_, question, key) => ({
+    ...turn("r2"),
+    question,
+    client_request_id: key,
+  });
+  draft(h, "第二轮");
+  await h.controller.send();
+  const secondWatch = h.watches.at(-1);
+  second.resolve(turn("r1"));
+  await p2;
+  assert.equal(
+    secondWatch.signal.aborted,
+    false,
+    "late R1 check must not stop R2",
+  );
+  assert.equal(h.watches.at(-1).runId, "r2");
+  h.controller.dispose();
+}
+async function lateSubmissionError() {
+  const h = setup(),
+    first = deferred(),
+    second = deferred();
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [];
+  h.api.submitTurn = async () => {
+    throw new TypeError("connection lost");
+  };
+  let calls = 0;
+  h.api.findSubmission = () => (++calls === 1 ? first.promise : second.promise);
+  await h.controller.start();
+  draft(h, "第一轮");
+  await h.controller.send();
+  const p1 = h.controller.checkSubmission(),
+    p2 = h.controller.checkSubmission();
+  first.resolve({ ...turn("r1", "completed"), answer });
+  await p1;
+  draft(h, "第二轮");
+  await h.controller.send();
+  const notice = h.document.getElementById("chat-notice").textContent;
+  second.reject(new HttpError(404, "NOT_FOUND"));
+  await p2;
+  assert.equal(
+    h.document.getElementById("chat-notice").textContent,
+    notice,
+    "late R1 error must not replace R2 submission notice",
+  );
+  assert.match(
+    h.document.getElementById("chat-messages").textContent,
+    /第二轮/,
+  );
+  h.controller.dispose();
+}
+async function deleteNavigation() {
+  const h = setup(),
+    refresh = deferred();
+  await h.controller.start();
+  h.api.deleteSession = async () => null;
+  h.api.listSessions = () => refresh.promise;
+  h.document.getElementById("delete-chat").click();
+  await flush();
+  await h.controller.selectSession("s2");
+  refresh.resolve({
+    items: [
+      { session_id: "s3", title: "C", active_run_id: null },
+      h.sessions[1],
+    ],
+    next_cursor: null,
+  });
+  await flush();
+  assert.equal(
+    h.controller.state.selectedSessionId,
+    "s2",
+    "delete completion must not override later navigation",
+  );
+  h.controller.dispose();
+}
+async function historyGap() {
+  const h = setup();
+  const completed = (n) => ({
+    ...turn(`r${n}`, "completed"),
+    answer,
+    created_at: `2026-10-01T00:00:0${n}.000000Z`,
+  });
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [completed(1), completed(2)];
+  await h.controller.start();
+  await h.controller.selectSession("s2");
+  h.histories.s1 = [completed(5), completed(6)];
+  await h.controller.selectSession("s1");
+  h.api.listTurns = async () => ({
+    items: [completed(3), completed(4)],
+    next_cursor: "older",
+  });
+  h.document.getElementById("older-turns").click();
+  await flush();
+  const ids = h.document
+    .getElementById("chat-messages")
+    .querySelectorAll('[data-role="user"]')
+    .map((e) => e.dataset.runId);
+  assert.deepEqual(
+    ids,
+    ["r1", "r2", "r3", "r4", "r5", "r6"],
+    "paginated history must remain chronological across cached page gaps",
+  );
+  h.controller.dispose();
+}
+async function revokedObservation() {
+  const h = setup(),
+    watch = deferred();
+  h.api.watchRun = () => watch.promise;
+  await h.controller.start();
+  draft(h, "下一问");
+  watch.reject(new HttpError(410, "SESSION_GONE"));
+  await flush();
+  assert.equal(
+    h.document.getElementById("chat-messages").children.length,
+    0,
+    "known revoked session must clear the transcript",
+  );
+  assert.equal(h.document.getElementById("send-button").disabled, true);
+  assert.equal(h.saved().selectedSessionId, null);
+  h.controller.dispose();
+}
+async function foregroundDuringSubmit() {
+  const h = setup(),
+    response = deferred(),
+    snapshot = deferred();
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [];
+  await h.controller.start();
+  h.api.submitTurn = () => response.promise;
+  draft(h, "新问题");
+  const sending = h.controller.send();
+  h.api.getSession = () => snapshot.promise;
+  h.listeners.focus();
+  await flush();
+  response.resolve({ ...turn("r2"), question: "新问题" });
+  await sending;
+  snapshot.resolve({ session_id: "s1", title: "A", active_run_id: null });
+  await flush();
+  draft(h, "下一问");
+  assert.equal(
+    h.controller.state.sessions.get("s1").activeRunId,
+    "r2",
+    "foreground snapshot predating POST acknowledgement must not clear the new run",
+  );
+  assert.equal(h.document.getElementById("send-button").disabled, true);
+  assert.equal(h.watches.at(-1).signal.aborted, false);
+  h.controller.dispose();
+}
+async function overlappingForegroundRefresh() {
+  const h = setup(),
+    response = deferred(),
+    snapshot = deferred();
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [];
+  await h.controller.start();
+  h.api.submitTurn = () => response.promise;
+  draft(h, "新问题");
+  const sending = h.controller.send();
+  h.api.getSession = () => snapshot.promise;
+  h.listeners.focus();
+  h.listeners.focus();
+  await flush();
+  response.resolve({ ...turn("r2", "completed"), answer });
+  await sending;
+  snapshot.resolve({ session_id: "s1", title: "A", active_run_id: null });
+  await flush();
+  draft(h, "下一问");
+  assert.equal(
+    h.document.getElementById("send-button").disabled,
+    false,
+    "overlapping foreground refreshes must not leave a finished session disabled",
+  );
+  h.controller.dispose();
+}
+async function acknowledgedAfterReopen() {
+  const h = setup(),
+    response = deferred(),
+    lookup = deferred();
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [];
+  await h.controller.start();
+  h.api.submitTurn = () => response.promise;
+  h.api.findSubmission = () => lookup.promise;
+  draft(h, "新问题");
+  const sending = h.controller.send();
+  await h.controller.selectSession("s2");
+  const opening = h.controller.selectSession("s1");
+  await flush();
+  response.resolve({ ...turn("r2"), question: "新问题" });
+  await sending;
+  lookup.resolve({ ...turn("r2"), question: "新问题" });
+  await opening;
+  const session = h.controller.state.sessions.get("s1");
+  assert.equal(
+    session.activeRunId,
+    "r2",
+    "accepted run must reach the reopened view",
+  );
+  assert.equal(session.turns.has("r2"), true);
+  assert.equal(h.watches.at(-1).runId, "r2");
+  assert.equal(
+    h.document
+      .getElementById("chat-messages")
+      .querySelectorAll('[data-run-id="pending"]').length,
+    0,
+  );
+  h.controller.dispose();
+}
+async function missedTurnCatchup() {
+  const h = setup();
+  const complete = (n) => ({
+    ...turn(`r${n}`, "completed"),
+    answer,
+    created_at: `2026-10-01T00:00:0${n}.000000Z`,
+  });
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [complete(1)];
+  await h.controller.start();
+  h.api.submitTurn = async () => {
+    throw new HttpError(409, "SESSION_BUSY", "/v1/query-runs/r3");
+  };
+  draft(h, "新问题");
+  await h.controller.send();
+  const watch = h.watches.at(-1);
+  await watch.onRun({ ...complete(3), status: "running", answer: null });
+  h.histories.s1 = [complete(1), complete(2), complete(3)];
+  await watch.onRun(complete(3));
+  assert.deepEqual(
+    h.document
+      .getElementById("chat-messages")
+      .querySelectorAll('[data-role="user"]')
+      .map((e) => e.dataset.runId),
+    ["r1", "r2", "r3"],
+  );
+  h.controller.dispose();
+}
+async function revokedSubmission() {
+  const h = setup();
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [{ ...turn("r1", "completed"), answer }];
+  await h.controller.start();
+  h.api.submitTurn = async () => {
+    throw new HttpError(410, "SESSION_GONE");
+  };
+  draft(h, "下一问");
+  await h.controller.send();
+  assert.equal(h.controller.state.selectedSessionId, null);
+  assert.equal(h.document.getElementById("chat-messages").children.length, 0);
+  assert.equal(h.document.getElementById("send-button").disabled, true);
+  h.controller.dispose();
+}
 const cases = {
+  revokedSubmission,
+  missedTurnCatchup,
+  acknowledgedAfterReopen,
+  overlappingForegroundRefresh,
+  foregroundDuringSubmit,
+  lateSubmissionCheck,
+  lateSubmissionError,
+  deleteNavigation,
+  historyGap,
+  revokedObservation,
   lateCancel,
   crossSessionCancel,
   historySwitch,

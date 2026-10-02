@@ -1,0 +1,18 @@
+{
+  "status": "PASS",
+  "browser": "154.0.8037.93",
+  "checks": [
+    "1440px three chronological turns, final-only answers, per-answer collapsed sources",
+    "rename and answer-bound AST source page",
+    "switch preserves background completion and separate draft",
+    "refresh resumes same Run with no duplicate submission",
+    "stop waits for durable cancelled state",
+    "older reading position and return to latest",
+    "Chinese composition Enter guard and Shift+Enter newline",
+    "late source response cannot cross session boundary",
+    "four SSE failures fall back to GET polling",
+    "open source reauthorization removes deleted document excerpts",
+    "390px no horizontal overflow, hidden sidebar focus isolation, Tab trap and Escape restore",
+    "no uncaught browser JavaScript errors"
+  ]
+}

@@ -40,6 +40,7 @@
     const openSources = new Map();
     const pendingCancellations = new Set();
     const loadingHistoryViews = new Set();
+    const refreshingViews = new Set();
     const current = () =>
       state.selectedSessionId
         ? S.sessionState(state, state.selectedSessionId)
@@ -60,6 +61,7 @@
         canSend:
           !!session &&
           session.loaded &&
+          !refreshingViews.has(token?.generation) &&
           !session.activeRunId &&
           !session.pendingSubmission,
         canStop: !!session?.activeRunId,
@@ -73,6 +75,11 @@
       byId("retry-submission").hidden = !pending?.question;
       byId("rename-chat").disabled = !session;
       byId("delete-chat").disabled = !session;
+    }
+    function renderTurn(runId) {
+      const session = current(),
+        run = session?.turns.get(runId);
+      if (run) view.updateTurn(run, true, session.orderedRunIds);
     }
     function renderList() {
       view.renderSessionList([...summaries.values()], state.selectedSessionId);
@@ -107,6 +114,40 @@
       sourceGeneration++;
       for (const id of openSources.keys()) view.setSourcesOpen(id, false);
       openSources.clear();
+    }
+    function invalidateSession(t) {
+      if (!valid(t)) return;
+      stopObservation();
+      viewAbort?.abort();
+      clearSources();
+      state.sessions.delete(t.sessionId);
+      summaries.delete(t.sessionId);
+      token = S.activateSession(state, null);
+      view.renderSession({
+        turns: new Map(),
+        orderedRunIds: [],
+        historyCursor: null,
+      });
+      renderList();
+      updateComposer();
+      save();
+    }
+    const ownsSubmission = (t, pending) =>
+      state.sessions.get(t.sessionId)?.pendingSubmission?.requestId ===
+      pending.requestId;
+    function acceptSubmission(t, pending, turn) {
+      if (!ownsSubmission(t, pending)) return;
+      S.acknowledgeSubmission(state, t.sessionId, pending.requestId);
+      save();
+      // The same session may have been reopened while its POST was in flight.
+      const visible = token;
+      if (!valid(visible) || visible.sessionId !== t.sessionId) return;
+      view.clearPending();
+      if (S.applyRun(state, visible, turn)) renderTurn(turn.run_id);
+      view.notice("");
+      updateComposer();
+      save();
+      if (!S.isTerminal(turn)) observe(turn.run_id, visible);
     }
     async function authorizeSource(runId, t, stamp) {
       const generation = sourceGeneration;
@@ -164,8 +205,7 @@
         });
         if (!valid(t)) return;
         for (const run of page.items) {
-          if (S.applyRun(state, t, run))
-            view.updateTurn(current().turns.get(run.run_id));
+          if (S.applyRun(state, t, run)) renderTurn(run.run_id);
         }
         updateComposer();
         save();
@@ -174,8 +214,15 @@
       }
     }
     function observe(runId, t) {
+      if (
+        !runId ||
+        document.hidden ||
+        !valid(t) ||
+        current()?.activeRunId !== runId
+      )
+        return;
+      if (observer?.runId === runId && !observer.control.signal.aborted) return;
       stopObservation();
-      if (!runId || document.hidden || !valid(t)) return;
       const control = new AbortController();
       observer = { runId, control };
       const session = current();
@@ -186,17 +233,18 @@
           signal: control.signal,
           onPhase(event) {
             if (
+              !control.signal.aborted &&
               valid(t) &&
               S.applyPhase(state, t, event.run_id, event.id, event.phase)
             ) {
-              view.updateTurn(current().turns.get(event.run_id));
+              renderTurn(event.run_id);
               save();
             }
           },
           async onRun(run) {
             if (control.signal.aborted || !valid(t)) return;
             if (S.applyRun(state, t, run)) {
-              view.updateTurn(current().turns.get(run.run_id));
+              renderTurn(run.run_id);
               updateComposer();
               save();
             }
@@ -206,7 +254,7 @@
             }
           },
           onConnection(status) {
-            if (valid(t) && status === "polling")
+            if (!control.signal.aborted && valid(t) && status === "polling")
               view.notice("连接暂时不稳定，正在定时检查任务状态。");
           },
         })
@@ -214,7 +262,7 @@
           if (!valid(t) || control.signal.aborted) return;
           if ([404, 410].includes(error.status)) {
             view.notice("当前会话已不可用，请从列表选择其他对话。");
-            current().activeRunId = null;
+            invalidateSession(t);
             void refreshSessions();
           } else view.notice("暂时无法获取任务状态，可重新打开会话继续查看。");
           updateComposer();
@@ -231,17 +279,15 @@
           pending.requestId,
           viewAbort?.signal,
         );
-        S.acknowledgeSubmission(state, t.sessionId, pending.requestId);
-        if (!valid(t)) return;
-        view.clearPending();
-        S.applyRun(state, t, turn);
-        view.updateTurn(current().turns.get(turn.run_id));
-        view.notice("");
-        updateComposer();
-        save();
-        if (!S.isTerminal(turn)) observe(turn.run_id, t);
+        acceptSubmission(t, pending, turn);
       } catch (error) {
-        if (!valid(t)) return;
+        if (!valid(t) || !ownsSubmission(t, pending)) return;
+        if (error.status === 410) {
+          invalidateSession(t);
+          view.notice("此对话已删除或不可访问，请选择其他对话。");
+          void refreshSessions();
+          return;
+        }
         S.markSubmissionUnknown(state, t.sessionId, pending.requestId);
         view.notice(
           error.status === 404
@@ -264,7 +310,8 @@
       viewAbort = new AbortController();
       clearSources();
       token = S.activateSession(state, id);
-      const t = token;
+      const t = token,
+        revision = current().runRevision;
       current().loaded = false;
       closeSidebar();
       view.notice("");
@@ -281,8 +328,11 @@
         summaries.set(id, summary);
         const session = current();
         session.metadata = summary;
-        session.activeRunId = summary.active_run_id;
+        if (session.runRevision === revision)
+          session.activeRunId = summary.active_run_id;
         for (const run of page.items) S.applyRun(state, t, run);
+        if (S.isTerminal(session.turns.get(session.activeRunId)))
+          session.activeRunId = null;
         session.historyCursor = page.next_cursor;
         session.loaded = true;
         if (session.pendingSubmission) {
@@ -313,15 +363,7 @@
             : "对话加载失败，请重新选择以重试。",
         );
         if ([404, 410].includes(error.status)) {
-          state.sessions.delete(id);
-          summaries.delete(id);
-          token = S.activateSession(state, null);
-          view.renderSession({
-            turns: new Map(),
-            orderedRunIds: [],
-            historyCursor: null,
-          });
-          renderList();
+          invalidateSession(t);
         }
         updateComposer();
       }
@@ -335,6 +377,13 @@
       clearSources();
       token = S.activateSession(state, null);
       const generation = token.generation;
+      view.renderSession({
+        turns: new Map(),
+        orderedRunIds: [],
+        historyCursor: null,
+      });
+      view.notice("");
+      renderList();
       state.creationRequestId = state.creationRequestId || uuid();
       const key = state.creationRequestId;
       save();
@@ -348,7 +397,7 @@
           await selectSession(summary.session_id);
         void refreshSessions();
       } catch (error) {
-        if (error.status === 410 && error.code === "SESSION_GONE") {
+        if (error.status === 410 && error.errorCode === "SESSION_GONE") {
           if (state.creationRequestId === key) state.creationRequestId = null;
           save();
           if (!disposed && state.viewGeneration === generation)
@@ -365,7 +414,13 @@
     async function send(retry = false) {
       const session = current(),
         t = token;
-      if (!session || !session.loaded || session.activeRunId) return;
+      if (
+        !session ||
+        !session.loaded ||
+        session.activeRunId ||
+        refreshingViews.has(t?.generation)
+      )
+        return;
       const existing = session.pendingSubmission;
       if (existing && (!retry || !existing.question)) return;
       const question = (existing?.question || session.draft).trim();
@@ -382,16 +437,16 @@
           pending.question,
           pending.requestId,
         );
-        S.acknowledgeSubmission(state, t.sessionId, pending.requestId);
-        save();
-        if (!valid(t)) return;
-        view.clearPending();
-        S.applyRun(state, t, turn);
-        view.updateTurn(current().turns.get(turn.run_id));
-        updateComposer();
+        acceptSubmission(t, pending, turn);
         void refreshSessions();
-        if (!S.isTerminal(turn)) observe(turn.run_id, t);
       } catch (error) {
+        if (!ownsSubmission(t, pending)) return;
+        if (valid(t) && [404, 410].includes(error.status)) {
+          invalidateSession(t);
+          view.notice("此对话已删除或不可访问，请选择其他对话。");
+          void refreshSessions();
+          return;
+        }
         if ([400, 401, 403, 404, 409, 410, 422].includes(error.status)) {
           S.rejectSubmission(state, t.sessionId, pending.requestId);
           if (valid(t)) {
@@ -434,7 +489,7 @@
         const run = await api.cancelRun(id);
         if (valid(t)) {
           S.applyRun(state, t, run);
-          view.updateTurn(current().turns.get(id));
+          renderTurn(id);
           updateComposer();
           if (S.isTerminal(run)) {
             stopObservation(id);
@@ -469,7 +524,7 @@
         );
         for (const run of page.items) S.applyRun(state, t, run);
         session.historyCursor = page.next_cursor;
-        view.prependTurns(added);
+        view.prependTurns(added, session.orderedRunIds);
         button.hidden = !page.next_cursor;
       } catch (_) {
         if (valid(t)) view.notice("更早消息加载失败，请重试。");
@@ -504,16 +559,18 @@
         return;
       try {
         await api.deleteSession(id);
-        state.sessions.delete(id);
-        summaries.delete(id);
         if (state.selectedSessionId === id) {
-          stopObservation();
-          clearSources();
-          token = S.activateSession(state, null);
+          invalidateSession(token);
+          const emptyView = token;
           await refreshSessions();
+          if (!valid(emptyView)) return;
           const first = summaries.keys().next().value;
           if (first) await selectSession(first);
           else await newChat();
+        } else {
+          state.sessions.delete(id);
+          summaries.delete(id);
+          renderList();
         }
         save();
       } catch (error) {
@@ -577,7 +634,12 @@
     for (const kind of ["documents", "memory", "system"])
       byId(`open-${kind}`).addEventListener("click", () => {
         closeSidebar();
-        toolView.open(kind);
+        toolView.open(
+          kind,
+          window.matchMedia("(max-width: 768px)").matches
+            ? byId("open-sidebar")
+            : document.activeElement,
+        );
       });
     byId("open-sidebar").addEventListener("click", () => {
       byId("session-sidebar").classList.add("is-open");
@@ -615,11 +677,11 @@
     let foregroundGeneration = 0;
     async function refreshVisible() {
       const t = token,
-        session = current(),
-        stamp = ++foregroundGeneration;
-      if (!session) return;
-      const wasLoaded = session.loaded;
-      session.loaded = false;
+        session = current();
+      if (!session || refreshingViews.has(t.generation)) return;
+      const stamp = ++foregroundGeneration;
+      refreshingViews.add(t.generation);
+      const revision = session.runRevision;
       stopObservation();
       updateComposer();
       try {
@@ -628,13 +690,20 @@
           api.listTurns(t.sessionId, { signal: viewAbort?.signal }),
         ]);
         if (!valid(t) || stamp !== foregroundGeneration) return;
+        // A POST/cancel acknowledgement may arrive while this older GET is in flight.
+        if (session.runRevision !== revision) {
+          updateComposer();
+          if (session.activeRunId) observe(session.activeRunId, t);
+          return;
+        }
         session.metadata = summary;
         session.activeRunId = summary.active_run_id;
         summaries.set(t.sessionId, summary);
         for (const run of page.items) {
-          if (S.applyRun(state, t, run))
-            view.updateTurn(session.turns.get(run.run_id));
+          if (S.applyRun(state, t, run)) renderTurn(run.run_id);
         }
+        if (S.isTerminal(session.turns.get(session.activeRunId)))
+          session.activeRunId = null;
         session.loaded = true;
         renderList();
         updateComposer();
@@ -643,19 +712,17 @@
       } catch (error) {
         if (!valid(t) || stamp !== foregroundGeneration) return;
         if ([404, 410].includes(error.status)) {
-          clearSources();
-          state.sessions.delete(t.sessionId);
-          summaries.delete(t.sessionId);
-          token = S.activateSession(state, null);
-          view.renderSession({ turns: new Map(), orderedRunIds: [] });
+          invalidateSession(t);
           view.notice("此对话已删除或不可访问，请选择其他对话。");
           renderList();
         } else {
-          session.loaded = wasLoaded;
           view.notice("会话状态暂未同步，可重新选择此对话以重试。");
           if (session.activeRunId) observe(session.activeRunId, t);
         }
         updateComposer();
+      } finally {
+        refreshingViews.delete(t.generation);
+        if (valid(t)) updateComposer();
       }
     }
     const onFocus = () => {
