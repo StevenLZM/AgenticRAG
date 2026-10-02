@@ -147,7 +147,7 @@
       view.notice("");
       updateComposer();
       save();
-      if (!S.isTerminal(turn)) observe(turn.run_id, visible);
+      syncObservation(visible);
     }
     async function authorizeSource(runId, t, stamp) {
       const generation = sourceGeneration;
@@ -209,9 +209,19 @@
         }
         updateComposer();
         save();
+        syncObservation(t);
       } catch (_) {
         if (valid(t)) view.notice("最新回答暂未同步，可重新打开会话继续查看。");
       }
+    }
+    function syncObservation(t) {
+      if (!valid(t)) return;
+      const id = current()?.activeRunId;
+      if (document.hidden || !id || S.isTerminal(current().turns.get(id))) {
+        stopObservation();
+        return;
+      }
+      observe(id, t);
     }
     function observe(runId, t) {
       if (
@@ -229,7 +239,9 @@
       void api
         .watchRun({
           runId,
-          cursor: session.turns.get(runId)?.eventCursor || session.eventCursor,
+          cursor:
+            session.turns.get(runId)?.eventCursor ??
+            (session.eventRunId === runId ? session.eventCursor : 0),
           signal: control.signal,
           onPhase(event) {
             if (
@@ -353,8 +365,7 @@
         updateComposer();
         save();
         if (session.pendingSubmission) await checkSubmission(t);
-        if (valid(t) && current().activeRunId)
-          observe(current().activeRunId, t);
+        syncObservation(t);
       } catch (error) {
         if (!valid(t)) return;
         view.notice(
@@ -441,15 +452,19 @@
         void refreshSessions();
       } catch (error) {
         if (!ownsSubmission(t, pending)) return;
-        if (valid(t) && [404, 410].includes(error.status)) {
-          invalidateSession(t);
+        // A result belongs to its request, while rendering belongs to the
+        // currently visible incarnation of that session (possibly reopened).
+        const visible = token;
+        const show = valid(visible) && visible.sessionId === t.sessionId;
+        if (show && [404, 410].includes(error.status)) {
+          invalidateSession(visible);
           view.notice("此对话已删除或不可访问，请选择其他对话。");
           void refreshSessions();
           return;
         }
         if ([400, 401, 403, 404, 409, 410, 422].includes(error.status)) {
           S.rejectSubmission(state, t.sessionId, pending.requestId);
-          if (valid(t)) {
+          if (show) {
             view.clearPending();
             view.notice(
               error.errorCode === "SESSION_BUSY"
@@ -462,20 +477,24 @@
               const match = error.location?.match(
                 /^\/v1\/query-runs\/([A-Za-z0-9_-]+)$/,
               );
-              if (match) {
+              if (
+                match &&
+                !current().activeRunId &&
+                !S.isTerminal(current().turns.get(match[1]))
+              ) {
                 current().activeRunId = match[1];
-                observe(match[1], t);
               }
+              syncObservation(visible);
             }
           }
         } else {
           S.markSubmissionUnknown(state, t.sessionId, pending.requestId);
-          if (valid(t)) {
+          if (show) {
             view.renderPending(current().pendingSubmission);
             view.notice("提交结果尚未确认，请检查状态，或使用原请求重试。");
           }
         }
-        if (valid(t)) updateComposer();
+        if (show) updateComposer();
         save();
       }
     }
@@ -693,7 +712,7 @@
         // A POST/cancel acknowledgement may arrive while this older GET is in flight.
         if (session.runRevision !== revision) {
           updateComposer();
-          if (session.activeRunId) observe(session.activeRunId, t);
+          syncObservation(t);
           return;
         }
         session.metadata = summary;
@@ -708,7 +727,7 @@
         renderList();
         updateComposer();
         save();
-        if (session.activeRunId) observe(session.activeRunId, t);
+        syncObservation(t);
       } catch (error) {
         if (!valid(t) || stamp !== foregroundGeneration) return;
         if ([404, 410].includes(error.status)) {
@@ -717,7 +736,7 @@
           renderList();
         } else {
           view.notice("会话状态暂未同步，可重新选择此对话以重试。");
-          if (session.activeRunId) observe(session.activeRunId, t);
+          syncObservation(t);
         }
         updateComposer();
       } finally {
@@ -749,6 +768,7 @@
         const session = S.sessionState(state, item.sessionId);
         session.activeRunId = item.activeRunId;
         session.eventCursor = item.eventCursor;
+        session.eventRunId = item.activeRunId;
         if (item.pendingRequestId)
           session.pendingSubmission = {
             requestId: item.pendingRequestId,

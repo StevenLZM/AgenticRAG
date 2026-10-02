@@ -593,6 +593,219 @@ async def test_over_budget_checkpointed_pack_terminates_without_an_answer() -> N
     assert result["termination_reason"] == "cannot_answer"
 
 
+def _large_batch(number: int) -> EvidenceBatch:
+    parents = []
+    for index in range(6):
+        content = (f"Document {number}, clause {index}: notice and obligations. " * 60)[:1200]
+        hit = ChildHit(
+            child_id=f"child-{number}-{index}", parent_id=f"parent-{number}-{index}",
+            user_id=SCOPE.user_id, document_id=f"doc-{number}",
+            document_version_id=f"version-{number}", content=content,
+            ast_locator=f"#/text/{index}", lane="dense", lane_rank=index + 1, score=1.0,
+        )
+        parents.append(ParentEvidence(
+            parent_id=hit.parent_id, document_id=hit.document_id,
+            document_version_id=hit.document_version_id, content=content,
+            child_hits=(hit,), rerank_score=1.0,
+        ))
+    return EvidenceBatch(query=f"document {number}", parents=tuple(parents), target_ids=(f"todo-{number}",))
+
+
+@pytest.mark.parametrize("mode", ["direct", "delegate_after_direct", "parallel_delegate"])
+async def test_legal_evidence_accumulation_is_repacked_before_budget_check(mode: str) -> None:
+    from agentic_rag.query.evidence_builder import EvidenceCoverageTarget
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+    from agentic_rag.query.subagents import DelegationResult, SubagentResult
+
+    batches = [_large_batch(1), _large_batch(2)]
+    packs = [EvidenceBuilder().build(
+        [batch], [EvidenceCoverageTarget(target_id=f"todo-{i}", description=batch.query)], SCOPE, SNAPSHOT,
+    ) for i, batch in enumerate(batches, 1)]
+    assert [len(pack.items) for pack in packs] == [6, 6]
+    assert all(pack.token_count < 12000 for pack in packs)
+    assert sum(pack.token_count for pack in packs) > 12000
+
+    class Retrieval:
+        async def retrieve(self, request, scope, snapshot):
+            return batches[int(request.query[-1]) - 1]
+
+    class Dispatcher:
+        async def delegate(self, selected, context, **kwargs):
+            return DelegationResult(results=tuple(
+                SubagentResult(todo_id=todo.id, evidence=packs[int(todo.id[-1]) - 1],
+                               batch=batches[int(todo.id[-1]) - 1]) for todo in selected
+            ), blocked_todo_ids=(), child_states=())
+
+    actions = ([{"action": "delegate_research", "todo_ids": ["todo-1", "todo-2"]}]
+               if mode == "parallel_delegate" else [
+                   {"action": "retrieve_evidence", "todo_id": "todo-1", "query": "document 1"},
+                   {"action": "retrieve_evidence", "todo_id": "todo-2", "query": "document 2"}
+                   if mode == "direct" else {"action": "delegate_research", "todo_ids": ["todo-2"]},
+               ])
+    state = _state()
+    state["research"]["todos"].append({
+        "id": "todo-2", "title": "Compare obligations", "owner": "supervisor",
+        "status": "pending", "blocked_by": [],
+    })
+    gateway = ScriptedGateway(actions)
+    deps = ResearchLoopDependencies(
+        gateway=gateway, retrieval=Retrieval(), evidence_builder=EvidenceBuilder(), subagents=Dispatcher(),
+    )
+    for _ in actions:
+        # Deserialize each checkpoint and recreate the loop to cover recovery boundaries.
+        result = await ResearchAgentLoop(deps).ainvoke(state)
+        assert result["research"]["cannot_answer"] is False
+        assert result["next_node"] == "research_agent"
+        state = {**state, **json.loads(json.dumps(result))}
+    assert len(result["retrieval_batches"]) == 2
+    packed = result["packed_context"]
+    assert 0 < packed["token_count"] <= 12000
+    assert packed["token_count"] == len(packed["rendered_context"])
+    assert {item["document_id"] for item in packed["items"]} == {"doc-1", "doc-2"}
+    assert set(packed["manifest"]) == {item["evidence_id"] for item in result["evidence"]}
+    for todo in result["research"]["todos"]:
+        assert set(todo["evidence_ids"]).issubset(packed["manifest"])
+
+
+@pytest.mark.parametrize("budget", [2000, 12000])
+async def test_retrieving_the_same_source_after_cropping_remains_valid(budget: int) -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+
+    batches = []
+    for number in (1, 2):
+        batch = _large_batch(number)
+        parents = []
+        for index, parent in enumerate(batch.parents[:1] if budget == 2000 else batch.parents):
+            document_id = f"doc-{number}-{index}"
+            parents.append(parent.model_copy(update={
+                "document_id": document_id,
+                "child_hits": tuple(hit.model_copy(update={"document_id": document_id})
+                                    for hit in parent.child_hits),
+            }))
+        batches.append(batch.model_copy(update={"parents": tuple(parents)}))
+
+    class Retrieval:
+        async def retrieve(self, request, scope, snapshot):
+            return batches[int(request.query[-1]) - 1]
+
+    snapshot = SNAPSHOT.model_copy(update={"max_evidence_tokens": budget, "max_research_rounds": 4})
+    state = new_query_state(run_id="crop-run", question="Compare sources", scope=SCOPE, snapshot=snapshot)
+    state["research"] = {"todos": [
+        {"id": f"todo-{n}", "title": f"Inspect source {n}", "owner": "supervisor",
+         "status": "pending", "blocked_by": []} for n in (1, 2, 3)
+    ]}
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=ScriptedGateway([
+            {"action": "retrieve_evidence", "todo_id": f"todo-{n}", "query": f"source {n}"}
+            for n in (1, 2, 3)
+        ]), retrieval=Retrieval(), evidence_builder=EvidenceBuilder(),
+    ))
+    for _ in range(2):
+        result = await loop.ainvoke(state)
+        assert result["research"]["cannot_answer"] is False
+        state = {**state, **json.loads(json.dumps(result))}
+    cropped = next(item for item in result["evidence"] if len(item["content"]) < 1200)
+    original = next(parent for batch in batches for parent in batch.parents
+                    if parent.parent_id == cropped["parent_id"])
+    batches.append(EvidenceBatch(query="repeat source", parents=(original,)))
+    result = await loop.ainvoke(state)
+    assert result["research"]["cannot_answer"] is False
+    assert result["next_node"] == "research_agent"
+    assert len(result["retrieval_batches"]) == 3
+    assert result["packed_context"]["token_count"] <= budget
+
+
+@pytest.mark.parametrize("damage", ["content", "document", "heading"])
+async def test_repacking_rejects_conflicting_raw_source_versions(damage: str) -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+
+    batch = _batch()
+    parent = batch.parents[0]
+    field, value = {"content": ("content", "Changed original"), "document": ("document_id", "wrong-doc"),
+                    "heading": ("heading_path", ("wrong-heading",))}[damage]
+    changed = parent.model_copy(update={field: value})
+    changed = changed.model_copy(update={"child_hits": tuple(hit.model_copy(update={
+        "content": changed.content, "document_id": changed.document_id,
+    }) for hit in changed.child_hits)})
+    batches = [batch, batch.model_copy(update={"parents": (changed,)})]
+
+    class Retrieval:
+        async def retrieve(self, request, scope, snapshot):
+            return batches[int(request.query[-1]) - 1]
+
+    state = _state()
+    state["research"]["todos"].append({
+        "id": "todo-2", "title": "Recheck", "owner": "supervisor", "status": "pending", "blocked_by": [],
+    })
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=ScriptedGateway([
+            {"action": "retrieve_evidence", "todo_id": f"todo-{n}", "query": f"source {n}"} for n in (1, 2)
+        ]), retrieval=Retrieval(), evidence_builder=EvidenceBuilder(),
+    ))
+    result = await loop.ainvoke(state)
+    result = await loop.ainvoke({**state, **json.loads(json.dumps(result))})
+    assert result["research"]["cannot_answer"] is True
+    assert result["research"]["observations"][-1]["error_code"] == "research_evidence_invalid"
+
+
+async def test_unbacked_checkpoint_cannot_claim_a_different_content_is_just_a_crop() -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop
+    from agentic_rag.safety.context import DataEnvelope
+
+    packed = EvidenceBuilder().build([_batch()], [], SCOPE, SNAPSHOT)
+    item = packed.items[0].model_copy(update={"content": "Different unverified content"})
+    rendered = DataEnvelope(source_label=f"document:{item.document_id}", evidence_id=item.evidence_id,
+                            content=item.content, heading_path=item.heading_path).render()
+    state = _state()
+    state["packed_context"] = packed.model_copy(update={
+        "items": (item,), "rendered_context": rendered, "token_count": len(rendered),
+    }).model_dump(mode="json")
+    loop = ResearchAgentLoop(_deps(actions=[
+        {"action": "retrieve_evidence", "todo_id": "todo-1", "query": "notice"},
+    ]))
+    result = await loop.ainvoke(state)
+    assert result["research"]["cannot_answer"] is True
+    assert result["research"]["observations"][-1]["error_code"] == "research_evidence_invalid"
+
+
+@pytest.mark.parametrize("damage", ["index", "manifest", "rendered", "over_budget", "missing_batch", "locator"])
+async def test_repacking_does_not_hide_invalid_delegated_evidence(damage: str) -> None:
+    from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
+    from agentic_rag.query.subagents import DelegationResult, SubagentResult
+
+    batch = _batch()
+    packed = EvidenceBuilder().build([batch], [], SCOPE, SNAPSHOT)
+    if damage == "index":
+        packed = packed.model_copy(update={"index_generation": "stale"})
+    elif damage == "manifest":
+        packed = packed.model_copy(update={"manifest": {}})
+    elif damage == "rendered":
+        packed = packed.model_copy(update={"rendered_context": "forged", "token_count": 6})
+    elif damage == "over_budget":
+        packed = packed.model_copy(update={"token_count": 12001})
+    elif damage == "locator":
+        item = packed.items[0].model_copy(update={"ast_locator": "#/not-in-raw-batch"})
+        packed = packed.model_copy(update={"items": (item,), "manifest": {
+            item.evidence_id: packed.manifest[item.evidence_id].model_copy(update={"ast_locator": item.ast_locator}),
+        }})
+
+    class Dispatcher:
+        async def delegate(self, *args, **kwargs):
+            return DelegationResult(results=(SubagentResult(
+                todo_id="todo-1", evidence=packed, batch=None if damage == "missing_batch" else batch,
+            ),), blocked_todo_ids=(), child_states=())
+
+    loop = ResearchAgentLoop(ResearchLoopDependencies(
+        gateway=ScriptedGateway([{"action": "delegate_research", "todo_ids": ["todo-1"]}]),
+        retrieval=FakeRetrieval(), evidence_builder=EvidenceBuilder(), subagents=Dispatcher(),
+    ))
+    result = await loop.ainvoke(_state())
+    assert result["research"]["cannot_answer"] is True
+    assert result["next_node"] == "end"
+    expected = "research_batches_missing" if damage == "missing_batch" else "research_evidence_invalid"
+    assert result["research"]["observations"][-1]["error_code"] == expected
+
+
 async def test_loop_propagates_cancellation_from_tool() -> None:
     from agentic_rag.query.research_loop import ResearchAgentLoop, ResearchLoopDependencies
 

@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -271,6 +271,12 @@ def build_retrieval_graph(
 
     async def evidence_batch(state: RetrievalState) -> dict[str, object]:
         started = perf_counter()
+        stage_hits: dict[Literal["dense", "bm25", "rrf", "rerank"], list[ChildHit]] = {
+            "dense": state.get("dense_hits", []),
+            "bm25": state.get("bm25_hits", []),
+            "rrf": state.get("fused_hits", []),
+            "rerank": state.get("reranked_hits", []),
+        }
         batch = EvidenceBatch(
             query=state["request"].query,
             parents=tuple(state["hydrated_parents"]),
@@ -284,10 +290,7 @@ def build_retrieval_graph(
                     child_id=hit.child_id, parent_id=hit.parent_id, user_id=hit.user_id,
                     document_id=hit.document_id, document_version_id=hit.document_version_id,
                     retrieval_score=hit.retrieval_score, rrf_score=hit.rrf_score, rerank_score=hit.rerank_score,
-                ) for hit in state.get(key, [])) for name, key in (
-                    ("dense", "dense_hits"), ("bm25", "bm25_hits"),
-                    ("rrf", "fused_hits"), ("rerank", "reranked_hits"),
-                )},
+                ) for hit in hits) for name, hits in stage_hits.items()},
                 selected_parent_ids=tuple(p.parent_id for p in state["selected_parents"]),
                 hydrated_parent_ids=tuple(p.parent_id for p in state["hydrated_parents"]),
                 candidate_budget=_budget(state).model_dump(), timings_ms=state["timings_ms"],

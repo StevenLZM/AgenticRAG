@@ -120,7 +120,8 @@ The Research loop owns a `PackedEvidence` working set, not an independent eviden
 - At loop entry, validate the checkpointed `packed_context` against the current runtime snapshot.
 - Direct retrieval returns both its raw `EvidenceBatch` and its packed evidence.
 - Subagent retrieval returns both values as well; `SubagentResult` no longer discards the batch.
-- Merge current and new packs deterministically by evidence ID, verify manifest equality and index generation, and enforce the snapshot evidence-token limit.
+- Validate current and new input packs individually, including manifest equality for duplicate evidence IDs, index generation, and each input's snapshot evidence-token limit. Accumulate their raw batches and use the Evidence Builder to select, deduplicate, and crop one canonical working pack. Candidate accumulation may exceed the budget; only the validated, bounded working pack enters checkpoints or model prompts. (Clarified 2026-10-02.)
+- Different crops of the same evidence ID are valid only when both packs have matching raw parent/version backing and child locators. Compare full raw content, document identity, and heading provenance across accumulated batches; conflicting raw sources remain invalid. Legacy packs without raw backing retain strict packed-content equality.
 - Before every supervisor action, stage the merged `packed_context`, evidence list, Todos, and observations into `ContextBuilder`.
 - On submission, return the merged packed context and every raw retrieval batch to the graph.
 
@@ -146,7 +147,7 @@ The graph must not wrap the entire Research loop in misleading `retrieval.tool` 
 
 - Layout association fails open to the exact original candidate sequence for ambiguous geometry, isolated right-aligned dates, or inconsistent column bands; all provenance validation continues to fail closed.
 - Evidence with a heading or manifest mismatch is rejected before prompt construction.
-- Mixed index generations, missing delegated batches, or an over-budget evidence merge terminate Research with a safe typed reason and no answer.
+- Mixed index generations, missing delegated batches, malformed input packs, or conflicting evidence provenance terminate Research with a safe typed reason and no answer. Legal candidate accumulation over budget is repacked, not classified as invalid evidence. The final working pack remains bounded by the snapshot limit; its counter uses Unicode code points in the rendered envelopes, including metadata. Todo references are reconciled against the retained evidence after packing.
 - Model timeout or invalid schema returns `model_unavailable` or `research_action_invalid` without exposing provider text.
 - Rebuild preflight aborts before deletion if source staging, backup verification, service quiescence, exact index resolution, or the old/new ingestion dry-run diff fails.
 - Rebuild validation failure keeps Query traffic stopped until the backup is restored or the defect is corrected and ingestion is rerun.

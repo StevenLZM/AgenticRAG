@@ -39,6 +39,7 @@
         historyCursor: null,
         activeRunId: null,
         eventCursor: 0,
+        eventRunId: null,
         loaded: false,
         runRevision: 0,
       });
@@ -99,7 +100,12 @@
       return false;
     turn.eventCursor = eventId;
     turn.phase = phase;
-    if (session.activeRunId === runId) session.eventCursor = eventId;
+    if (turn.status === "queued") turn.status = "running";
+    session.runRevision++;
+    if (session.activeRunId === runId) {
+      session.eventCursor = eventId;
+      session.eventRunId = runId;
+    }
     return true;
   }
   function beginSubmission(state, id, question, requestId) {
@@ -138,7 +144,8 @@
         .map((s) => ({
           sessionId: s.sessionId,
           activeRunId: s.activeRunId,
-          eventCursor: safeCursor(s.eventCursor),
+          eventCursor:
+            s.eventRunId === s.activeRunId ? safeCursor(s.eventCursor) : 0,
           pendingRequestId: s.pendingSubmission?.requestId || null,
         }));
       storage.setItem(

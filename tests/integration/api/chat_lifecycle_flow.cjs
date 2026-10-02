@@ -514,7 +514,222 @@ async function revokedSubmission() {
   assert.equal(h.document.getElementById("send-button").disabled, true);
   h.controller.dispose();
 }
+async function queuedProgress(eventType = "QUERY_PHASE_CHANGED") {
+  const h = setup();
+  h.histories.s1 = [turn("r1", "queued")];
+  let stream;
+  h.api.watchRun = createChatApi({
+    fetchImpl: async (url, options) => {
+      if (!url.endsWith("/events")) return Response.json(turn("r1", "queued"));
+      return new Response(
+        new ReadableStream({
+          start(control) {
+            stream = control;
+            options.signal.addEventListener("abort", () => control.close(), {
+              once: true,
+            });
+          },
+        }),
+      );
+    },
+  }).watchRun;
+  try {
+    await h.controller.start();
+    await flush();
+    stream.enqueue(
+      new TextEncoder().encode(
+        `id: 1\nevent: ${eventType}\ndata: {"run_id":"r1","phase":"retrieving"}\n\n`,
+      ),
+    );
+    await flush();
+    assert.equal(
+      h.controller.state.sessions.get("s1").turns.get("r1").status,
+      "running",
+    );
+    assert.match(
+      h.document.getElementById("chat-messages").textContent,
+      eventType === "RUN_STARTED" ? /处理中/ : /检索中/,
+    );
+  } finally {
+    h.controller.dispose();
+  }
+}
+async function startedProgress() {
+  await queuedProgress("RUN_STARTED");
+}
+async function staleBusyAfterReopen() {
+  const h = setup(),
+    post = deferred(),
+    lookup = deferred();
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [];
+  h.api.submitTurn = () => post.promise;
+  h.api.findSubmission = () => lookup.promise;
+  await h.controller.start();
+  draft(h, "保留草稿");
+  const sending = h.controller.send();
+  await h.controller.selectSession("s2");
+  h.histories.s1 = [{ ...turn("r2", "completed"), answer }];
+  const reopening = h.controller.selectSession("s1");
+  await flush();
+  post.reject(new HttpError(409, "SESSION_BUSY", "/v1/query-runs/r2"));
+  await sending;
+  lookup.reject(new HttpError(404, "CHAT_NOT_FOUND"));
+  await reopening;
+  assert.equal(
+    h.controller.state.sessions.get("s1").activeRunId,
+    null,
+    "an old busy Location must not reactivate a known completed task",
+  );
+  assert.equal(h.document.getElementById("send-button").disabled, false);
+  h.controller.dispose();
+}
+async function nextRunObservation() {
+  const h = setup();
+  await h.controller.start();
+  const first = h.watches[0];
+  await first.onPhase({ run_id: "r1", id: 80, phase: "auditing" });
+  const done = { ...turn("r1", "completed"), answer };
+  h.histories.s1 = [done, turn("r2")];
+  h.sessions[0].active_run_id = "r2";
+  await first.onRun(done);
+  const second = h.watches.at(-1);
+  assert.equal(second.runId, "r2", "history-discovered R2 must be observed");
+  assert.equal(second.cursor, 0, "R2 must not inherit R1's event cursor");
+  await first.onRun(done);
+  assert.equal(
+    second.signal.aborted,
+    false,
+    "late R1 callbacks must not stop R2",
+  );
+  assert.equal(h.watches.filter((w) => w.runId === "r2").length, 1);
+  h.histories.s1[1] = { ...turn("r2", "completed"), answer };
+  h.sessions[0].active_run_id = null;
+  await second.onRun(h.histories.s1[1]);
+  assert.equal(h.controller.state.sessions.get("s1").activeRunId, null);
+  assert.match(
+    h.document.getElementById("chat-messages").textContent,
+    /第二轮完整答案/,
+  );
+  draft(h, "第三问");
+  assert.equal(h.document.getElementById("send-button").disabled, false);
+  h.controller.dispose();
+}
+async function completedBeforeObservation() {
+  const h = setup();
+  await h.controller.start();
+  const first = h.watches[0],
+    done = { ...turn("r1", "completed"), answer };
+  h.histories.s1 = [done, turn("r2")];
+  h.sessions[0].active_run_id = "r2";
+  const transport = createChatApi({
+    fetchImpl: async (url) => {
+      assert.equal(
+        url,
+        "/v1/query-runs/r2",
+        "completed R2 needs no SSE connection",
+      );
+      const completed = { ...turn("r2", "completed"), answer };
+      h.histories.s1[1] = completed;
+      h.sessions[0].active_run_id = null;
+      return Response.json(completed);
+    },
+  });
+  h.api.watchRun = transport.watchRun;
+  await first.onRun(done);
+  await flush();
+  assert.equal(
+    h.controller.state.sessions.get("s1").turns.get("r2").status,
+    "completed",
+  );
+  draft(h, "第三问");
+  assert.equal(h.document.getElementById("send-button").disabled, false);
+  h.controller.dispose();
+}
+async function switchDuringTerminalRefresh() {
+  const h = setup(),
+    refresh = deferred();
+  await h.controller.start();
+  const first = h.watches[0],
+    list = h.api.listTurns;
+  h.api.listTurns = (id, options) =>
+    id === "s1" ? refresh.promise : list(id, options);
+  const catchingUp = first.onRun({ ...turn("r1", "completed"), answer });
+  await h.controller.selectSession("s2");
+  const currentWatch = h.watches.at(-1);
+  refresh.resolve({ items: [turn("r2")], next_cursor: null });
+  await catchingUp;
+  assert.equal(h.controller.state.selectedSessionId, "s2");
+  assert.equal(h.watches.at(-1).runId, "b1");
+  assert.equal(currentWatch.signal.aborted, false);
+  assert.doesNotMatch(
+    h.document.getElementById("chat-messages").textContent,
+    /r2/,
+  );
+  h.controller.dispose();
+}
+async function rejectedAfterReopen(status = 422, code = "INVALID_INPUT") {
+  const h = setup(),
+    post = deferred(),
+    lookup = deferred();
+  h.sessions[0].active_run_id = null;
+  h.histories.s1 = [];
+  h.api.submitTurn = () => post.promise;
+  h.api.findSubmission = () => lookup.promise;
+  await h.controller.start();
+  draft(h, "保留草稿");
+  const sending = h.controller.send();
+  await h.controller.selectSession("s2");
+  const reopening = h.controller.selectSession("s1");
+  await flush();
+  if (code === "SESSION_BUSY") {
+    h.sessions[0].active_run_id = "r2";
+    h.histories.s1 = [turn("r2")];
+  }
+  post.reject(new HttpError(status, code, "/v1/query-runs/r2"));
+  await sending;
+  lookup.reject(new HttpError(404, "CHAT_NOT_FOUND"));
+  await reopening;
+  assert.doesNotMatch(
+    h.document.getElementById("chat-messages").textContent,
+    /提交中/,
+  );
+  if (status === 410) {
+    assert.equal(h.controller.state.selectedSessionId, null);
+  } else {
+    const session = h.controller.state.sessions.get("s1");
+    assert.equal(session.draft, "保留草稿");
+    if (status === 503) {
+      assert.equal(session.pendingSubmission.status, "unknown");
+      assert.equal(h.document.getElementById("pending-actions").hidden, false);
+    } else {
+      assert.equal(session.pendingSubmission, null);
+      assert.equal(
+        h.document.getElementById("send-button").disabled,
+        code === "SESSION_BUSY",
+      );
+      if (code === "SESSION_BUSY") {
+        assert.equal(h.watches.at(-1).runId, "r2");
+        h.histories.s1 = [{ ...turn("r2", "completed"), answer }];
+        h.sessions[0].active_run_id = null;
+        await h.watches.at(-1).onRun(h.histories.s1[0]);
+        assert.equal(h.document.getElementById("send-button").disabled, false);
+      }
+    }
+  }
+  h.controller.dispose();
+}
 const cases = {
+  queuedProgress,
+  startedProgress,
+  staleBusyAfterReopen,
+  nextRunObservation,
+  completedBeforeObservation,
+  switchDuringTerminalRefresh,
+  rejectedAfterReopen,
+  busyAfterReopen: () => rejectedAfterReopen(409, "SESSION_BUSY"),
+  goneAfterReopen: () => rejectedAfterReopen(410, "SESSION_GONE"),
+  unknownAfterReopen: () => rejectedAfterReopen(503, "UNAVAILABLE"),
   revokedSubmission,
   missedTurnCatchup,
   acknowledgedAfterReopen,

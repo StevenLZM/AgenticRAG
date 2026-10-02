@@ -45,6 +45,16 @@ def test_chat_client_contract(script):
         "acknowledgedAfterReopen",
         "missedTurnCatchup",
         "revokedSubmission",
+        "queuedProgress",
+        "startedProgress",
+        "staleBusyAfterReopen",
+        "nextRunObservation",
+        "completedBeforeObservation",
+        "switchDuringTerminalRefresh",
+        "rejectedAfterReopen",
+        "busyAfterReopen",
+        "goneAfterReopen",
+        "unknownAfterReopen",
     ],
 )
 def test_chat_controller_lifecycle(case):

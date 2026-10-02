@@ -96,4 +96,24 @@ assert.equal(
 const aa = S.activateSession(state, "session-a");
 assert.equal(S.applyRun(state, a, turn), false); // even after returning to A
 assert.equal(S.isCurrent(state, aa), true);
+S.applyRun(state, aa, { ...turn, run_id: "next", status: "queued" });
+S.applyPhase(state, aa, "next", 1, "retrieving");
+assert.equal(sa.turns.get("next").status, "running");
+assert.equal(
+  S.applyRun(state, aa, { ...turn, run_id: "next", status: "queued" }),
+  false,
+);
+S.applyRun(state, aa, { ...turn, run_id: "next", status: "cancel_requested" });
+S.applyPhase(state, aa, "next", 2, "researching");
+assert.equal(sa.turns.get("next").status, "cancel_requested");
+S.applyRun(state, aa, { ...turn, run_id: "next", status: "cancelled" });
+assert.equal(S.applyPhase(state, aa, "next", 3, "auditing"), false);
+S.applyRun(state, aa, { ...turn, run_id: "later", status: "queued" });
+S.saveResumeMetadata(storage, state);
+assert.equal(
+  S.loadResumeMetadata(storage).sessions.find(
+    (s) => s.sessionId === "session-a",
+  ).eventCursor,
+  0,
+);
 console.log("chat state contracts passed");

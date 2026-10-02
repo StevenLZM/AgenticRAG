@@ -34,7 +34,7 @@ from agentic_rag.query.todos import (
     TodoReducer,
 )
 from agentic_rag.query.tools import ResearchContext, ResearchToolset, RetrievalPort
-from agentic_rag.retrieval.models import EvidenceBatch
+from agentic_rag.retrieval.models import EvidenceBatch, ParentEvidence
 from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway, StructuredOutputValidationError, load_prompt
 from agentic_rag.safety.context import DataEnvelope
 
@@ -250,12 +250,15 @@ class ResearchAgentLoop:
         """Repack every raw batch into the one bounded research working set."""
         try:
             batches = tuple(EvidenceBatch.model_validate(value) for value in retrieval_batches)
-            return self._evidence_builder.build(
+            packed = self._evidence_builder.build(
                 batches,
                 _coverage_targets(state, todos),
                 context.scope,
                 context.snapshot,
             )
+            if _packed_validation_error(packed, context.snapshot):
+                raise ValueError("invalid repacked evidence")
+            return packed
         except (TypeError, ValueError):
             # Invalid checkpointed/raw evidence is never allowed to leak into
             # a prompt; the loop continues with an empty, generation-bound pack.
@@ -348,7 +351,10 @@ class ResearchAgentLoop:
                 batch, addition = await self._tools.retrieve_evidence(
                     query=action.query, ctx=context, target_id=action.todo_id,
                 )
-                merged = _merge_packed(evidence, addition, max_tokens=context.snapshot.max_evidence_tokens)
+                _validate_packed_inputs((
+                    (evidence, tuple(EvidenceBatch.model_validate(raw) for raw in _retrieval_batches(state))),
+                    (addition, (batch,)),
+                ), context.snapshot)
             except asyncio.CancelledError:
                 raise
             except (TypeError, ValueError):
@@ -360,7 +366,7 @@ class ResearchAgentLoop:
             return _Step(completed, [*observations, {
                 "kind": "retrieval", "ok": bool(ids), "todo_id": action.todo_id,
                 "evidence_ids": list(ids),
-            }], merged, retrieval_batches=[batch.model_dump(mode="json")])
+            }], evidence, retrieval_batches=[batch.model_dump(mode="json")])
 
         assert isinstance(action, DelegateResearch)
         if self._subagents is None:
@@ -397,13 +403,15 @@ class ResearchAgentLoop:
         if len(set(result_ids)) != len(result_ids) or not set(result_ids).issubset(todo_ids):
             return failure("delegate", "research_evidence_invalid", selected=blocked, terminal=True)
         try:
-            # Validate each child before the reducer can discard malformed entries.
-            for result in delegated.results:
-                if _packed_validation_error(result.evidence, context.snapshot):
-                    raise ValueError("invalid child evidence")
-            merged = evidence
-            for result in sorted(delegated.results, key=lambda result: result.todo_id):
-                merged = _merge_packed(merged, result.evidence, max_tokens=context.snapshot.max_evidence_tokens)
+            # Validate every input before canonical packing can discard entries.
+            # The accumulated candidates may exceed the final prompt budget.
+            _validate_packed_inputs(
+                (
+                    (evidence, tuple(EvidenceBatch.model_validate(raw) for raw in _retrieval_batches(state))),
+                    *((result.evidence, (result.batch,) if result.batch is not None else ())
+                      for result in delegated.results),
+                ), context.snapshot,
+            )
         except (TypeError, ValueError):
             return failure("delegate", "research_evidence_invalid", selected=blocked, terminal=True)
         updated = claimed
@@ -418,7 +426,7 @@ class ResearchAgentLoop:
         return _Step(updated, [*observations, {
             "kind": "delegate", "ok": True, "completed_todo_ids": sorted(completed_ids),
             "blocked_todo_ids": sorted(blocked_ids),
-        }], merged, retrieval_batches=[
+        }], evidence, retrieval_batches=[
             result.batch.model_dump(mode="json") for result in delegated.results if result.batch is not None
         ])
 
@@ -574,91 +582,51 @@ def _coverage_targets(
     return tuple(dict((target.target_id, target) for target in targets).values())
 
 
-def _merge_packed(
-    existing: PackedEvidence,
-    addition: PackedEvidence,
-    *,
-    max_tokens: int | None = None,
-) -> PackedEvidence:
-    """Merge compatibility-only child packs without replacing source metadata."""
-    if existing.index_generation != addition.index_generation:
-        raise ValueError("evidence index generation must be consistent")
-    selected: dict[str, tuple[EvidenceItem, EvidenceManifestEntry]] = {}
-    for packed in (existing, addition):
+def _validate_packed_inputs(
+    inputs: tuple[tuple[PackedEvidence, tuple[EvidenceBatch, ...]], ...], snapshot: Any,
+) -> None:
+    """Validate bounded inputs without constructing an oversized working pack.
+
+    Raw batches, including all newly retrieved candidates, are packed once by
+    ``_rebuild_working_pack`` before they enter the checkpoint or a model prompt.
+    Provenance conflicts remain terminal even if packing would discard them.
+    Crops of the same source may differ only when both packs have matching raw
+    backing; old checkpoints without raw backing retain strict content equality.
+    """
+    selected: dict[str, tuple[EvidenceItem, EvidenceManifestEntry, bool]] = {}
+    sources: dict[tuple[str, str], ParentEvidence] = {}
+    for packed, batches in inputs:
+        if _packed_validation_error(packed, snapshot):
+            raise ValueError("invalid input evidence")
+        locators: dict[tuple[str, str], set[str]] = {}
+        for batch in batches:
+            for parent in batch.parents:
+                key = (parent.parent_id, parent.document_version_id)
+                source = sources.get(key)
+                if source is not None and (
+                    source.document_id, source.content, source.heading_path
+                ) != (parent.document_id, parent.content, parent.heading_path):
+                    raise ValueError("conflicting raw evidence for source version")
+                sources[key] = parent
+                locators.setdefault(key, set()).update(hit.ast_locator for hit in parent.child_hits)
         for item in packed.items:
-            manifest = packed.manifest.get(item.evidence_id)
-            if manifest is None or not _matches_manifest(item, manifest):
-                raise ValueError("evidence manifest does not match its item")
+            manifest = packed.manifest[item.evidence_id]
+            key = (item.parent_id, item.document_version_id)
+            backed = key in locators
+            if backed and (
+                sources[key].document_id != item.document_id
+                or sources[key].heading_path != item.heading_path
+                or item.ast_locator not in locators[key]
+            ):
+                raise ValueError("evidence does not match its raw source")
             prior = selected.get(item.evidence_id)
             if prior is not None:
-                prior_item, prior_manifest = prior
-                if prior_manifest != manifest or not _same_evidence_metadata(
-                    prior_item, item
+                prior_item, prior_manifest, prior_backed = prior
+                if prior_manifest != manifest or (
+                    prior_item.content != item.content and not (prior_backed and backed)
                 ):
                     raise ValueError("conflicting evidence metadata for evidence id")
-                selected[item.evidence_id] = (
-                    prior_item.model_copy(
-                        update={
-                            "covered_target_ids": tuple(
-                                dict.fromkeys(
-                                    (
-                                        *prior_item.covered_target_ids,
-                                        *item.covered_target_ids,
-                                    )
-                                )
-                            )
-                        }
-                    ),
-                    prior_manifest,
-                )
-                continue
-            selected[item.evidence_id] = (item, manifest)
-    chosen: list[tuple[EvidenceItem, EvidenceManifestEntry]] = []
-    rendered_parts: list[str] = []
-    for key in sorted(selected):
-        item, manifest = selected[key]
-        rendered_item = DataEnvelope(
-            source_label=f"document:{item.document_id}",
-            evidence_id=item.evidence_id,
-            content=item.content,
-            heading_path=item.heading_path,
-        ).render()
-        candidate_rendered = "\n".join((*rendered_parts, rendered_item))
-        if max_tokens is not None and len(candidate_rendered) > max_tokens:
-            raise ValueError("evidence merge exceeds the snapshot token limit")
-        chosen.append((item, manifest))
-        rendered_parts.append(rendered_item)
-    ordered = tuple(item for item, _manifest in chosen)
-    merged_manifest = {item.evidence_id: manifest for item, manifest in chosen}
-    rendered = "\n".join(rendered_parts)
-    return PackedEvidence(
-        items=ordered,
-        manifest=merged_manifest,
-        rendered_context=rendered,
-        token_count=len(rendered),
-        index_generation=existing.index_generation,
-    )
-
-
-def _same_evidence_metadata(left: EvidenceItem, right: EvidenceItem) -> bool:
-    """Compare source identity while allowing coverage to accumulate."""
-    return (
-        left.evidence_id,
-        left.parent_id,
-        left.document_id,
-        left.document_version_id,
-        left.content,
-        left.ast_locator,
-        left.heading_path,
-    ) == (
-        right.evidence_id,
-        right.parent_id,
-        right.document_id,
-        right.document_version_id,
-        right.content,
-        right.ast_locator,
-        right.heading_path,
-    )
+            selected[item.evidence_id] = (item, manifest, backed)
 
 
 def _block_active(todos: tuple[TodoItem, ...]) -> tuple[TodoItem, ...]:

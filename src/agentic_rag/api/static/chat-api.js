@@ -182,6 +182,8 @@
               failures = 0;
               lastId = id;
               onConnection("connected");
+              if (type === "RUN_STARTED")
+                await onPhase({ run_id: runId, id, phase: "processing" });
               if (type === "QUERY_PHASE_CHANGED" && PHASES.has(payload.phase))
                 await onPhase({ run_id: runId, id, phase: payload.phase });
               if (
