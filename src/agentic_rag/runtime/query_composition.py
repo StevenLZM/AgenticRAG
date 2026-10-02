@@ -59,6 +59,7 @@ _PROMPTS = (
     "faithfulness_v1",
     "memory_extractor_v1",
     "context_compactor_v1",
+    "tool_agent_v1",
 )
 
 
@@ -145,9 +146,10 @@ def build_subagent_dispatcher(
     evidence_builder: EvidenceBuilder,
     snapshot: RuntimeConfigSnapshot,
     concurrency: ConcurrencyManager,
+    tool_runtime: Any = None,
 ) -> SubagentDispatcher:
     """Compose bounded children that inherit only server-owned query context."""
-    tools = ResearchToolset(retrieval, evidence_builder)
+    tools = ResearchToolset(retrieval, evidence_builder, tool_runtime)
 
     async def child_worker(
         child: ChildResearchState,
@@ -155,7 +157,12 @@ def build_subagent_dispatcher(
     ) -> tuple[EvidenceBatch, PackedEvidence]:
         child_scope = UserScope.model_validate(dict(child.scope))
         inherited = RuntimeConfigSnapshot.model_validate(dict(child.runtime_config_snapshot))
-        context = ResearchContext(scope=child_scope, snapshot=inherited)
+        from agentic_rag.tool_runtime.models import ToolContext
+        metadata = child.tool_context
+        context = ResearchContext(scope=child_scope, snapshot=inherited,
+            tool_context=ToolContext(scope=child_scope, snapshot=inherited, run_id=str(metadata["run_id"]),
+                session_id=str(metadata["session_id"]), deadline=float(str(metadata["deadline"]))) if metadata else None,
+            call_prefix=str(metadata.get("call_prefix", "child")))
         return await child_tools.retrieve_evidence(
             query=child.question,
             context=context,
@@ -215,6 +222,7 @@ async def build_query_dependencies(
         max_retries=0,
     )
     qwen = AsyncOpenAI(api_key=qwen_key, base_url=settings.qwen_embedding_base_url, timeout=30.0, max_retries=0)
+    tool_runtime = None
     try:
         from agentic_rag.observability.provider_usage import install_provider_meter
         install_provider_meter(deepseek)
@@ -251,11 +259,14 @@ async def build_query_dependencies(
             )
         )
         evidence_builder = EvidenceBuilder()
+        from agentic_rag.runtime.tool_composition import build_tool_runtime
+        tool_runtime, tool_capabilities = build_tool_runtime(settings, retrieval=retrieval)
         subagents = build_subagent_dispatcher(
             retrieval=retrieval,
             evidence_builder=evidence_builder,
             snapshot=snapshot,
             concurrency=shared_concurrency,
+            tool_runtime=tool_runtime,
         )
         research_loop = ResearchAgentLoop(
             ResearchLoopDependencies(
@@ -263,6 +274,7 @@ async def build_query_dependencies(
                 retrieval=retrieval,
                 evidence_builder=evidence_builder,
                 subagents=subagents,
+                tool_runtime=tool_runtime,
             )
         )
         emitter = AgentEventEmitter(
@@ -285,17 +297,22 @@ async def build_query_dependencies(
             trace_recorder=TraceRecorder(runtime_config_snapshot_id=snapshot.snapshot_id),
             event_emitter=emitter,
             concurrency=shared_concurrency,
-            owned_resources=(deepseek, qwen, reranker),
+            owned_resources=(deepseek, qwen, reranker, *((tool_runtime,) if tool_runtime is not None else ())),
             deployment_snapshot_id=snapshot.snapshot_id,
-            capabilities=RuntimeCapabilities(knowledge_base=True),
+            capabilities=RuntimeCapabilities(knowledge_base=True, tool_capabilities=tool_capabilities),
             conversations=SqlAlchemyConversationReader(repositories.session_factory),
+            tool_runtime=tool_runtime,
         )
         return dependencies
     except QueryCompositionError:
+        if tool_runtime is not None:
+            await tool_runtime.aclose()
         await deepseek.close()
         await qwen.close()
         raise
     except Exception as error:
+        if tool_runtime is not None:
+            await tool_runtime.aclose()
         await deepseek.close()
         await qwen.close()
         raise QueryCompositionError(f"Query Worker dependency composition failed: {type(error).__name__}") from error

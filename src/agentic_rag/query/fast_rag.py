@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from pydantic import ValidationError
 
@@ -45,6 +45,8 @@ class FastRagDependencies:
     evidence_builder: EvidenceBuilder
     evidence_grader: EvidenceGrader
     capabilities: RuntimeCapabilities | None = None
+    tool_runtime: Any = None
+    gateway: Any = None
 
 
 async def run_fast_rag(
@@ -54,13 +56,27 @@ async def run_fast_rag(
     route = _route_from_state(state)
     if route.route != "fast_rag":
         return {"next_node": "research_agent"}
+    if dependencies.tool_runtime is not None:
+        from agentic_rag.query.tool_loop import has_external_requirement, run_tool_step
+        if has_external_requirement(state) or (state.get("tool_state") or {}).get("active"):
+            await report_safely(report_phase, "retrieving")
+            return await run_tool_step(state, dependencies.gateway, dependencies.tool_runtime, strategy="fast_rag")
     scope = scope_from_state(state)
     snapshot = snapshot_from_state(state)
     question = reasoning_question(state) if dependencies.capabilities is not None else question_from_state(state)
     request = RetrievalRequest(query=route.normalized_query)
     await report_safely(report_phase, "retrieving")
     try:
-        batch = await dependencies.retrieval.retrieve(request, scope, snapshot)
+        if dependencies.tool_runtime is None:
+            batch = await dependencies.retrieval.retrieve(request, scope, snapshot)
+        else:
+            from agentic_rag.query.tool_loop import tool_context
+            from agentic_rag.retrieval.models import EvidenceBatch
+            result = await dependencies.tool_runtime.call("local.knowledge_search", {"query": route.normalized_query},
+                tool_context(state), call_id=f"fast:{state['run_id']}:retrieve")
+            if result.status != "success":
+                raise ConnectionError("knowledge tool unavailable")
+            batch = EvidenceBatch.model_validate(result.data["batch"])
     except asyncio.CancelledError:
         raise
     except (OSError, TimeoutError, ConnectionError, RetrievalUnavailable) as error:

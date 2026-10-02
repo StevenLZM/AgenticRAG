@@ -42,6 +42,7 @@ class ChildResearchState:
     dependency_context: str = ""
     dependency_results: Mapping[str, object] = field(default_factory=dict)
     runtime_config_snapshot: Mapping[str, object] = field(default_factory=dict)
+    tool_context: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +78,8 @@ class SubagentTools:
             query=query, ctx=context, target_id=target_id
         )
 
-    async def calculator(self, expression: str) -> dict[str, object]:
-        return await self._tools.calculator(expression)
+    async def calculator(self, expression: str, *, context: ResearchContext | None = None) -> dict[str, object]:
+        return await self._tools.calculator(expression, ctx=context)
 
 
 class SubagentDispatcher:
@@ -226,6 +227,9 @@ class SubagentDispatcher:
             dependency_context="\n".join(dependency_text),
             dependency_results=_freeze_mapping(dependency_results),
             runtime_config_snapshot=_freeze_mapping(context.snapshot.model_dump(mode="json")),
+            tool_context=_freeze_mapping({"run_id": context.tool_context.run_id,
+                "session_id": context.tool_context.session_id, "deadline": context.tool_context.deadline,
+                "call_prefix": f"{context.call_prefix}:child:{item.id}"}) if context.tool_context is not None else MappingProxyType({}),
         )
 
 

@@ -1,0 +1,268 @@
+{
+  "arguments": {
+    "city": "北京",
+    "cityd": "北京",
+    "destination": "116.411220,39.915458",
+    "origin": "116.324618,40.064687"
+  },
+  "payload": {
+    "origin": "116.324618,40.064687",
+    "destination": "116.411220,39.915458",
+    "distance": "23971",
+    "transits": [
+      {
+        "duration": "4661",
+        "walking_distance": "1843",
+        "segments": [
+          {
+            "walking": {
+              "origin": "116.324654,40.064632",
+              "destination": "116.319344,40.071037",
+              "distance": "1362",
+              "duration": "1165",
+              "steps": [
+                {
+                  "instruction": "步行15米左转",
+                  "road": "",
+                  "distance": "15",
+                  "action": "左转",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "步行48米右转",
+                  "road": "",
+                  "distance": "48",
+                  "action": "右转",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "沿回龙观政府路步行161米右转",
+                  "road": "回龙观政府路",
+                  "distance": "161",
+                  "action": "右转",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "沿G6辅路步行933米右转进入左侧道路",
+                  "road": "G6辅路",
+                  "distance": "933",
+                  "action": "右转",
+                  "assistant_action": "进入左侧道路"
+                },
+                {
+                  "instruction": "沿同成街步行27米向右前方直行",
+                  "road": "同成街",
+                  "distance": "27",
+                  "action": "向右前方直行",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "沿同成街辅路步行145米右转",
+                  "road": "同成街辅路",
+                  "distance": "145",
+                  "action": "右转",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "步行32米左转到达目的地",
+                  "road": "",
+                  "distance": "32",
+                  "action": "左转",
+                  "assistant_action": "到达目的地"
+                },
+                {
+                  "instruction": "步行1米到达龙泽",
+                  "road": "",
+                  "distance": "1",
+                  "action": "",
+                  "assistant_action": "到达龙泽"
+                }
+              ]
+            },
+            "bus": {
+              "buslines": [
+                {
+                  "name": "地铁13号线(西直门--东直门)",
+                  "distance": "3528",
+                  "duration": "600",
+                  "departure_stop": {
+                    "name": "龙泽"
+                  },
+                  "arrival_stop": {
+                    "name": "霍营"
+                  },
+                  "via_stops": [
+                    {
+                      "name": "回龙观"
+                    }
+                  ]
+                }
+              ]
+            },
+            "entrance": {
+              "name": "A北口"
+            },
+            "exit": {
+              "name": ""
+            },
+            "railway": {
+              "name": "",
+              "trip": ""
+            }
+          },
+          {
+            "walking": {
+              "origin": "116.360802,40.070564",
+              "destination": "116.360291,40.071857",
+              "distance": "245",
+              "duration": "210",
+              "steps": [
+                {
+                  "instruction": "步行168米到达霍营",
+                  "road": "",
+                  "distance": "168",
+                  "action": "",
+                  "assistant_action": "到达霍营"
+                }
+              ]
+            },
+            "bus": {
+              "buslines": [
+                {
+                  "name": "地铁8号线(朱辛庄--瀛海)",
+                  "distance": "21030",
+                  "duration": "2400",
+                  "departure_stop": {
+                    "name": "霍营"
+                  },
+                  "arrival_stop": {
+                    "name": "金鱼胡同"
+                  },
+                  "via_stops": [
+                    {
+                      "name": "育新"
+                    },
+                    {
+                      "name": "西小口"
+                    },
+                    {
+                      "name": "永泰庄"
+                    },
+                    {
+                      "name": "林萃桥"
+                    },
+                    {
+                      "name": "森林公园南门"
+                    },
+                    {
+                      "name": "奥林匹克公园"
+                    },
+                    {
+                      "name": "奥体中心"
+                    },
+                    {
+                      "name": "北土城"
+                    },
+                    {
+                      "name": "安华桥"
+                    },
+                    {
+                      "name": "安德里北街"
+                    },
+                    {
+                      "name": "鼓楼大街"
+                    },
+                    {
+                      "name": "什刹海"
+                    },
+                    {
+                      "name": "南锣鼓巷"
+                    },
+                    {
+                      "name": "中国美术馆"
+                    }
+                  ]
+                }
+              ]
+            },
+            "entrance": {
+              "name": ""
+            },
+            "exit": {
+              "name": "B东口"
+            },
+            "railway": {
+              "name": "",
+              "trip": ""
+            }
+          },
+          {
+            "walking": {
+              "origin": "116.411186,39.916370",
+              "destination": "116.411224,39.915443",
+              "distance": "236",
+              "duration": "286",
+              "steps": [
+                {
+                  "instruction": "步行146米右转",
+                  "road": "",
+                  "distance": "146",
+                  "action": "右转",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "步行1米到达目的地",
+                  "road": "",
+                  "distance": "1",
+                  "action": "",
+                  "assistant_action": "到达目的地"
+                },
+                {
+                  "instruction": "步行6米右转",
+                  "road": "",
+                  "distance": "6",
+                  "action": "右转",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "沿金鱼胡同步行71米左转",
+                  "road": "金鱼胡同",
+                  "distance": "71",
+                  "action": "左转",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "沿王府井大街步行6米左转",
+                  "road": "王府井大街",
+                  "distance": "6",
+                  "action": "左转",
+                  "assistant_action": ""
+                },
+                {
+                  "instruction": "沿金鱼胡同步行7米到达目的地",
+                  "road": "金鱼胡同",
+                  "distance": "7",
+                  "action": "",
+                  "assistant_action": "到达目的地"
+                }
+              ]
+            },
+            "bus": {
+              "buslines": []
+            },
+            "entrance": {
+              "name": ""
+            },
+            "exit": {
+              "name": ""
+            },
+            "railway": {
+              "name": "",
+              "trip": ""
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -14,6 +14,7 @@ class RuntimeCapabilities(BaseModel):
     knowledge_base: bool
     external_realtime: Literal[False] = False
     external_lookup: Literal[False] = False
+    tool_capabilities: tuple[str, ...] = ()
 
 
 class PolicyDecision(BaseModel):
@@ -56,6 +57,14 @@ def decide_route(assessment: RouteAssessment, capabilities: RuntimeCapabilities)
         return _clarify()
     missing = tuple(s for s in sources if s in {"external_realtime", "external_lookup"})
     if missing:
+        required = set(assessment.required_capabilities)
+        if required and required.issubset(capabilities.tool_capabilities):
+            if "knowledge_base" in sources and not capabilities.knowledge_base:
+                return technical_failure("retrieval_unavailable")
+            research = "knowledge_base" in sources or assessment.execution_complexity == "multi"
+            return PolicyDecision(next_node="research_agent" if research else "fast_rag",
+                                  route="research" if research else "fast_rag",
+                                  reason_code="available_tool_capabilities")
         return _unavailable(missing, mixed="knowledge_base" in sources)
     if "knowledge_base" in sources:
         if not capabilities.knowledge_base:
@@ -77,6 +86,11 @@ def decide_grade(
     if grade.decision == "clarify" or grade.gap_type == "query_ambiguous":
         return _clarify()
     if grade.gap_type in {"external_realtime_required", "external_lookup_required"}:
+        if capabilities.tool_capabilities and research_attempts < max_research_rounds:
+            # Discovery may establish that no matching tool exists. Do not
+            # confuse an available map service with arbitrary real-time data.
+            return PolicyDecision(next_node="research_agent", route="research",
+                                  reason_code="discover_missing_capability")
         missing: tuple[InformationSource, ...] = (
             "external_realtime" if grade.gap_type == "external_realtime_required" else "external_lookup",
         )

@@ -4,13 +4,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agentic_rag.models.indexing import (
     DEFAULT_INDEX_GENERATION,
     validate_writable_index_generation,
 )
+from agentic_rag.tool_runtime.mcp import McpServerConfig
 
 
 class Settings(BaseSettings):
@@ -75,6 +76,24 @@ class Settings(BaseSettings):
     query_checkpoint_path: Path = Path("var/query_checkpoints.sqlite")
     ingestion_checkpoint_path: Path = Path("var/ingestion_checkpoints.sqlite")
     artifact_root: Path = Path("var/artifacts")
+    tool_runtime_enabled: bool = True
+    tool_invocation_path: Path = Path("var/tool_invocations.sqlite")
+    tool_max_calls_per_run: int = Field(default=12, ge=1, le=48)
+    tool_max_discoveries_per_run: int = Field(default=4, ge=1, le=12)
+    tool_call_timeout_seconds: float = Field(default=20, gt=0, le=60)
+    mcp_servers: tuple[McpServerConfig, ...] = ()
+    amap_mcp_enabled: bool = False
+    amap_mcp_url: str = "https://dashscope.aliyuncs.com/api/v1/mcps/amap-maps/sse"
+    amap_mcp_transport: Literal["sse", "streamable_http"] = "sse"
+    dashscope_api_key: SecretStr | None = Field(default=None, validation_alias=AliasChoices(
+        "DASHSCOPE_API_KEY", "AGENTIC_RAG_DASHSCOPE_API_KEY", "dashscope_api_key"))
+
+    @field_validator("mcp_servers")
+    @classmethod
+    def _unique_mcp_ids(cls, value: tuple[McpServerConfig, ...]) -> tuple[McpServerConfig, ...]:
+        if len({server.id for server in value}) != len(value) or len(value) > 16:
+            raise ValueError("MCP service IDs must be unique; maximum 16 services")
+        return value
 
     @field_validator("index_generation")
     @classmethod

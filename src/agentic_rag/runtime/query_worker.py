@@ -703,10 +703,10 @@ def _public_answer_projection(
     route = route_value if isinstance(route_value, str) else None
     projected = project_public_answer(
         answer,
-        evidence_parent_ids=[] if route == "chat" else parent_ids,
+        evidence_parent_ids=parent_ids if answer.get("audited") is True else [],
         route=route,
         runtime_config_snapshot_id=(runtime_config_snapshot_id if require_audited else None),
-        require_audited=require_audited and route != "chat",
+        require_audited=require_audited and (route != "chat" or answer.get("audited") is True or answer.get("tool_audited") is True),
     )
     if projected is None:
         return None

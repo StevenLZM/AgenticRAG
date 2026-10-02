@@ -34,7 +34,15 @@ knowledge_base merely because answering would involve a lookup. Never infer abse
 
 # OUTPUT
 Return complete JSON only: required_sources (unique nonempty array), retrieval_complexity
-(none|single|multi), needs_clarification (boolean), normalized_query, reason_code.
+(none|single|multi), needs_clarification (boolean), normalized_query, reason_code,
+required_capabilities (array), execution_complexity (none|single|multi).
+For external lookups name the matching installed capability from SERVER CAPABILITIES.tool_capabilities,
+such as maps.search/maps.geocode/maps.route/maps.distance. These are needs, not permissions.
+If no installed capability matches, use an accurate capability name (e.g. finance.quote, weather.lookup),
+never substitute a map capability for unrelated news/weather/stock data. Empty array for general conversation.
+Use execution_complexity=single for focused factual lookups; multi for multi-step planning/comparison.
+Map places/directions are external_lookup, even when the place was mentioned in conversation.
+Mixed document/map requests retain knowledge_base and external_lookup. Do not choose a tool or service.
 reason_code is one of general_conversation, conversation_reference, knowledge_base_lookup,
 knowledge_base_research, realtime_information_required, external_lookup_required,
 mixed_sources, clarification_required.

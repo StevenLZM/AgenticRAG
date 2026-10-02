@@ -37,3 +37,14 @@ def test_fresh_run_has_a_valid_empty_research_pack():
     state = _initial_state()
     fresh = module().fresh_routing_state(state)
     assert _packed_validation_error(fresh["packed_context"], snapshot_from_state(state)) is None
+
+
+def test_new_run_drops_old_tool_results_but_resume_keeps_checkpoint():
+    from tests.unit.query.test_router_fast_path import _initial_state
+    state = _initial_state()
+    state.update(routing_owner_run_id="previous-run", tool_state={"steps": 8, "results": [{"call_id": "old-call"}]})
+    fresh = module().fresh_routing_state(state)
+    assert fresh["tool_state"] == {}
+    state["routing_owner_run_id"] = state["run_id"]
+    assert module().fresh_routing_state(state) == {}
+    assert state["tool_state"]["steps"] == 8

@@ -14,6 +14,8 @@ dependencies = [
   "docling",
   "elasticsearch[async]",
   "fastapi",
+  "jsonschema>=4.23,<5",
+  "mcp==1.26.0",
   "langgraph>=1.2.10,<1.3",
   "langgraph-checkpoint-sqlite>=3.1.1,<3.2",
   "mem0ai==2.0.12",
@@ -31,7 +33,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["httpx", "mypy", "pytest", "pytest-asyncio", "ruff"]
+dev = ["httpx", "mypy", "pytest", "pytest-asyncio", "ruff", "types-jsonschema>=4.23,<5"]
 eval = ["ragas==0.4.2", "langchain-community==0.4.1", "pypdf==6.10.0", "openpyxl==3.1.5"]
 
 [tool.pytest.ini_options]
@@ -49,5 +51,5 @@ where = ["src", "."]
 include = ["agentic_rag*", "evals*", "scripts*"]
 
 [tool.setuptools.package-data]
-agentic_rag = ["api/static/*"]
+agentic_rag = ["api/static/*", "prompts/*.md"]
 evals = ["datasets/*.jsonl", "datasets/real_corpus/*.json", "datasets/real_corpus/assets/*"]

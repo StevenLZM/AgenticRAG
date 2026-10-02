@@ -29,6 +29,12 @@ class RouteAssessment(BaseModel):
         "knowledge_base_research", "realtime_information_required", "external_lookup_required",
         "mixed_sources", "clarification_required",
     ]
+    # Optional defaults preserve stored routing-v2 assessments. Capability names
+    # are requirements, never execution permissions or arbitrary service URLs.
+    required_capabilities: tuple[Annotated[str, StringConstraints(
+        min_length=1, max_length=96, pattern=r"^[a-z][a-z0-9_.-]+$",
+    )], ...] = Field(default=(), max_length=16)
+    execution_complexity: Literal["none", "single", "multi"] = "none"
 
     @model_validator(mode="after")
     def consistent_sources(self) -> RouteAssessment:

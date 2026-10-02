@@ -77,3 +77,14 @@ async def test_router_cancellation_propagates():
     with pytest.raises(asyncio.CancelledError):
         await route_query(_initial_state(), Gateway(asyncio.CancelledError()),
                           capabilities=RuntimeCapabilities(knowledge_base=True))
+
+
+async def test_controlled_reply_ends_previous_tool_loop():
+    state = _initial_state()
+    state.update(await route_query(state, Gateway(TimeoutError()),
+                                  capabilities=RuntimeCapabilities(knowledge_base=True)))
+    state["tool_state"] = {"steps": 3, "active": True}
+    assert state["next_node"] == "chat"
+    result = await run_chat(state, Gateway(AssertionError("no model call")), tool_runtime=object())
+    assert result["next_node"] == "end"
+    assert result["termination_reason"] == "cannot_answer"

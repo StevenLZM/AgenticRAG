@@ -1,0 +1,107 @@
+{
+  "question": "回龙观到王府井的公共交通路线",
+  "answer": {
+    "segments": [
+      {
+        "kind": "content",
+        "text": "公交路线 1；预计耗时 4661 秒。\n公交路线 2；预计耗时 4351 秒。\n公交路线 3；预计耗时 4870 秒。",
+        "evidence_ids": []
+      }
+    ],
+    "evidence_parent_ids": [],
+    "route": "fast_rag",
+    "tool_audited": true,
+    "external_sources": [
+      {
+        "id": "tool-fda972b018196343f5b65148",
+        "tool_id": "mcp.amap_maps.maps_direction_transit_integrated",
+        "provider": "高德地图",
+        "observed_at": "2026-10-02T08:21:52.290495+00:00"
+      }
+    ],
+    "cards": [
+      {
+        "id": "tool-fda972b018196343f5b65148-r0",
+        "title": "公交路线 1",
+        "source_id": "tool-fda972b018196343f5b65148",
+        "url": "https://uri.amap.com/navigation?from=116.324618%2C40.064687&to=116.41122%2C39.915458&mode=bus&src=agentic_rag&callnative=0",
+        "details": {
+          "steps": [
+            "步行 1362 米",
+            "乘坐 地铁13号线(西直门--东直门)：龙泽 上车 → 霍营 下车",
+            "换乘步行 245 米",
+            "换乘 地铁8号线(朱辛庄--瀛海)：霍营 上车 → 金鱼胡同 下车",
+            "步行 236 米"
+          ]
+        },
+        "kind": "route",
+        "origin": {
+          "location": "116.324618,40.064687",
+          "coordinate_system": "GCJ-02"
+        },
+        "destination": {
+          "location": "116.41122,39.915458",
+          "coordinate_system": "GCJ-02"
+        },
+        "mode": "transit",
+        "duration_s": 4661.0
+      },
+      {
+        "id": "tool-fda972b018196343f5b65148-r1",
+        "title": "公交路线 2",
+        "source_id": "tool-fda972b018196343f5b65148",
+        "url": "https://uri.amap.com/navigation?from=116.324618%2C40.064687&to=116.41122%2C39.915458&mode=bus&src=agentic_rag&callnative=0",
+        "details": {
+          "steps": [
+            "步行 584 米",
+            "乘坐 617路(地铁生命科学园站西--来广营北)：回龙观桥南 上车 → 地铁育新站 下车",
+            "换乘步行 167 米",
+            "换乘 地铁8号线(朱辛庄--瀛海)：育新 上车 → 金鱼胡同 下车",
+            "步行 236 米"
+          ]
+        },
+        "kind": "route",
+        "origin": {
+          "location": "116.324618,40.064687",
+          "coordinate_system": "GCJ-02"
+        },
+        "destination": {
+          "location": "116.41122,39.915458",
+          "coordinate_system": "GCJ-02"
+        },
+        "mode": "transit",
+        "duration_s": 4351.0
+      },
+      {
+        "id": "tool-fda972b018196343f5b65148-r2",
+        "title": "公交路线 3",
+        "source_id": "tool-fda972b018196343f5b65148",
+        "url": "https://uri.amap.com/navigation?from=116.324618%2C40.064687&to=116.41122%2C39.915458&mode=bus&src=agentic_rag&callnative=0",
+        "details": {
+          "steps": [
+            "步行 2614 米",
+            "乘坐 地铁8号线(朱辛庄--瀛海)：育新 上车 → 金鱼胡同 下车",
+            "步行 236 米"
+          ]
+        },
+        "kind": "route",
+        "origin": {
+          "location": "116.324618,40.064687",
+          "coordinate_system": "GCJ-02"
+        },
+        "destination": {
+          "location": "116.41122,39.915458",
+          "coordinate_system": "GCJ-02"
+        },
+        "mode": "transit",
+        "duration_s": 4870.0
+      }
+    ]
+  },
+  "route": {
+    "route": "fast_rag",
+    "reason_code": "available_tool_capabilities",
+    "normalized_query": "回龙观到王府井的公共交通路线"
+  },
+  "steps": 6
+}

@@ -1,0 +1,210 @@
+{
+  "query": "回龙观到王府井的公共交通路线",
+  "route": {
+    "route": "fast_rag",
+    "reason_code": "available_tool_capabilities",
+    "normalized_query": "回龙观到王府井的公共交通路线"
+  },
+  "actions": 6,
+  "business_tool_calls": 3,
+  "observed_at": "2026-10-02T08:00:32.058341+00:00",
+  "tool_arguments": {
+    "city": "北京",
+    "cityd": "北京",
+    "destination": "116.411220,39.915458",
+    "origin": "116.324618,40.064687"
+  },
+  "upstream_routes": [
+    {
+      "number": 1,
+      "duration_s": "4661",
+      "walking_distance_m": "1843",
+      "lines": [
+        {
+          "name": "地铁13号线(西直门--东直门)",
+          "departure": "龙泽",
+          "arrival": "霍营"
+        },
+        {
+          "name": "地铁8号线(朱辛庄--瀛海)",
+          "departure": "霍营",
+          "arrival": "金鱼胡同"
+        }
+      ]
+    },
+    {
+      "number": 2,
+      "duration_s": "4330",
+      "walking_distance_m": "987",
+      "lines": [
+        {
+          "name": "617路(地铁生命科学园站西--来广营北)",
+          "departure": "回龙观桥南",
+          "arrival": "地铁育新站"
+        },
+        {
+          "name": "地铁8号线(朱辛庄--瀛海)",
+          "departure": "育新",
+          "arrival": "金鱼胡同"
+        }
+      ]
+    },
+    {
+      "number": 3,
+      "duration_s": "4870",
+      "walking_distance_m": "2850",
+      "lines": [
+        {
+          "name": "地铁8号线(朱辛庄--瀛海)",
+          "departure": "育新",
+          "arrival": "金鱼胡同"
+        }
+      ]
+    },
+    {
+      "number": 4,
+      "duration_s": "4555",
+      "walking_distance_m": "803",
+      "lines": [
+        {
+          "name": "681路区间(海淀中街--地铁霍营站)",
+          "departure": "回龙观桥北",
+          "arrival": "地铁霍营站"
+        },
+        {
+          "name": "地铁8号线(朱辛庄--瀛海)",
+          "departure": "霍营",
+          "arrival": "金鱼胡同"
+        }
+      ]
+    },
+    {
+      "number": 5,
+      "duration_s": "4600",
+      "walking_distance_m": "803",
+      "lines": [
+        {
+          "name": "681路(海淀中街--龙锦苑公交场站)",
+          "departure": "回龙观桥北",
+          "arrival": "地铁霍营站"
+        },
+        {
+          "name": "地铁8号线(朱辛庄--瀛海)",
+          "departure": "霍营",
+          "arrival": "金鱼胡同"
+        }
+      ]
+    }
+  ],
+  "public_answer": {
+    "segments": [
+      {
+        "kind": "content",
+        "text": "公交路线 1；预计耗时 4661 秒。\n公交路线 2；预计耗时 4330 秒。\n公交路线 3；预计耗时 4870 秒。\n公交路线 4；预计耗时 4555 秒。\n公交路线 5；预计耗时 4600 秒。",
+        "evidence_ids": []
+      }
+    ],
+    "evidence_parent_ids": [],
+    "route": "fast_rag",
+    "tool_audited": true,
+    "external_sources": [
+      {
+        "id": "tool-06a1412789d15da61a5f4cd4",
+        "tool_id": "mcp.amap_maps.maps_direction_transit_integrated",
+        "provider": "高德地图",
+        "observed_at": "2026-10-02T08:00:32.058341+00:00"
+      }
+    ],
+    "cards": [
+      {
+        "id": "tool-06a1412789d15da61a5f4cd4-r0",
+        "title": "公交路线 1",
+        "source_id": "tool-06a1412789d15da61a5f4cd4",
+        "url": "https://uri.amap.com/navigation?from=116.324618%2C40.064687&to=116.41122%2C39.915458&mode=bus&src=agentic_rag&callnative=0",
+        "kind": "route",
+        "origin": {
+          "location": "116.324618,40.064687",
+          "coordinate_system": "GCJ-02"
+        },
+        "destination": {
+          "location": "116.41122,39.915458",
+          "coordinate_system": "GCJ-02"
+        },
+        "mode": "transit",
+        "duration_s": 4661.0
+      },
+      {
+        "id": "tool-06a1412789d15da61a5f4cd4-r1",
+        "title": "公交路线 2",
+        "source_id": "tool-06a1412789d15da61a5f4cd4",
+        "url": "https://uri.amap.com/navigation?from=116.324618%2C40.064687&to=116.41122%2C39.915458&mode=bus&src=agentic_rag&callnative=0",
+        "kind": "route",
+        "origin": {
+          "location": "116.324618,40.064687",
+          "coordinate_system": "GCJ-02"
+        },
+        "destination": {
+          "location": "116.41122,39.915458",
+          "coordinate_system": "GCJ-02"
+        },
+        "mode": "transit",
+        "duration_s": 4330.0
+      },
+      {
+        "id": "tool-06a1412789d15da61a5f4cd4-r2",
+        "title": "公交路线 3",
+        "source_id": "tool-06a1412789d15da61a5f4cd4",
+        "url": "https://uri.amap.com/navigation?from=116.324618%2C40.064687&to=116.41122%2C39.915458&mode=bus&src=agentic_rag&callnative=0",
+        "kind": "route",
+        "origin": {
+          "location": "116.324618,40.064687",
+          "coordinate_system": "GCJ-02"
+        },
+        "destination": {
+          "location": "116.41122,39.915458",
+          "coordinate_system": "GCJ-02"
+        },
+        "mode": "transit",
+        "duration_s": 4870.0
+      },
+      {
+        "id": "tool-06a1412789d15da61a5f4cd4-r3",
+        "title": "公交路线 4",
+        "source_id": "tool-06a1412789d15da61a5f4cd4",
+        "url": "https://uri.amap.com/navigation?from=116.324618%2C40.064687&to=116.41122%2C39.915458&mode=bus&src=agentic_rag&callnative=0",
+        "kind": "route",
+        "origin": {
+          "location": "116.324618,40.064687",
+          "coordinate_system": "GCJ-02"
+        },
+        "destination": {
+          "location": "116.41122,39.915458",
+          "coordinate_system": "GCJ-02"
+        },
+        "mode": "transit",
+        "duration_s": 4555.0
+      },
+      {
+        "id": "tool-06a1412789d15da61a5f4cd4-r4",
+        "title": "公交路线 5",
+        "source_id": "tool-06a1412789d15da61a5f4cd4",
+        "url": "https://uri.amap.com/navigation?from=116.324618%2C40.064687&to=116.41122%2C39.915458&mode=bus&src=agentic_rag&callnative=0",
+        "kind": "route",
+        "origin": {
+          "location": "116.324618,40.064687",
+          "coordinate_system": "GCJ-02"
+        },
+        "destination": {
+          "location": "116.41122,39.915458",
+          "coordinate_system": "GCJ-02"
+        },
+        "mode": "transit",
+        "duration_s": 4600.0
+      }
+    ]
+  },
+  "transport_passed": true,
+  "transit_step_presentation_passed": false,
+  "tested_boundary": "latest workspace Router + ModelGateway + ToolRuntime + actual AMap SSE + public result builder",
+  "localhost_8000_restarted": false
+}

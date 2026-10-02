@@ -163,6 +163,7 @@ class _CrossEncoder:
 
 async def test_production_composition_graph_factory_delegates_research_with_server_scope(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     """A production-composed graph delegates child retrieval instead of refusing it."""
     gateway = _ScriptedGateway()
@@ -182,6 +183,8 @@ async def test_production_composition_graph_factory_delegates_research_with_serv
         memory_service=_PipelineMemory(),
     )
     settings = Settings(
+        _env_file=None,
+        tool_invocation_path=tmp_path / "tool-invocations.sqlite",
         mysql_dsn="mysql+asyncmy://user:password@127.0.0.1:3306/app",
         deepseek_base_url="https://api.deepseek.com",
         qwen_embedding_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",

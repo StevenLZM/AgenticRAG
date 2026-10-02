@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import TypedDict
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -29,6 +30,18 @@ class UploadVersions:
     pipeline: str
     embedding: str
     index_generation: str
+
+
+class _VersionCreationValues(TypedDict):
+    content_hash: str
+    parser_version: str
+    pipeline_version: str
+    embedding_version: str
+    index_generation: str
+    document_id: str
+    document_version_id: str
+    version_status: DocumentVersionStatus
+    transaction: AsyncSession
 
 
 class UploadRejectedError(ValueError):
@@ -99,7 +112,7 @@ class DocumentService:
         )
         try:
             async with self._session_factory.begin() as transaction:
-                values = dict(
+                values = _VersionCreationValues(
                     content_hash=decision.content_hash,
                     parser_version=self._versions.parser,
                     pipeline_version=self._versions.pipeline,

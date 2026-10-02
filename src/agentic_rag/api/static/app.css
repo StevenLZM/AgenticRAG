@@ -371,6 +371,29 @@ input:focus-visible,
   font-size: 11px;
   color: #8b8e73;
 }
+.tool-cards {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+.tool-cards[hidden] { display: none; }
+.tool-card {
+  border: 1px solid #d7e1d6;
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: #f8faf6;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.tool-card-title { margin: 0 0 5px; font-size: 15px; color: #304c3d; }
+.tool-card-address, .tool-card-metrics, .tool-card-detail { margin: 5px 0; }
+.tool-card-metrics { color: #52695c; }
+.tool-card-details { margin: 9px 0; }
+.tool-card-details summary { cursor: pointer; color: #3b7660; }
+.tool-card-steps { padding-left: 21px; }
+.tool-card-link { display: inline-block; color: #31634d; margin-top: 5px; }
+.tool-source { color: #637266; font-size: 11px; margin: 0; overflow-wrap: anywhere; }
 .composer-area {
   position: relative;
   flex-shrink: 0;

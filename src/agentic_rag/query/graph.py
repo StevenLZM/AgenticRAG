@@ -13,7 +13,7 @@ import time
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator, Protocol, cast
+from typing import Any, AsyncIterator, Protocol, cast
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -89,6 +89,7 @@ class QueryGraphDependencies:
     deployment_snapshot_id: str | None = None
     capabilities: RuntimeCapabilities | None = None
     conversations: ConversationReader | None = None
+    tool_runtime: Any = None
 
 
 def query_checkpoint_config(state: QueryState) -> RunnableConfig:
@@ -121,6 +122,8 @@ def build_query_graph(
         evidence_builder=dependencies.evidence_builder,
         evidence_grader=dependencies.evidence_grader,
         capabilities=dependencies.capabilities,
+        tool_runtime=dependencies.tool_runtime,
+        gateway=dependencies.gateway,
     )
 
     def phase_reporter(state: QueryState):
@@ -160,7 +163,7 @@ def build_query_graph(
     async def chat(state: QueryState) -> dict[str, object]:
         await phase_reporter(state)("processing")
         async with _trace_span(dependencies, state, "graph.node.chat"):
-            return await run_chat(state, dependencies.gateway)
+            return await run_chat(state, dependencies.gateway, tool_runtime=dependencies.tool_runtime)
 
     async def fast_rag(state: QueryState) -> dict[str, object]:
         async with _trace_span(dependencies, state, "graph.node.fast_rag"):
@@ -181,7 +184,7 @@ def build_query_graph(
         return {}
 
     async def research_agent_loop(state: QueryState) -> dict[str, object]:
-        if dependencies.capabilities is not None and state.get("last_evidence_grade"):
+        if dependencies.tool_runtime is None and dependencies.capabilities is not None and state.get("last_evidence_grade"):
             grade = EvidenceGrade.model_validate(state["last_evidence_grade"])
             if grade.gap_type in {"external_realtime_required", "external_lookup_required"}:
                 assessment = RouteAssessment.model_validate(state["route_assessment"]) if state.get("route_assessment") else None
@@ -245,8 +248,9 @@ def build_query_graph(
         if dependencies.capabilities is not None:
             try:
                 async with _trace_span(dependencies, state, "graph.node.evidence_grader"):
+                    from agentic_rag.query.tool_loop import document_question
                     grade_v2 = await dependencies.evidence_grader.grade(
-                        reasoning_question(state), _packed_from_state(state), scope=scope_from_state(state),
+                        document_question(state) or reasoning_question(state), _packed_from_state(state), scope=scope_from_state(state),
                         snapshot=snapshot_from_state(state), capabilities=dependencies.capabilities,
                         routing_context=RoutingContext.model_validate(state["routing_context"]) if state.get("routing_context") else None)
                 grade_v2 = EvidenceGrade.model_validate(_unwrap(grade_v2))
@@ -292,8 +296,9 @@ def build_query_graph(
                         }
                     # `generate_with_mandatory_audits` is the sole owner of revision
                     # policy; subsequent graph nodes expose its completed gates only.
+                    from agentic_rag.query.tool_loop import document_question
                     update = await generate_with_mandatory_audits(
-                        question=reasoning_question(state), state=state, packed_evidence=packed,
+                        question=document_question(state) or reasoning_question(state), state=state, packed_evidence=packed,
                         scope=scope_from_state(state), snapshot=snapshot_from_state(state),
                         generator=dependencies.generator, faithfulness_auditor=dependencies.faithfulness_auditor,
                         citation_validator=dependencies.citation_validator, authorization={},
@@ -320,13 +325,31 @@ def build_query_graph(
     async def finalize(state: QueryState) -> dict[str, object]:
         async with _trace_span(dependencies, state, "graph.node.finalize"):
             async with _trace_span(dependencies, state, "memory"):
+                tool_update: dict[str, object] = {}
+                if not state.get("termination_reason") and (state.get("tool_state") or {}).get("results"):
+                    from agentic_rag.query.tool_answers import build_tool_answer
+                    from agentic_rag.query.tool_loop import tool_results
+                    previous = state.get("answer") or {}
+                    # External facts append only after document generation has
+                    # passed its own mandatory authorization/citation audits.
+                    if previous.get("audited") is True:
+                        tool_state = state.get("tool_state") or {}
+                        selected = tool_state.get("selected_result_ids")
+                        results = tool_results(state)
+                        if isinstance(selected, list):
+                            results = [r for r in results if r.call_id in selected]
+                        maximum = tool_state.get("max_items", 5)
+                        combined = build_tool_answer(results, route=str((state.get("route") or {}).get("route", "chat")),
+                                                     document_answer=dict(previous), max_cards=int(maximum) if isinstance(maximum, int) else 5)
+                        if combined is not None:
+                            tool_update["answer"] = combined
                 termination = state.get("termination_reason")
                 completed = "completed" if termination is None else str(termination)
                 await _event(dependencies, state, "ANSWER_FINALIZED", completed)
                 # Publication precedes best-effort memory extraction.  A memory outage
                 # must never retract an answer that has already passed audits.
                 if snapshot_from_state(state).evaluation is not None:
-                    return {"termination_reason": completed, "next_node": "end"}
+                    return {**tool_update, "termination_reason": completed, "next_node": "end"}
                 try:
                     await dependencies.memory.extract_and_store(
                         scope_from_state(state), state["run_id"], _public_messages(state)
@@ -336,12 +359,12 @@ def build_query_graph(
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except Exception as error:
-                    return {
+                    return {**tool_update,
                         "termination_reason": completed,
                         "errors": [*state.get("errors", []), {"code": "memory_finalize_unavailable", "detail": type(error).__name__}],
                         "next_node": "end",
                     }
-                return {"termination_reason": completed, "next_node": "end"}
+                return {**tool_update, "termination_reason": completed, "next_node": "end"}
 
     def after_route(state: QueryState) -> str:
         if state.get("next_node") == "chat":
@@ -349,6 +372,8 @@ def build_query_graph(
         return "fast_rag" if state.get("next_node") == "fast_rag" else "research_agent_loop"
 
     def after_fast_grade(state: QueryState) -> str:
+        if state.get("next_node") == "fast_rag":
+            return "fast_rag"
         if state.get("next_node") == "chat":
             return "chat"
         next_node = state.get("next_node")
@@ -356,6 +381,15 @@ def build_query_graph(
             return "generate"
         if next_node == "research_agent":
             return "research_agent_loop"
+        return "finalize"
+
+    def after_chat(state: QueryState) -> str:
+        if state.get("next_node") == "chat" and state.get("tool_state"):
+            return "chat"
+        if state.get("next_node") == "research_agent":
+            return "research_agent_loop"
+        if state.get("next_node") == "generate":
+            return "generate"
         return "finalize"
 
     def after_research(state: QueryState) -> str:
@@ -388,6 +422,9 @@ def build_query_graph(
                 update = await function(state, config)
             else:
                 update = await function(state)
+            answer = update.get("answer")
+            if name != "finalize" and isinstance(answer, dict) and answer.get("tool_audited") is True:
+                await phase_reporter(state)("auditing")
             if dependencies.capabilities is not None:
                 update["executed_path"] = path
             return update
@@ -403,9 +440,10 @@ def build_query_graph(
     builder.add_edge(START, "memory_loader")
     builder.add_edge("memory_loader", "route")
     builder.add_conditional_edges("route", after_route, {"chat": "chat", "fast_rag": "fast_rag", "research_agent_loop": "research_agent_loop"})
-    builder.add_edge("chat", "finalize")
+    builder.add_conditional_edges("chat", after_chat, {"chat": "chat", "research_agent_loop": "research_agent_loop",
+                                 "generate": "generate", "finalize": "finalize"})
     builder.add_edge("fast_rag", "record_fast_grade")
-    builder.add_conditional_edges("record_fast_grade", after_fast_grade, {"chat": "chat", "generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
+    builder.add_conditional_edges("record_fast_grade", after_fast_grade, {"chat": "chat", "fast_rag": "fast_rag", "generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})
     builder.add_conditional_edges("research_agent_loop", after_research, {"chat": "chat", "research_agent_loop": "research_agent_loop", "evidence_builder": "evidence_builder", "finalize": "finalize"})
     builder.add_conditional_edges("evidence_builder", after_evidence_builder, {"evidence_grader": "evidence_grader", "finalize": "finalize"})
     builder.add_conditional_edges("evidence_grader", after_grade, {"chat": "chat", "generate": "generate", "research_agent_loop": "research_agent_loop", "finalize": "finalize"})

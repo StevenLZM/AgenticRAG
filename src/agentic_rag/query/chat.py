@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import Sequence
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,14 +30,17 @@ def controlled_reply(mode: str, reason_code: str, *, missing_sources: Sequence[I
     raise ValueError("not a controlled response mode")
 
 
-async def run_chat(state: QueryState, gateway: ModelGateway) -> dict[str, object]:
+async def run_chat(state: QueryState, gateway: ModelGateway, *, tool_runtime: Any = None) -> dict[str, object]:
     mode = state.get("response_mode")
     if mode in {"capability_unavailable", "clarify", "technical_error"}:
         policy = PolicyDecision.model_validate(state.get("policy_decision"))
         return {"answer": {"route": "chat", "status": policy.termination_reason,
                            "segments": [{"kind": "content", "text": controlled_reply(
                                mode, policy.reason_code, missing_sources=policy.missing_sources), "evidence_ids": []}]},
-                "termination_reason": policy.termination_reason, "audit_results": []}
+                "termination_reason": policy.termination_reason, "audit_results": [], "next_node": "end"}
+    if tool_runtime is not None:
+        from agentic_rag.query.tool_loop import run_tool_step
+        return await run_tool_step(state, gateway, tool_runtime, strategy="chat")
     call = ModelCall(
         model_role="light", snapshot=snapshot_from_state(state), max_output_tokens=1024,
         messages=(

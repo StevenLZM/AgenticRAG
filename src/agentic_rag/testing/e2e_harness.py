@@ -554,7 +554,7 @@ def _parent(parent_id: str, user_id: str) -> ParentEvidence:
         ast_locator="document/body/paragraph[1]",
         lane="dense",
         lane_rank=1,
-        score=1.0,
+        retrieval_score=1.0,
     )
     return ParentEvidence(
         parent_id=parent_id,

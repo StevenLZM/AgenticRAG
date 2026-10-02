@@ -4,9 +4,9 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections.abc import Sequence
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
@@ -30,6 +30,7 @@ class RoutingContext(BaseModel):
     timezone: str = "Asia/Shanghai"
     history: tuple[RoutingTurn, ...] = ()
     history_available: bool = True
+    map_references: tuple[dict[str, Any], ...] = Field(default=(), max_length=24)
 
 
 class RoutingContextUnavailable(RuntimeError):
@@ -73,7 +74,7 @@ def fresh_routing_state(state: QueryState) -> dict[str, object]:
             "initial_route": "", "memory_context": None, "evidence": [], "retrieval_batches": [],
             "packed_context": PackedEvidence(items=(), manifest={}, rendered_context="", token_count=0,
                 index_generation=snapshot_from_state(state).index_generation).model_dump(mode="json"),
-            "research": {}, "answer": {}, "errors": [],
+            "research": {}, "tool_state": {}, "answer": {}, "errors": [],
             "termination_reason": None, "research_attempt_count": 0, "revision_count": 0,
             "audit_results": [], "next_node": "route", "routing_policy_version": "routing-v2"}
 

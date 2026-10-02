@@ -37,6 +37,7 @@ class QueryState(TypedDict):
     executed_path: NotRequired[list[str]]
     last_evidence_grade: NotRequired[dict[str, JsonValue]]
     research: NotRequired[dict[str, JsonValue]]
+    tool_state: NotRequired[dict[str, JsonValue]]
     evidence: NotRequired[list[dict[str, JsonValue]]]
     retrieval_batches: NotRequired[list[dict[str, JsonValue]]]
     packed_context: NotRequired[dict[str, JsonValue]]
