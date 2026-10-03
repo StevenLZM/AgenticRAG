@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agentic_rag.models.indexing import (
     DEFAULT_INDEX_GENERATION,
+    LexicalAnalysis,
     validate_writable_index_generation,
 )
 from agentic_rag.tool_runtime.mcp import McpServerConfig
@@ -73,6 +74,7 @@ class Settings(BaseSettings):
     parser_version: str = "docling-v1"
     ingestion_pipeline_version: str = "ingestion-v2"
     index_generation: str = DEFAULT_INDEX_GENERATION
+    lexical_analysis: LexicalAnalysis = "standard"
     query_checkpoint_path: Path = Path("var/query_checkpoints.sqlite")
     ingestion_checkpoint_path: Path = Path("var/ingestion_checkpoints.sqlite")
     artifact_root: Path = Path("var/artifacts")

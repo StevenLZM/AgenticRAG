@@ -13,7 +13,10 @@ def test_settings_use_local_defaults(monkeypatch):
         "AGENTIC_RAG_QWEN_EMBEDDING_BASE_URL",
         "https://embeddings.example.invalid/v1",
     )
-    settings = Settings()
+    # Deployment overrides in .env.local must not redefine the code defaults.
+    monkeypatch.delenv("AGENTIC_RAG_INDEX_GENERATION", raising=False)
+    monkeypatch.delenv("AGENTIC_RAG_LEXICAL_ANALYSIS", raising=False)
+    settings = Settings(_env_file=None)
     assert settings.redis_url == "redis://127.0.0.1:6379/0"
     assert settings.elasticsearch_url == "http://localhost:9200"
     assert settings.embedding_dimensions == 1024
@@ -24,6 +27,7 @@ def test_settings_use_local_defaults(monkeypatch):
     assert settings.max_upload_bytes == 50 * 1024 * 1024
     assert settings.ingestion_pipeline_version == "ingestion-v2"
     assert settings.index_generation == "index-v3"
+    assert settings.lexical_analysis == "standard"
 
 
 def test_mem0_can_be_explicitly_disabled_for_local_diagnostics(monkeypatch) -> None:

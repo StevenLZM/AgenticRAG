@@ -33,6 +33,9 @@ def isolated_environment(settings, allocation: dict, *, root: Path) -> dict[str,
     if not artifacts.is_relative_to(allowed) or artifacts == allowed:
         raise ValueError("artifact root must be inside evaluation artifacts")
     values = {
+        # Existing allocations predate IK and must never inherit a business
+        # analyzer change into their independently provisioned ES instance.
+        "LEXICAL_ANALYSIS": allocation.get("lexical_analysis", "standard"),
         "MYSQL_DSN": mysql.set(database=allocation["mysql_database"]).render_as_string(hide_password=False),
         "REDIS_URL": urlunsplit(redis._replace(path=f"/{db}")),
         "ELASTICSEARCH_URL": allocation["elasticsearch_url"],

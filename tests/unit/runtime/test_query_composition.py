@@ -211,14 +211,15 @@ async def test_query_worker_alias_startup_uses_current_index_generation(
 ) -> None:
     import scripts.run_query_worker as worker_entrypoint
 
-    calls: list[tuple[object, str]] = []
+    calls: list[tuple[object, str, str]] = []
 
     class RecordingAliasStore:
-        def __init__(self, client: object) -> None:
+        def __init__(self, client: object, *, lexical_analysis: str = "standard") -> None:
             self._client = client
+            self._lexical_analysis = lexical_analysis
 
         async def ensure_active_alias(self, index_generation: str) -> bool:
-            calls.append((self._client, index_generation))
+            calls.append((self._client, index_generation, self._lexical_analysis))
             return True
 
     client = object()
@@ -226,11 +227,11 @@ async def test_query_worker_alias_startup_uses_current_index_generation(
         worker_entrypoint, "ElasticsearchChildIndexStore", RecordingAliasStore
     )
 
-    settings = _settings(index_generation="runtime-index")
+    settings = _settings(index_generation="runtime-index", lexical_analysis="ik")
     container = SimpleNamespace(elasticsearch=client)
     await worker_entrypoint.ensure_active_child_alias(container, settings)
 
-    assert calls == [(client, "runtime-index")]
+    assert calls == [(client, "runtime-index", "ik")]
 
 
 def _settings(**overrides: object) -> Settings:

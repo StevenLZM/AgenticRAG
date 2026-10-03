@@ -19,6 +19,7 @@ from agentic_rag.models.indexing import (
     ACTIVE_CHILD_INDEX_ALIAS,
     DEFAULT_INDEX_GENERATION,
     LEGACY_INDEX_GENERATIONS,
+    LexicalAnalysis,
     validate_index_generation,
 )
 
@@ -47,11 +48,15 @@ class ElasticsearchChildIndexStore:
         client: AsyncElasticsearch,
         *,
         bulk_batch_size: int = 500,
+        lexical_analysis: LexicalAnalysis = "standard",
     ) -> None:
         if bulk_batch_size <= 0:
             raise ValueError("bulk_batch_size must be positive")
         self._client = client
         self._bulk_batch_size = bulk_batch_size
+        if lexical_analysis not in {"standard", "ik"}:
+            raise ValueError("unsupported lexical analysis profile")
+        self._lexical_analysis = lexical_analysis
 
     @staticmethod
     def index_name(index_generation: str) -> str:
@@ -79,7 +84,7 @@ class ElasticsearchChildIndexStore:
             )
             return False
 
-        await self._ensure_index(index_generation)
+        await self.ensure_index(index_generation)
         targets = await self._read_active_alias_targets()
         if not targets:
             await self._client.indices.put_alias(
@@ -112,7 +117,7 @@ class ElasticsearchChildIndexStore:
             raise ChildIndexWriteError(
                 f"cannot switch active alias to missing index {index!r}"
             )
-        await self._ensure_index(index_generation)
+        await self.ensure_index(index_generation)
         targets = await self._read_active_alias_targets()
         if targets == (index,):
             return False
@@ -158,7 +163,7 @@ class ElasticsearchChildIndexStore:
         *,
         before_side_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
-        await self._ensure_index(context.index_generation)
+        await self.ensure_index(context.index_generation)
         index = self.index_name(context.index_generation)
         staged = 0
         for start in range(0, len(children), self._bulk_batch_size):
@@ -270,14 +275,14 @@ class ElasticsearchChildIndexStore:
             {"term": {"search_type": "document"}},
         ]
 
-    async def _ensure_index(self, index_generation: str) -> None:
+    async def ensure_index(self, index_generation: str) -> None:
         index = self.index_name(index_generation)
         if index_generation in LEGACY_INDEX_GENERATIONS:
             raise ChildIndexMappingError(
                 f"Index Generation {index_generation!r} uses the legacy Child schema; "
                 f"stage new versions with {DEFAULT_INDEX_GENERATION!r}"
             )
-        expected_mapping = _index_mapping(index_generation)
+        expected_mapping = _index_mapping(index_generation, self._lexical_analysis)
         try:
             await self._client.indices.create(
                 index=index,
@@ -289,22 +294,28 @@ class ElasticsearchChildIndexStore:
             error_type = detail.get("type") if isinstance(detail, Mapping) else None
             if error_type != "resource_already_exists_exception":
                 raise
-            response = await self._client.indices.get_mapping(index=index)
-            mapping_body = cast(Mapping[str, Any], response.body)
-            index_body = mapping_body.get(index)
-            actual_mapping = (
-                index_body.get("mappings") if isinstance(index_body, Mapping) else None
+            await self.validate_index(index_generation)
+
+    async def validate_index(self, index_generation: str) -> None:
+        """Read-only compatibility check; never create or alter an index."""
+        index = self.index_name(index_generation)
+        expected_mapping = _index_mapping(index_generation, self._lexical_analysis)
+        response = await self._client.indices.get_mapping(index=index)
+        mapping_body = cast(Mapping[str, Any], response.body)
+        index_body = mapping_body.get(index)
+        actual_mapping = (
+            index_body.get("mappings") if isinstance(index_body, Mapping) else None
+        )
+        if not isinstance(actual_mapping, Mapping):
+            raise ChildIndexMappingError(
+                f"existing index {index!r} did not return a readable strict mapping"
             )
-            if not isinstance(actual_mapping, Mapping):
-                raise ChildIndexMappingError(
-                    f"existing index {index!r} did not return a readable strict mapping"
-                )
-            differences = _mapping_differences(actual_mapping, expected_mapping)
-            if differences:
-                raise ChildIndexMappingError(
-                    f"existing index {index!r} has an incompatible strict mapping: "
-                    + "; ".join(differences)
-                )
+        differences = _mapping_differences(actual_mapping, expected_mapping)
+        if differences:
+            raise ChildIndexMappingError(
+                f"existing index {index!r} has an incompatible strict mapping: "
+                + "; ".join(differences)
+            )
 
     async def _read_active_alias_targets(self) -> tuple[str, ...]:
         try:
@@ -390,14 +401,15 @@ def _bulk_failures(body: Mapping[str, Any]) -> list[str]:
     return failures or ["unknown bulk failure"]
 
 
-def _index_mapping(index_generation: str) -> dict[str, Any]:
+def _index_mapping(index_generation: str, lexical_analysis: LexicalAnalysis = "standard") -> dict[str, Any]:
     return {
         "dynamic": "strict",
         "_meta": {
             "index_generation": index_generation,
             "embedding_model": EMBEDDING_MODEL,
             "embedding_dimensions": EMBEDDING_DIMENSIONS,
-            "schema_version": 2,
+            "schema_version": 3 if lexical_analysis == "ik" else 2,
+            **({"lexical_analysis": "ik-v1"} if lexical_analysis == "ik" else {}),
         },
         "properties": {
             "id": {"type": "keyword"},
@@ -414,7 +426,11 @@ def _index_mapping(index_generation: str) -> dict[str, Any]:
             "heading_ast_locators": {"type": "keyword"},
             "content_type": {"type": "keyword"},
             "content": {"type": "text"},
-            "contextualized_content": {"type": "text"},
+            "contextualized_content": {
+                "type": "text",
+                **({"fields": {"zh": {"type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart"}}}
+                   if lexical_analysis == "ik" else {}),
+            },
             "token_count": {"type": "integer"},
             "page_from": {"type": "integer"},
             "page_to": {"type": "integer"},

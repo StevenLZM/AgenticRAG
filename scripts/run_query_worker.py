@@ -53,7 +53,7 @@ async def ensure_active_child_alias(
     container: AppContainer, settings: Settings
 ) -> None:
     """Repair a missing configured Child alias before consuming Query Outbox."""
-    await ElasticsearchChildIndexStore(container.elasticsearch).ensure_active_alias(
+    await ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis).ensure_active_alias(
         settings.index_generation
     )
 

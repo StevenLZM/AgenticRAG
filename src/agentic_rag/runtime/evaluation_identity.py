@@ -6,7 +6,7 @@ from pathlib import Path
 
 def evaluation_config_fingerprint(settings):
     names = ("deepseek_base_url", "deepseek_protocol", "qwen_embedding_base_url", "main_model", "light_model",
-             "embedding_model", "embedding_dimensions", "reranker_model", "max_concurrent_query_runs",
+             "embedding_model", "embedding_dimensions", "lexical_analysis", "reranker_model", "max_concurrent_query_runs",
              "max_concurrent_llm_calls", "max_concurrent_reranks", "max_parallel_subagents_per_run",
              "max_research_rounds", "max_answer_revisions", "query_run_timeout_seconds", "max_evidence_tokens",
              "research_context_soft_limit_tokens", "tool_runtime_enabled", "tool_max_calls_per_run",

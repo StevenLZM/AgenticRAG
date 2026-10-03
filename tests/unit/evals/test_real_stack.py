@@ -28,6 +28,18 @@ def test_environment_isolates_all_persistent_boundaries(tmp_path):
         assert env["AGENTIC_RAG_" + name].startswith(str(tmp_path / "var/artifacts/evals/example/runtime"))
 
 
+def test_existing_evaluation_allocation_does_not_inherit_business_ik(tmp_path):
+    config = settings()
+    config.lexical_analysis = "ik"
+    env = isolated_environment(config, allocation(), root=tmp_path)
+    assert env["AGENTIC_RAG_LEXICAL_ANALYSIS"] == "standard"
+
+
+def test_evaluation_can_explicitly_select_ik(tmp_path):
+    env = isolated_environment(settings(), {**allocation(), "lexical_analysis": "ik"}, root=tmp_path)
+    assert env["AGENTIC_RAG_LEXICAL_ANALYSIS"] == "ik"
+
+
 @pytest.mark.parametrize("change", [
     {"mysql_database": "business"}, {"redis_database_candidate": 0},
     {"elasticsearch_url": "http://127.0.0.1:9200"}, {"artifact_root": "../outside"},

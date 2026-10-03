@@ -107,6 +107,32 @@ class _Client:
         return _Response(self.lifecycle_response)
 
 
+@pytest.mark.asyncio
+async def test_ik_staging_preserves_standard_field_and_indexes_chinese_subfield() -> None:
+    client = _Client()
+    store = ElasticsearchChildIndexStore(cast(Any, client), lexical_analysis="ik")
+
+    await store.stage(_context(index_generation="index-v4"), [_embedded_child(index_generation="index-v4")])
+
+    assert client.indices.mappings["properties"]["contextualized_content"] == {
+        "type": "text",
+        "fields": {"zh": {"type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart"}},
+    }
+    assert client.indices.mappings["_meta"]["lexical_analysis"] == "ik-v1"
+    assert client.operations[1]["contextualized_content"] == "Heading\nhello"
+    assert client.operations[1]["embedding"] == [0.1] * 1024
+
+
+@pytest.mark.asyncio
+async def test_ik_cannot_silently_reuse_a_standard_index() -> None:
+    client = _Client()
+    await ElasticsearchChildIndexStore(cast(Any, client)).stage(_context(), [_embedded_child()])
+    store = ElasticsearchChildIndexStore(cast(Any, client), lexical_analysis="ik")
+    with pytest.raises(ChildIndexMappingError, match="incompatible"):
+        await store.stage(_context(), [_embedded_child()])
+    assert client.bulk_calls == 1
+
+
 def _embedded_child(*, index_generation: str = "index-v2") -> EmbeddedChild:
     locator = AstLocator(
         spans=(

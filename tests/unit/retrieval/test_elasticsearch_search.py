@@ -58,6 +58,32 @@ def _filter(**overrides: Any) -> SearchFilter:
 
 
 @pytest.mark.asyncio
+async def test_ik_bm25_prefers_chinese_field_without_adding_a_recall_lane() -> None:
+    client = _Client()
+    lexical = ElasticsearchBm25Index(cast(Any, client), index_generation="index-v4", lexical_analysis="ik")
+    hits = await lexical.search("京东工作经历", _filter(index_generation="index-v4"), 7)
+    assert client.calls[0]["query"]["bool"]["must"] == {
+        "multi_match": {"query": "京东工作经历", "fields": ["contextualized_content.zh^2", "contextualized_content"],
+                        "type": "best_fields", "tie_breaker": 0.0},
+    }
+    assert client.calls[0]["query"]["bool"]["filter"] == [
+        {"term": {"user_id": "u1"}}, {"term": {"is_active": True}},
+        {"term": {"index_generation": "index-v4"}},
+    ]
+    assert client.calls[0]["size"] == 7
+    assert len(client.calls) == 1
+    assert [hit.lane for hit in hits] == ["bm25"]
+
+
+@pytest.mark.asyncio
+async def test_standard_profile_keeps_legacy_bm25_query() -> None:
+    client = _Client()
+    lexical = ElasticsearchBm25Index(cast(Any, client), index_generation="index-v3", lexical_analysis="standard")
+    await lexical.search("京东", _filter(index_generation="index-v3"), 7)
+    assert client.calls[0]["query"]["bool"]["must"] == {"match": {"contextualized_content": "京东"}}
+
+
+@pytest.mark.asyncio
 async def test_dense_and_bm25_serialize_the_same_server_owned_filters() -> None:
     client = _Client()
     filter = _filter(

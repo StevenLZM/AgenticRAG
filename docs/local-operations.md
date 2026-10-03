@@ -8,6 +8,100 @@ set -a; source .env.local; set +a
 
 ## 启动、控制台与查询
 
+### IK 中文检索（2026-10-02）
+
+`AGENTIC_RAG_LEXICAL_ANALYSIS=standard` 保留原有索引/查询行为；设为 `ik` 后，
+Child 索引的 `contextualized_content` 保留 standard 分析，并增加 `.zh` 子字段：
+索引端 `ik_max_word`，查询端 `ik_smart`。BM25 使用 `multi_match/best_fields`，
+中文字段权重 2、原字段权重 1、tie_breaker=0，输出仍是一份 BM25 排名，再与向量
+进行原有 RRF。这是初始工程配置，不是已证明最优的权重。默认 OR 不代表必须包含
+每个实体；standard 补充分支仍可能单字匹配。分词不是实体必选约束。
+
+本次只使用 IK 内置词典，不启用远程词典、自动新词发现或词典在线学习。插件版本必须
+与 ES 对应，所有目标节点安装后重启。当前本地业务 ES 版本为 8.19.0，安装入口由
+[IK 维护方](https://github.com/infinilabs/analysis-ik)提供；插件要求 outbound_network
+权限用于远程词典，当前配置不启用远程词典。上线前应审核插件来源及权限。
+
+既有 index-v3 不能只改查询分析器：旧倒排词项不会自动更新。迁移工具默认只读预检，
+要求所有源 ES 记录对应活跃 SQL 文档版本，逐版本核对 Child/Parent 数量、用户归属、
+Canonical AST/Manifest 哈希；出现非活跃或孤立 ES 记录会拒绝迁移，需要单独处理。
+它保留 Child ID、正文、向量、Parent 内容及分块关系，只复制 ES 文档到新索引并更新
+`index_generation`，为活跃版本写入新的 Manifest Artifact，并在一个 SQL 事务内
+更新版本的索引代际及 Manifest 引用。旧 Artifact、旧索引和历史非活跃版本保留。
+
+操作顺序（以下命令在项目 Python 环境运行）：
+
+1. 安装匹配版本 IK，先在隔离 ES 上完成下述集成测试。
+2. 停止业务 API 接收新任务，排空 Query/Ingestion、Outbox、待处理删除，再停止 Worker。
+   不可手工 ACK Redis pending 消息。业务 ES 重启仅用于加载插件，不重启 Redis/MySQL 或评测栈。
+3. 创建含 MySQL、ES、Artifact、checkpoint 的独立备份。不要把备份放在 Artifact 根目录内。
+4. 保持服务停止，执行迁移；预检/复制/SQL 更新/别名切换任何步骤失败，都不要启动业务服务。
+5. 迁移成功后同时设置 `.env.local` 中 `INDEX_GENERATION=index-v4`、`LEXICAL_ANALYSIS=ik`
+   （均带 `AGENTIC_RAG_` 前缀），重启业务 API 和两类 Worker，验证健康、快照与检索。
+
+```sh
+python scripts/migrate_ik_index.py --source index-v3 --target index-v4
+python scripts/backup_local.py --output var/backups/pre-ik --include-services
+python scripts/migrate_ik_index.py --source index-v3 --target index-v4 \
+  --apply --offline-confirmed --backup var/backups/pre-ik --journal var/migrations/ik-v4
+```
+
+迁移 journal 路径不可重复使用。迁移失败或验收不通过时，继续保持 API/Worker 停止，
+按 journal 回滚 SQL 元数据和别名；中断后也使用回滚，不要盲目重跑 `--apply`。
+新索引不会被删除。回滚仅适用于没有后续数据变化的窗口；工具检测到目标内容或
+Parent 变化会拒绝，需人工制定保留新数据的方案。
+
+```sh
+python scripts/migrate_ik_index.py --source index-v3 --target index-v4 \
+  --rollback --offline-confirmed --journal var/migrations/ik-v4
+# 然后恢复 INDEX_GENERATION=index-v3、LEXICAL_ANALYSIS=standard，再恢复业务服务。
+```
+
+运行时快照以 `retrieval-ik-v1` 和 provider 配置指纹记录词法配置。旧快照结构不变。
+隔离评测 allocation 缺省固定使用 standard，不继承业务 IK；评测 IK 时必须显式设置
+allocation 的 `lexical_analysis=ik`，并提前在其独立 ES 安装插件。本次不修改已有评测服务。
+
+```sh
+AGENTIC_RAG_TEST_IK_ELASTICSEARCH_URL=http://127.0.0.1:9202 \
+  python -m pytest -q tests/integration/retrieval/test_ik_analysis.py
+```
+
+上述测试只允许指向可丢弃测试节点，覆盖中文词项、中英文/未知词、排序、用户过滤、
+真实 reindex、Publisher 清单校验、Parent/向量保留、源 mapping 兼容性，以及
+写入阻断/复制完成/SQL 提交/别名切换四个中断窗口的 journal 回滚。功能通过不等于质量收益验收；
+BM25/RRF/最终证据和回答质量仍需固定语料/预算的独立 A/B 评测。
+旧索引及备份包含原始私有文档内容，须按受控回滚窗口保管，后续清理需明确授权。
+
+#### 本地切换验收记录（2026-10-02）
+
+- ES 8.19.0 已加载 `analysis-ik 8.19.0`，只用内置词典，远程词典未启用。
+  插件包 SHA256：`bcacbcea8dab5555cc8ad4bc59c0403cd583ed1ee169b7764e5bbb81464c7673`。
+- 活动 Alias 已从 `agenticrag-children-index-v3` 切到 `agenticrag-children-index-v4`；
+  `.env.local` 生效配置为 `INDEX_GENERATION=index-v4`、`LEXICAL_ANALYSIS=ik`。
+  Runtime snapshot：`be482e1136095769a7f6d451b12cc421591ae2814776e19d634ee5d74c7973d4`，
+  检索配置版本 `retrieval-ik-v1`，API 返回相同快照。
+- 1003 个活跃版本通过真实 `VersionPublisher._verify`；2237 个 Child 的源/目标内容、
+  ID、向量及元数据（仅排除索引代际）哈希一致；2231 个 Parent 全量行哈希保持不变。
+  旧 v3（2237 条）及更早 v2（30 条）索引均保留，未重新分块或 Embedding。
+- 停服备份：`var/backups/pre-ik-20261002`，11408 个文件完成完整性验证，包含 MySQL、
+  ES、Artifact 和 checkpoint。迁移 journal：`var/migrations/ik-v4-20261002`，阶段 `complete`。
+  实际回滚时必须使用这个 journal，且先停服并重新确认没有后续数据变化。
+- 业务 API、Query Worker、Ingestion Worker 已恢复；`/health/ready` 全部依赖 available，
+  两个新 Worker 均已注册对应 Redis consumer。未重启共享 Redis/MySQL 或已有评测服务。
+  ES 为单节点 yellow（副本未分配），无未分配主分片，与切换前一致。
+- 实测 `ik_smart` 将“京东”保留为完整词，“刘泽明”仍拆为单字。真实 BM25 对“京东”、
+  “刘泽明在京东做过什么”、`Redis` 均返回当前用户 v4 活跃记录；不存在用户返回空。
+  `2024.06` 在当前语料的新旧索引均未命中，不能将无语料命中解释为分词退化。
+- 全量回归：1444 passed、99 skipped、20 warnings；独立 IK ES 实测：10 passed。
+  跳过项需要另行启用其依赖/开关；警告来自既有 pytest、Docling、Torch 依赖。
+  默认配置单测已隔离真实 `.env.local`，不因本地部署代际变化误报。
+  Ruff、Mypy（120 个源文件）、`git diff --check` 均通过。
+- 迁移前存在 54 条 Query Redis pending，逐条对应的业务 Run 已不存在；业务 SQL 无
+  非终态任务，Stream lag 为 0。这些历史消息未手工 ACK/删除，留待独立排查。
+  本次未进行完整 LLM 问答 E2E 或检索质量 A/B，以上是索引、检索及部署功能验收。
+
+### 查询链路
+
 查询入口使用同一次 Router 调用选择 `chat`、`fast_rag` 或 `research`。
 问候、闲聊和不带检索请求的偏好陈述走 `chat → finalize`；包含文档查询或分析的
 混合输入仍走检索路径。三条路径均在原 `finalize` 位置从原始用户消息提取长期记忆。

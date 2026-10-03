@@ -16,6 +16,7 @@ from elasticsearch import AsyncElasticsearch
 from agentic_rag.ingestion.indexer import EMBEDDING_DIMENSIONS
 from agentic_rag.models.indexing import (
     ACTIVE_CHILD_INDEX_ALIAS,
+    LexicalAnalysis,
     validate_index_generation,
 )
 from agentic_rag.retrieval.models import ChildHit, SearchFilter
@@ -160,6 +161,13 @@ class ElasticsearchVectorIndex(_ElasticsearchChildSearch):
 class ElasticsearchBm25Index(_ElasticsearchChildSearch):
     """BM25 Child retrieval over contextualized Child content."""
 
+    def __init__(self, client: AsyncElasticsearch, *, index_generation: str,
+                 index: str | None = None, lexical_analysis: LexicalAnalysis = "standard") -> None:
+        super().__init__(client, index_generation=index_generation, index=index)
+        if lexical_analysis not in {"standard", "ik"}:
+            raise ValueError("unsupported lexical analysis profile")
+        self._lexical_analysis = lexical_analysis
+
     async def search(
         self,
         query_text: str,
@@ -168,12 +176,21 @@ class ElasticsearchBm25Index(_ElasticsearchChildSearch):
     ) -> list[ChildHit]:
         self._validate_top_k(top_k)
         clauses = self._validate_filter(filter)
+        text_query: dict[str, Any] = {"match": {"contextualized_content": query_text}}
+        if self._lexical_analysis == "ik":
+            # A single BM25 ranking retains one vote in the downstream RRF.
+            # The standard field remains an unknown-word/identifier fallback.
+            text_query = {"multi_match": {
+                "query": query_text,
+                "fields": ["contextualized_content.zh^2", "contextualized_content"],
+                "type": "best_fields", "tie_breaker": 0.0,
+            }}
         response = await self._client.search(
             index=self._index,
             query={
                 "bool": {
                     "filter": clauses,
-                    "must": {"match": {"contextualized_content": query_text}},
+                    "must": text_query,
                 }
             },
             size=top_k,

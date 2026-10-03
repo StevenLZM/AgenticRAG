@@ -129,7 +129,7 @@ async def run(settings: Settings) -> None:
     factory = container.repositories.session_factory
     jobs = SqlAlchemyIngestionJobStore(factory)
     parent_store = SqlAlchemyParentStagingStore(factory)
-    child_store = ElasticsearchChildIndexStore(container.elasticsearch)
+    child_store = ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis)
     publisher = VersionPublisher(
         repository=SqlAlchemyPublicationRepository(factory),
         parent_store=parent_store,

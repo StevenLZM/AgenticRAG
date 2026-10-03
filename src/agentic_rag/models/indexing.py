@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 
 _INDEX_GENERATION = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 DEFAULT_INDEX_GENERATION = "index-v3"
 LEGACY_INDEX_GENERATIONS = frozenset({"index-v1"})
 ACTIVE_CHILD_INDEX_ALIAS = "agenticrag-children-active"
+LexicalAnalysis = Literal["standard", "ik"]
 
 
 def validate_index_generation(value: str) -> str:
