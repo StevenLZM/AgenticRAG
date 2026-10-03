@@ -173,3 +173,32 @@
 - 运行期间代码指纹与冻结值一致：`a9b1bdc706ae0e6c8c13f1b54e647d6c72eef01e08dff84af718faaefe809573`。金标与评分说明hash不变，首轮审计新Query POST=0，末尾全语料快照核验通过。
 - 完整resume退出码0；`audit-resume.json`确认新Query POST=0、Judge SDK调用=0、付费账本新增请求=0，20个Run ID、查询账本和裁判账本hash均不变，并与源v6.1 Run完全一致。金标/说明/实现hash再次核对通过，`snapshot_verified=true`。回放及恢复进程均已结束。
 - 本轮编号定位与字段误拒修复完成。后续人工审核、至少100例事实级校准、graded qrels、890题validation和893题test未启动，`eligible_for_tuning=false`、`production_release_accepted=false`，不能当生产验收结论。下一步从已批准方案的任务4/5准备审核与校准，需真人审核和门槛确认，不能由AI代签，也不自动启动全量付费实验。
+
+## 2026-10-03 主分支 IK 适配设计恢复点
+
+- 用户要求根据主分支变化重梳金标和测评流程，已确认“保留事实、重绑v4、分层验证”的书面设计。本次已保存详细实施计划，尚未实现或执行新测评。
+- 当前核对的 main 为`60d543c7c8d181fffce11f8cc5572d5277a0d0fc`，IK 已正式提交；此前“IK 未提交”的状态已失效。本次不切换分支、不提交/推送，既有`tmp/`保留。
+- 设计：`docs/superpowers/specs/2026-10-03-ik-gold-retrieval-evaluation-design.md`。范围为v4等价金标重绑定、真实分词环境指纹、同一v4索引standard与IK混合BM25对照。
+- 计划：`docs/superpowers/plans/2026-10-03-ik-gold-retrieval-evaluation.md`。六个任务依次为迁移证明、金标发布、分词环境、真实配对执行/恢复、指标报告、命令与真实验收；待审阅及确认执行方式。
+- 当前只读分支检查：`codex/real-rag-evaluation` 是 main 祖先，落后 14 个提交、无独有提交；实施前再核查，在隔离评测工作区仅快进到上述批准基线，不在本轮切分支或修改 Git 状态。
+- 第一轮拟使用dev五类各20题，只做真实ES读取/分词/BM25，不提交Query、不调用Embedding/生成模型/Judge。Dense/RRF/rerank/最终上下文与真实问答另设有预算的阶段，未执行阶段不能伪造分数。
+- 4453题事实、答案、split、审核状态和既有unmapped事实保持不变；更新snapshot及sidecar绑定前必须证明全部原文与分块内容等价。新产物独立目录，旧v3快照和旧20题评分不能直接恢复成IK实验。
+- [x] 核对主分支变化、运行索引与旧金标结构，确认拆分设计方向。
+- [x] 保存第一批设计及验收条件。
+- [x] 用户审阅并确认书面设计（2026-10-03）。
+- [x] 编写详细实施计划、具名失败测试和评测分支同步步骤。
+- [ ] 用户审阅计划及首轮只读预算，选择 Native 或 Subagent-driven 执行方式。
+- [ ] 按批准的计划实现、测试、真实只读预检和限额A/B，记录实际结果。
+
+下次从本小节和设计文档恢复。人工审核、事实级校准、自然问法扩充、完整validation/test、聊天及工具场景仍是后续待办，不能标记完成。本次没有修改业务代码、数据库、索引、金标文件或服务。
+
+## 2026-10-03 Native 实施恢复入口（最新，以隔离工作区账本为准）
+
+- 用户已批准计划和 Native 执行。评测代码位于 `/Users/steven/.codex/worktrees/ik-rag-evaluation/AgenticRAG`，分支 `codex/real-rag-evaluation`，批准基线 `60d543c7c8d181fffce11f8cc5572d5277a0d0fc`；新增代码未提交/推送，main 不承载这些实现。
+- 任务1–5已实现；任务6的 `python -m evals.ik_evaluation_command rebind|bm25|resume` 已实现并经单测。当前全仓非在线回归1435 passed/35 skipped/145 deselected；定向434 passed/1 skipped。最终独立审查进行中，审查修复后的计数以隔离工作区账本为准。
+- 已真实生成 `/Users/steven/LzmWorkSpace/AgenticRAG/var/artifacts/evals/formal-v4-rebound-20261003`：1003原文、2231 Parent、2237 Child、4453题、12105事实组（1 unmapped）；dev2670/validation890/test893，旧输入字节hash不变。不要重复生成或覆盖这个目录。
+- 真实只读语料预检matched；实际IK进程/制品/词典及15探针核验通过。环境证明在 `var/artifacts/evals/ik-environment-preflight-20261003/environment-host-read.json`；先前沙箱无法读进程的unverified结果也保留。新增BM25/Query/模型调用仍为0。
+- 测试ES9202未运行；已向用户询问是否允许启动隔离临时节点，未得到许可前不启动、不执行集成写入。100题/200次真实BM25对照和零请求resume仍未执行，不能把上述工程测试/重绑定当作质量成绩。
+- 继续时先读隔离工作区 `.superpowers/sdd/2026-10-03-ik-gold-retrieval-evaluation/progress.md` 和该工作区同名进度文档，完成审查修复，再按用户对临时测试节点的答复执行。不要从旧main记录重做任务1–5。
+
+补充最终状态：独立审查两项Important已完成9个RED→GREEN反例修复（历史失败核验不可被resume洗白、删除的已加载词典不可漏检）。全仓非在线回归1444 passed/35 skipped/145 deselected；真实环境修复后前后再次核验通过，保存于 `ik-environment-preflight-20261003/reviewed-pre.json`、`reviewed-post.json`、`audit-reviewed.json`。尚未启动9202、未跑真实BM25；下一步仅在明确获准启动隔离节点或提供可用测试URL后继续。代码全部保留在隔离worktree，未提交/推送；详细次要待办及执行取舍见该处最新账本。
