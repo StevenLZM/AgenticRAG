@@ -68,6 +68,17 @@ def test_multiple_retrievals_are_not_concatenated_into_one_ranking():
     assert result["ranking_scope"] == "per-retrieval"
 
 
+@pytest.mark.parametrize("termination", ["research_round_limit", "cannot_answer", "clarify"])
+def test_terminal_projection_matches_worker_without_claiming_unaudited_evidence(termination):
+    from agentic_rag.runtime.query_worker import _public_answer_projection
+    run, state = observed()
+    state.update(answer={"status": termination}, termination_reason=termination, evidence=[{"parent_id": "p1"}])
+    run["answer"] = _public_answer_projection(state["answer"], state,
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id, require_audited=False)
+    assert run["answer"] is not None
+    assert collect(run, state)["contexts"] == ["actual evidence"]
+
+
 def test_persisted_public_answer_matches_projected_checkpoint_not_raw_dict():
     run, state = observed()
     segment = {"kind": "content", "text": "answer", "evidence_ids": []}

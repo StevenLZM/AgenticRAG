@@ -462,3 +462,69 @@ python scripts/eval_routing.py --dataset evals/datasets/routing_v2.jsonl \
 4. 完成新建会话、连续两问、刷新、切换、停止与来源展开 smoke；确认同 session 的 thread 稳定且每问 Run 不同，观察 Outbox/Worker 消费和终态持久化。历史列表从新功能创建的 session 起生效。
 
 回滚前同样排空活动 Run，恢复相互匹配的 API、Worker、静态资源和图版本。应用回滚优先保留新增表列与数据，旧客户端仍能使用旧 API。不要把 Alembic downgrade 当作无损回滚：它会移除会话、幂等键和来源字段；`question` 故意保留较大的兼容类型，避免历史长消息截断。确需降级 schema 时，先另行备份和批准数据处理方案。
+## IK 查询 analyzer 对照（2026-10-03，main）
+
+`evals.ik_evaluation_command` 为只读诊断入口，复用已经完成的 v4 金标重绑定包。
+默认 `bm25` 仍比较 standard 与原 IK；新增 `--comparison ik-smart-vs-max` 比较原 IK 查询与查询端 `ik_max_word`。
+两臂入库都使用现存 `.zh` 的 `ik_max_word` 索引；实验臂仅覆盖 `.zh` 查询 analyzer，原字段仍为 standard。
+为避免 `multi_match.analyzer` 同时覆盖两个字段，实验臂用等价的 `dis_max` 展开 `best_fields`：权重2/1、tie_breaker=0不变。
+不修改正式 mapping、配置、alias、SQL、文档或金标，不启动服务、不调用 Query API/模型，也不上传或重分块。
+
+在仓库根目录运行（最后的输出目录必须尚不存在）：
+
+```bash
+PYTHONPATH=src:. PYTHONDONTWRITEBYTECODE=1 \
+  var/eval-venv-ragas042/bin/python -m evals.ik_evaluation_command bm25 \
+  --comparison ik-smart-vs-max \
+  --settings-file .env.local \
+  --artifact-root var/artifacts \
+  --es-url http://localhost:9200 --user-id default_user \
+  --bundle var/artifacts/evals/formal-v4-rebound-20261003 \
+  --node-evidence-config var/artifacts/evals/ik-environment-preflight-20261003/nodes.json \
+  --output-dir var/artifacts/evals/ik-analyzer-paired-v4-20261003-main
+```
+
+仍固定原抽样协议：dev五类各20题、每臂Top40、共200次尝试、并发1、每次30秒、检索阶段900秒。
+查询前后分别全量核验语料/SQL/原文及实际IK环境；不能读取本机进程与插件证明时会拒绝strict运行，不跳过保护。
+报告中 `ik` 是原 `ik_smart` 查询臂，`ik_max_word` 是实验臂；差值为后者减前者。
+`report.md`/`report.json`、`experiment.json`、`results.json`、`ledger.json` 和 `audit-first.json` 均保存在新目录。
+代码、金标、配置或环境变更后须新建实验，不能覆盖或混入旧目录。
+
+同一实现和环境下恢复使用相同公共参数，将 `bm25` 改为 `resume`，去掉 `--comparison`、`--bundle`、`--output-dir`，
+改传 `--experiment <既有实验目录>`。比较模式从冻结身份读取，完整实验恢复应新增检索0次。
+本入口只测BM25；Dense/RRF/rerank/生成/Ragas/AnswerCorrectness均未执行，不是完整RAG或上线验收。
+
+## 原20题真实QueryGraph双臂对照（2026-10-04）
+
+此入口复用生产 QueryGraph 和真实模型、Dense/BM25/RRF/rerank、SQL Parent、Evidence Grader、Research、生成与答案审计。
+固定取上述实验的原20道multi_hop题，不重新抽样、上传、分块、改金标或正式配置。两组只改变中文字段的查询analyzer。
+它不经过HTTP/Outbox/Worker，不衡量排队或API TTFT，也不会在聊天会话列表创建记录。
+
+```bash
+PYTHONPATH=src:. PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false \
+  var/eval-venv-ragas042/bin/python -m evals.paired_graph_command \
+  --settings-file .env.local --artifact-root var/artifacts \
+  --es-url http://127.0.0.1:9200 --user-id default_user \
+  --bundle var/artifacts/evals/formal-v4-rebound-20261003 \
+  --source-experiment var/artifacts/evals/ik-analyzer-paired-v4-20261003-main \
+  --node-evidence-config var/artifacts/evals/ik-environment-preflight-20261003/nodes.json \
+  --output-dir var/artifacts/evals/ik-querygraph-paired-v4-20261004-main
+```
+
+执行前需要本地缓存的真实reranker权重、可用模型凭据、读取本机ES进程/插件的权限；不会自动下载替换模型。
+每题两组按AB/BA顺序各执行一次，保持正式研究预算6动作/300秒；每题最多100次真实provider尝试，每臂裁判最多500次尝试，每题评分最多600秒。
+生产gateway自身的有界重试保持原样并计入请求账本；“不自动重试”特指测评器不重新发送已经开始或结果未知的整次Query/评分操作。
+记忆与历史会话禁用，SQL只读，事件、运行状态、工具账本只写实验目录；不访问本批文档RAG无关的第三方工具，若路由误要求此类工具会保留失败，不能当成功。
+
+逐题 `query.json` 保存真实轨迹，`grades.json` 保存grader当时看到的完整打包证据与gaps，`searches.json`保存实际DSL和排名，`history.json`保存研究动作/Todo变化，`events.json`和`provider-budget.json`保存实际调用凭据（不保存API密钥）。
+`score.json`和每臂`judges/`保存金标关键字段校验、独立事实判定、Ragas/AnswerCorrectness；`report.json`包含检索各阶段指标、最终上下文覆盖及答案结果。
+服务故障与无法回答分开统计；未知/超时不剔除分母。费用没有固定价目表时为unknown，不伪填0。
+
+恢复使用同一命令加 `--resume`，不得改变代码/金标/配置。已启动且结果未知的操作会保留unknown而不重发；完整实验会核验封存JSON文件后离线返回，新增搜索和模型请求均为0，不表示重新核验了此刻线上状态。
+若正式数据、代码或环境已改变，须另开经批准的新实验目录，不能覆盖或混入旧结果。本批20题×2的单次随机结果、未完成人工审核/裁判校准，都不构成上线验收。
+
+本次首题已真实完成，但旧测评终态投影误附未经审计的Parent引用而停止。修复后用户批准的实际续跑：在上述命令追加
+`--continue-from var/artifacts/evals/ik-querygraph-paired-v4-20261004-main`，输出目录改为
+`--output-dir var/artifacts/evals/ik-querygraph-paired-v4-20261004-continued`。
+该专用恢复仅接受已核验、完整结束于research_round_limit的首题，离线恢复结果（仍为失败）并只发送剩余39次；不重试未知查询，也不修改源目录。
+续跑恢复对continued目录加`--resume`；源证据哈希、旧快照、未改生产实现、相同金标/配置/预算均严格校验。

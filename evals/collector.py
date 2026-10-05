@@ -139,7 +139,8 @@ def project_verified_state(run, state, *, run_id, user_id, snapshot_id, question
     else:
         answer["status"] = termination
     projected = project_public_answer(answer,
-        evidence_parent_ids=list(dict.fromkeys(item["parent_id"] for item in state.get("evidence", []))),
+        evidence_parent_ids=(list(dict.fromkeys(item["parent_id"] for item in state.get("evidence", [])))
+                             if answer.get("audited") is True else []),
         route=route, runtime_config_snapshot_id=snapshot_id if termination == "completed" else None,
         require_audited=termination == "completed" and route != "chat")
     persisted = project_public_answer(run.get("answer"))

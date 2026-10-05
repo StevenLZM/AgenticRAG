@@ -1,5 +1,22 @@
 # 正式 RAG 测评 v2：可恢复实施账本
 
+## 当前任务：100题系统端到端基线（2026-10-05）
+
+- 用户要求重新测评整个 RAG 系统，不限于 IK 变化；已明确选择五类均衡100题。使用正式 API8000 / Outbox / Query Worker / QueryGraph；保持生产默认参数，不做 analyzer 双臂对照。
+- 输入沿用 `var/artifacts/evals/formal-v4-rebound-20261003/{snapshot.json,gold.v2.2.jsonl,answer-spec.jsonl}`。确定性 `--split dev --smoke 100` 已核对为 single_hop、section_comprehension、table_calculation、unanswerable、multi_hop 各20题；validation/test不使用。
+- 本轮只读预检已通过：1003份原文、4453题来源锚点，以及正式SQL/ES完整快照 matched；live fingerprint=`d8347a7b2e5adf522d413160d40b427f1bea901d63d7d985928b0d2ef80ea739`。正式 API 配置与本地匹配，base snapshot=`be482e1136095769a7f6d451b12cc421591ae2814776e19d634ee5d74c7973d4`，evaluation_requests_enabled=true；正式 Query Worker PID73998存在。只读预检没有调用模型或新建查询。
+- 新目录：`var/artifacts/evals/system-rag-baseline-100-20261005`。先以完整100题身份和 `--max-wall-seconds 1` 执行首题链路探针；墙钟预算在题间检查，所以首题允许完成，其余保留pending。核实API/Worker/证据采集/评分正常后，在同一目录 `--resume` 继续，不重提首题。
+- 首阶段命令：`./scripts/eval_rag.sh --dataset var/artifacts/evals/formal-v4-rebound-20261003/gold.v2.2.jsonl --corpus-snapshot var/artifacts/evals/formal-v4-rebound-20261003/snapshot.json --answer-spec var/artifacts/evals/formal-v4-rebound-20261003/answer-spec.jsonl --api-url http://127.0.0.1:8000 --split dev --smoke 100 --max-cases 100 --max-judge-requests 5000 --max-wall-seconds 1 --output-dir var/artifacts/evals/system-rag-baseline-100-20261005`。
+- 拟续跑命令：`./scripts/eval_rag.sh --resume var/artifacts/evals/system-rag-baseline-100-20261005 --max-cases 100 --max-judge-requests 5000 --max-wall-seconds 28800`。初始链路尚待真实完成，不能把预检通过当作100题成绩。
+- 评分包括最终答案对金标、独立来源约束事实评分、关键字段校验、Ragas、分阶段检索排名与证据完整性；失败/超时/评分未知保留分母。人工金标审核和Judge校准仍pending，graded NDCG缺标注不编造；此基线不等于上线验收，也不覆盖聊天、长期记忆或故障恢复测试。memory_policy=disabled，独立评测thread，不污染用户记忆。
+- 旧IK对照目录保留原状：截至本次检查仅21/40有记录，另1条query账本为running、对应评测进程已不在；不得将其当全量完成，不自动重发未知查询。本轮使用独立新实验，不混入旧结果。
+- [x] 全量输入、环境与API配置只读预检。
+- [x] 确认100题五类各20题，以及生产Worker存在。
+- [ ] 首题真实API链路与评分核验。
+- [ ] 同目录继续剩余99题，保存逐题进度与失败。
+- [ ] 全量后复核语料快照、评分覆盖率、零新增付费请求恢复。
+- [ ] 汇总总体及五类成绩、系统瓶颈与未覆盖范围。
+
 用户已授权实施：2026-09-30。方案：`docs/superpowers/plans/2026-09-30-formal-corpus-evaluation-v2.md`。
 
 ## 固定输入与边界
@@ -202,3 +219,66 @@
 - 继续时先读隔离工作区 `.superpowers/sdd/2026-10-03-ik-gold-retrieval-evaluation/progress.md` 和该工作区同名进度文档，完成审查修复，再按用户对临时测试节点的答复执行。不要从旧main记录重做任务1–5。
 
 补充最终状态：独立审查两项Important已完成9个RED→GREEN反例修复（历史失败核验不可被resume洗白、删除的已加载词典不可漏检）。全仓非在线回归1444 passed/35 skipped/145 deselected；真实环境修复后前后再次核验通过，保存于 `ik-environment-preflight-20261003/reviewed-pre.json`、`reviewed-post.json`、`audit-reviewed.json`。尚未启动9202、未跑真实BM25；下一步仅在明确获准启动隔离节点或提供可用测试URL后继续。代码全部保留在隔离worktree，未提交/推送；详细次要待办及执行取舍见该处最新账本。
+
+## 2026-10-03 本批真实 BM25 已完成（最新）
+
+用户批准复用9200创建专属临时测试索引，不再等待9202。新同集群授权/归属保护11测试先失败再通过，独立审查无阻断；真实集成1passed，临时索引及4条合成数据已精确删除，正式v4/alias未改。全仓非在线回归1455passed/35skipped/145deselected，2旧警告。实现仍在 `/Users/steven/.codex/worktrees/ik-rag-evaluation/AgenticRAG`，分支及基线不变，未提交/推送。
+
+真实报告：`/Users/steven/LzmWorkSpace/AgenticRAG/var/artifacts/evals/ik-bm25-paired-v4-20261003-shared9200/report.md`（详细JSON同目录）。100题/200次BM25全部成功，100有效配对；standard→IK的FactRecall@40为64%→67%，完整证据覆盖54%→67%，MRR@40为0.481889→0.423347，binaryNDCG@40为0.513403→0.482907。覆盖提高但排名指标下降，不是整体质量提升或上线结论。
+
+首次与resume均退出0；resume新增检索0、QueryPOST0、模型0，语料/词法前后核验通过、ledger/results哈希不变。实验与金标产物不要覆盖/重建。当前六项BM25工程任务完成；全链路问答、Ragas/AnswerCorrectness、人工审核/校准和validation/test仍未执行。下一步以隔离worktree同名进度文档最新小节和恢复账本为准，不再重复启动9202或重复200次实验。
+## IK 查询分词兼容性对照（2026-10-03；已完成，main）
+
+- 用户已批准查询端 `ik_max_word` 对照，并明确要求在 `main` 修改；此次授权覆盖旧计划的分支约束，不改变正式检索配置。
+- 从已完成的测评工作区迁入 main 所需的八个只读评测模块及八个单测文件；不合并业务代码、服务配置、临时索引工具或旧实验数据。
+- 固定同一 v4 物理索引、金标和五类各20道 dev 题，Top40、中文字段权重2、standard兜底权重1、best-fields最大得分语义、200次请求预算不变。仅实验臂 `.zh` 查询 analyzer 改为 `ik_max_word`，原 IK 臂重跑作为基线。
+- [x] 单测 RED→GREEN：字段级覆盖、身份冻结、原始 adapter 漂移拒绝、两臂交替、报告方向与零请求恢复。新增反例先9 failed/30 passed，再39 passed。
+- [x] main 全仓非在线回归与独立检查；不运行未授权的写入型或付费测试。1455 passed/34 skipped/144 deselected，2个已有警告；新增16个Python文件Ruff通过；独立审查无Critical/Important发现。
+- [x] 新独占目录真实100题/200次只读检索；前后语料和分词环境核验；保存新报告，不覆盖旧实验。全部成功，100有效配对，4项严格核验均通过。
+- [x] 验证完成后恢复新增检索为0，记录质量变化、范围限制和剩余问题。resume退出0，新增BM25/attempt/Query POST/模型调用均0，4项前后核验通过，ledger/results SHA256不变。
+
+新报告：`var/artifacts/evals/ik-analyzer-paired-v4-20261003-main/report.md`，详细逐题结果见同目录 `report.json`。运行与恢复命令见 `docs/local-operations.md` 的“IK 查询 analyzer 对照”。恢复仍会只读扫描语料和分词环境；0指新增BM25实验检索，不是0次ES读请求。
+
+| 指标 | 原 IK（ik_smart） | 查询 ik_max_word |
+| --- | --- | --- |
+| Fact Recall@40 | 67% | 68% |
+| Complete Evidence@40 | 67% | 60% |
+| Complete Evidence@3 | 43% | 60% |
+| MRR@40 | 0.423347 | 0.518976 |
+| binary NDCG@40 | 0.482907 | 0.553198 |
+
+同一批100题的题目身份及顺序、金标包和快照与旧实验完全相同；原IK臂100题的请求、命中ID、排名、得分完全复现旧实验。旧实验ledger/results/report哈希未变。另做了4次只读 `_explain` 诊断（不计入200次实验search）：FAQ示例中2025/2026文档原同分44.500668，候选分别62.913967/65.63708，正确年份的`.zh:2026`开始贡献得分；未额外调用模型。
+
+关键取舍：不是无条件提升，不自动切换正式配置。
+
+- 单跳20题的完整证据@3由10/20提高到20/20；表格计算完整证据@40由0/20提高到8/20。
+- 跨年多跳20题的完整证据@40由13/20降至0/20，Fact Recall@40由65%降至40%；章节理解由14/20降至12/20。因此总完整题数67→60，不能只看MRR/NDCG宣布改善。
+- 已保存结果中的例子 `S012-2026-policy:year-comparison`：原两年证据排名19/20；候选2026年证据升至10，但2025年证据不在Top40。候选Top40被不同公司的2026年文档占据且同分56.583126，说明年份区分改善并未解决公司区分与跨年证据完整性；不能把这一原始BM25结果当作ResearchAgent实际多跳结论。
+- 后续需单独设计并批准实体/公司上下文补齐、跨年份子查询与证据完整性对照；本批没有更改这些行为，也没有调整候选数量或重新生成金标。
+
+代码保留在main工作区，未提交/推送；正式src、配置、mapping、alias、SQL和原文未改。本批只执行BM25；Dense/RRF/rerank/Parent/最终回答、Ragas/AnswerCorrectness、人工审核/裁判校准及validation/test仍未执行，不能作为上线结论。旧的main/隔离分支恢复指引以本节为准，旧实验产物仍保留。
+
+## 2026-10-04 多跳20题全链路对照：执行边界预检
+
+用户同意下一步比较上述20道多跳题在两种查询analyzer下的真实最终回答与多轮补救，而不是将单次BM25的0/20当作系统失败；继续使用main，不同时修改分块、元数据、grader规则或研究预算。
+
+- [x] 从 `ik-analyzer-paired-v4-20261003-main/report.json` 确认原20个multi_hop case ID，不重新抽样或改金标。
+- [x] 只读检查8000端口的 `/v1/runtime/summary`：测评请求已启用，所列依赖均available；此检查不代表完整语料/实现身份预检已完成。
+- [x] 确认当前 `EvaluationMetadata` 只支持会话隔离、禁用记忆与候选预算，不支持逐Run的analyzer选择；`ik-smart-vs-max` 仅存在于单次BM25实验客户端。
+- [x] 用户已批准执行边界：复用生产组成的真实QueryGraph，在独立测评进程中只对候选臂的中文BM25字段覆盖analyzer，真实调用模型/embedding/reranker并保留完整轨迹；明确不覆盖HTTP、Outbox、Worker队列。两臂必须都走相同入口，不拿API基线与Graph候选直接比较延时。
+- HTTP到Worker不在本轮范围；若以后需要，须另行批准受控测评配置扩展及部署安排，不能自行切换正式配置、重启服务或绕过快照校验。
+- [x] 补入口与防护测试：23个新增用例，安全回归1478 passed/34 skipped/144 deselected，Ruff与diff检查通过。独立审查发现的跨臂缓存替换、技术故障固定回复误送裁判均已复现并修复。真实composition/reranker加载验证通过，0付费调用。严格前置探测43次ES只读调用通过，正式语料/SQL/原文/IK绑定未变。
+- [x] 开始冻结双臂实验：`var/artifacts/evals/ik-querygraph-paired-v4-20261004-main`，20题/每臂一次，QueryGraph独立入口；已批准启动真实模型与裁判调用（结果以逐题账本为准）。执行中不得修改evals/src实现以免身份漂移。
+- [ ] 真实执行并保存最终答案、金标正确性、各次grader决策/gaps、后续任务/检索、累计与最终上下文覆盖、时延和用量。判别首次足够、多轮补齐、误放行、重复检索、打包丢证据和预算耗尽，不能只统计成功答案。
+- [ ] 验证resume不重复已完成请求，生成两臂对照报告；模型缺失用量/价格时记unknown，不当作0费用。
+
+已新增 `evals/paired_graph*.py` 与配套测试，使用真实生产composition；SQL只读、正式ES仅search，事件/工具账本写实验目录、禁用记忆与历史会话；与本批文档检索无关的第三方工具拒绝连接（两臂相同，明确报告限制）。默认6个研究动作/300秒不变；每题provider最多100次、每臂裁判最多500次、每题评分600秒。生产gateway原有有界重试保留并计费；测评器不重发已经开始且结果未知的整次Query/评分。下一步：观察原20题×2真实运行→后置核验与报告→完成态零网络resume验证。若中断，按local-operations中的同一命令加`--resume`，保留uncertain，不重开目录重跑已付费题。旧100题BM25报告和金标保持不变。
+
+### 首题记录修复与获准续跑（2026-10-04）
+
+- 原目录 `ik-querygraph-paired-v4-20261004-main` 首题S028基线真实完成：research_round_limit，6动作、7次检索、262.8598秒，15次provider请求（67491输入/24131输出tokens）。grader首次返回insufficient并指出公司主体不明和年份数值冲突；真实最终答案为空，不属于成功补救。
+- 发现测评投影兼容缺陷：将未经答案审计的Parent IDs附到轮次上限终态，严格PublicAnswer拒绝；正式Worker会排除这种未经审计的引用。测评器自停，剩余39次未发送；源目录前后严格核验通过且保留不改。
+- 已修复 `evals/collector.py` 与Graph投影，回归1491 passed/34 skipped/144 deselected，Ruff与diff检查通过；新增终态、不可变来源、代码/语料/区间漂移与离线恢复测试，独立审查无阻断项。
+- 用户明确批准：新建续跑目录 `var/artifacts/evals/ik-querygraph-paired-v4-20261004-continued`，只继承首题真实结果并执行剩余39次。通过 `--continue-from var/artifacts/evals/ik-querygraph-paired-v4-20261004-main` 启动；不重跑首题，不更改其原始失败账本。
+- 续跑身份固定源目录78个JSON产物哈希、旧运行快照/金标/预算，只有本次4个测评修复文件允许变化；`continuation-proof.json`记录离线重建证明。首题仍按轮次耗尽/无答案计0分，旧调用用量保留，恢复新增provider请求0。
+- 后续恢复目标必须是 `...-continued` 目录加`--resume`（命令可保留`--continue-from`），不得对旧目录强行改身份或重跑首题。当前真实执行状态与最终结论以continued目录逐题账本和最终报告为准；还需完成后置核验、完整态零网络resume与结果总结。
