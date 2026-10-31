@@ -5,6 +5,8 @@
 > 实现语言：Python  
 > 编排框架：LangGraph
 
+> 2026-10-30 架构调整：[Supervisor、Retrieval Agent、分析报告 Agent 与可靠任务协作](2026-10-30-supervisor-retrieval-analysis-design.md)。实现覆盖完整任务派发合同、多个检索 Agent 的证据汇总、简单查询快路径，以及子 Agent 私有上下文、检索至 rerank、外部 grader、分析计算、预算内补差、可靠收件箱、重启恢复和最终答案 token 流。2026-10-31 已完成隔离真实环境验收，详见[验收记录](../../supervisor-live-validation.md)；本文件保留原架构基线。
+
 ## 1. 摘要
 
 本项目构建一个本地启动、面向企业文档问答和复杂研究任务的生产级 Agentic RAG 系统。系统同时支持：

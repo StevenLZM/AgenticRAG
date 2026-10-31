@@ -1,5 +1,7 @@
 # 本地运行手册
 
+Supervisor / Retrieval / Analysis 新运行时的迁移、角色进程、流式协议、恢复与回滚，见 [专用运行说明](supervisor-runtime.md)。该入口默认关闭，旧 Query Worker 的本地流程仍如下文所述。
+
 以下流程仅适用于本地 V1 部署。每次执行命令前先加载本地配置：
 
 ```sh
