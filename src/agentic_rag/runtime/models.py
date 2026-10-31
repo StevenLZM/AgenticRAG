@@ -49,6 +49,8 @@ class RuntimeConfigSnapshot(BaseModel):
     graph_version: str
     prompt_version: str
     routing_policy_version: str | None = None
+    orchestration_version: Literal["supervisor-v1"] | None = None
+    answer_protocol_version: Literal["answer-v2"] | None = None
     prompt_hashes: PromptHashes = ()
     main_model_id: str
     light_model_id: str

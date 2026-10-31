@@ -23,6 +23,7 @@ from agentic_rag.persistence.repositories import QueryRun
 from agentic_rag.query.answer_sources import cited_ids
 from agentic_rag.query.phases import PHASES, QueryPhase
 from agentic_rag.query.public_answer import PublicAnswer, project_public_answer
+from agentic_rag.orchestration.streaming import PublicSupervisorAnswer
 from agentic_rag.runtime.chat_sources import SourceView
 
 chat_sessions_router = APIRouter(prefix="/v1/chat-sessions", tags=["chat"])
@@ -104,7 +105,8 @@ class TurnResponse(BaseModel):
     finished_at: str | None
     question: str
     status: RunStatus
-    answer: PublicAnswer | None
+    answer: PublicAnswer | PublicSupervisorAnswer | None
+    answer_protocol_version: str | None = None
     phase: QueryPhase | None
     source_status: Literal["available", "unavailable", "none"]
     terminal_code: str | None
@@ -113,16 +115,18 @@ class TurnResponse(BaseModel):
     def project(cls, run: QueryRun, phases: dict):
         # Durable managed turns always have a server-assigned creation time.
         assert run.created_at is not None
-        answer = (
+        answer: PublicAnswer | PublicSupervisorAnswer | None = (
             project_public_answer(
                 run.answer, runtime_config_snapshot_id=run.runtime_config_snapshot_id
             )
             if run.status == RunStatus.COMPLETED
             else None
         )
+        if run.runtime_config_snapshot.get("answer_protocol_version") == "answer-v2" and run.answer is not None:
+            answer = PublicSupervisorAnswer.model_validate(run.answer)
         code = None
         if run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
-            code = answer.status if answer and answer.status else run.status.value
+            code = getattr(answer, "status", None) or run.status.value
         return cls(
             run_id=run.id,
             client_request_id=run.client_request_id,
@@ -131,6 +135,7 @@ class TurnResponse(BaseModel):
             question=run.question,
             status=run.status,
             answer=answer,
+            answer_protocol_version=run.runtime_config_snapshot.get("answer_protocol_version"),
             phase=phases.get(run.id, "processing")
             if run.status == RunStatus.RUNNING
             else None,
@@ -266,7 +271,7 @@ async def list_turns(
     )
     no_store(response)
     return TurnsPage(
-        items=tuple(TurnResponse.project(run, phases) for run in page.items),
+        items=tuple([TurnResponse.project(await _project_supervisor(request, run), phases) for run in page.items]),
         next_cursor=page.next_cursor,
     )
 
@@ -287,7 +292,7 @@ async def submit_turn(
     response.status_code = 202 if result.created else 200
     response.headers["Location"] = f"/v1/query-runs/{result.run.id}"
     no_store(response)
-    return TurnResponse.project(result.run, await phases_for(request, [result.run.id]))
+    return TurnResponse.project(await _project_supervisor(request, result.run), await phases_for(request, [result.run.id]))
 
 
 @chat_sessions_router.get(
@@ -302,7 +307,7 @@ async def find_submission(
     if run is None:
         raise SessionNotFound(str(session_id))
     no_store(response)
-    return TurnResponse.project(run, await phases_for(request, [run.id]))
+    return TurnResponse.project(await _project_supervisor(request, run), await phases_for(request, [run.id]))
 
 
 @chat_sessions_router.get(
@@ -316,3 +321,8 @@ async def get_sources(
     )
     no_store(response)
     return view
+
+
+async def _project_supervisor(request: Request, run: QueryRun) -> QueryRun:
+    from agentic_rag.api.supervisor_stream import project_run
+    return await project_run(request, run)

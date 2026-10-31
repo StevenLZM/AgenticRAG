@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -115,6 +115,9 @@ class EvidenceBuilder:
         scope: UserScope,
         snapshot: RuntimeConfigSnapshot,
         max_tokens: int = MAX_PACKED_EVIDENCE_TOKENS,
+        *,
+        rank_across_batches: bool = True,
+        balance_targets: bool = False,
     ) -> PackedEvidence:
         """Return bounded data envelopes for valid evidence, or an empty pack."""
         if max_tokens < 1:
@@ -122,7 +125,7 @@ class EvidenceBuilder:
         capacity = min(
             max_tokens, snapshot.max_evidence_tokens, MAX_PACKED_EVIDENCE_TOKENS
         )
-        candidates = self._candidates(batches, coverage_targets, scope)
+        candidates = self._candidates(batches, coverage_targets, scope, rank_across_batches=rank_across_batches)
         allow_single_document = bool(candidates) and len(
             {candidate.parent.document_id for candidate in candidates}
         ) == 1
@@ -140,9 +143,12 @@ class EvidenceBuilder:
                 key = (candidate.parent.parent_id, candidate.parent.document_version_id)
                 if target.target_id not in candidate.target_ids or key in selected_keys:
                     continue
-                packed = self._pack_candidate(
-                    candidate, rendered, capacity
-                )
+                target_capacity = capacity
+                if balance_targets:
+                    remaining_targets = len({t.target_id for t in coverage_targets} - covered_target_ids)
+                    used = _estimate_tokens("\n".join(rendered))
+                    target_capacity = used + (capacity - used) // max(1, remaining_targets)
+                packed = self._pack_candidate(candidate, rendered, target_capacity)
                 if (
                     packed is None
                     or target.target_id not in packed[0].covered_target_ids
@@ -245,6 +251,8 @@ class EvidenceBuilder:
         batches: Sequence[EvidenceBatch],
         targets: Sequence[EvidenceCoverageTarget],
         scope: UserScope,
+        *,
+        rank_across_batches: bool = True,
     ) -> list[_Candidate]:
         candidates: list[_Candidate] = []
         known_target_ids = {target.target_id for target in targets}
@@ -276,19 +284,25 @@ class EvidenceBuilder:
         ranked = sorted(
             candidates,
             key=lambda candidate: (
-                -candidate.parent.ranking_score,
+                -candidate.parent.ranking_score if rank_across_batches else candidate.parent_position,
                 candidate.batch_position,
                 candidate.parent_position,
                 candidate.parent.parent_id,
             ),
         )
         unique: list[_Candidate] = []
-        seen: set[tuple[str, str]] = set()
+        positions: dict[tuple[str, str], int] = {}
         for candidate in ranked:
             key = (candidate.parent.parent_id, candidate.parent.document_version_id)
-            if key not in seen:
-                seen.add(key)
+            if key not in positions:
+                positions[key] = len(unique)
                 unique.append(candidate)
+            else:
+                position = positions[key]
+                original = unique[position]
+                unique[position] = replace(original, target_ids=tuple(dict.fromkeys(
+                    (*original.target_ids, *candidate.target_ids)
+                )))
         return unique
 
     @staticmethod

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TYPE_CHECKING
 
 from pydantic import (
     BaseModel,
@@ -17,6 +17,9 @@ from pydantic import (
 from agentic_rag.ingestion.chunker import AstLocator
 from agentic_rag.query.evidence_builder import PackedEvidence
 from agentic_rag.query.public_answer import PublicAnswer
+
+if TYPE_CHECKING:
+    from agentic_rag.orchestration.streaming import PublicSupervisorAnswer
 
 MAX_BYTES = 256 * 1024
 SourceId = Annotated[
@@ -80,7 +83,10 @@ def within_budget(value: dict) -> bool:
     )
 
 
-def cited_ids(answer: PublicAnswer | None) -> tuple[str, ...]:
+def cited_ids(answer: PublicAnswer | PublicSupervisorAnswer | None) -> tuple[str, ...]:
+    from agentic_rag.orchestration.streaming import PublicSupervisorAnswer
+    if isinstance(answer, PublicSupervisorAnswer):
+        return tuple(answer.evidence_ids)
     if answer is None or answer.audited is not True:
         return ()
     return tuple(

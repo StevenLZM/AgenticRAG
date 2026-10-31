@@ -116,7 +116,9 @@ def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
         raise QueryCompositionError("Query Worker requires 1024-dimensional embeddings")
     return RuntimeConfigSnapshot(
         app_version="0.1.0",
-        graph_version="query-v2",
+        graph_version="supervisor-v1" if settings.supervisor_enabled else "query-v2",
+        orchestration_version="supervisor-v1" if settings.supervisor_enabled else None,
+        answer_protocol_version="answer-v2" if settings.supervisor_enabled else None,
         prompt_version="prompt-v2",
         routing_policy_version="routing-v2",
         prompt_hashes=tuple(sorted(hashes.items())),

@@ -146,3 +146,17 @@ class EvidenceBatch(BaseModel):
     document_ids: tuple[str, ...] = ()
     target_ids: tuple[str, ...] = ()
     observation: RetrievalObservation | None = None
+
+
+class RankedCandidates(BaseModel):
+    """Retrieval output at rerank; contains no hydrated parents or grade."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    query: str
+    hits: tuple[ChildHit, ...]
+    user_id: str
+    snapshot_id: str
+    index_generation: str
+    document_ids: tuple[str, ...] = ()
+    degraded_components: tuple[str, ...] = ()
+    observation: RetrievalObservation | None = None

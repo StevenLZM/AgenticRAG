@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     query_run_timeout_seconds: int = 300
     max_evidence_tokens: int = 12_000
     research_context_soft_limit_tokens: int = 16_000
+    supervisor_enabled: bool = False
+    supervisor_tenant_model_limit: int = Field(default=4, ge=1, le=64)
+    # This count belongs only to the legacy SQLite Query Worker.
     query_worker_count: Literal[1] = 1
     ingestion_worker_count: Literal[1] = 1
     max_upload_bytes: int = Field(

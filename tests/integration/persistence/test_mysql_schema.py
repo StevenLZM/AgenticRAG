@@ -49,6 +49,9 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 pytestmark = pytest.mark.integration
 
 EXPECTED_TABLES = {
+    "supervisor_runs", "agent_work_items", "agent_task_results",
+    "supervisor_decisions", "evidence_input_snapshots", "supervisor_inbox",
+    "supervisor_outbox", "answer_stream_chunks", "agent_resource_leases",
     "chat_sessions",
     "documents",
     "document_versions",
@@ -91,6 +94,15 @@ EXPECTED_INDEXES = {
 }
 
 EXPECTED_FOREIGN_KEYS = {
+    "supervisor_runs": {},
+    "agent_work_items": {},
+    "agent_task_results": {},
+    "supervisor_decisions": {},
+    "evidence_input_snapshots": {},
+    "supervisor_inbox": {},
+    "supervisor_outbox": {},
+    "answer_stream_chunks": {},
+    "agent_resource_leases": {},
     "chat_sessions": {},
     "documents": {
         "fk_documents_active_version": (

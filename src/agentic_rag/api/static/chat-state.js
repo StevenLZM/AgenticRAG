@@ -71,6 +71,8 @@
       return false;
     if (previous?.status === "running" && turn.status === "queued")
       return false;
+    if (previous?.answer?.protocol_version === "answer-v2" && turn.answer?.protocol_version === "answer-v2" &&
+        (turn.answer.epoch < previous.answer.epoch || (turn.answer.epoch === previous.answer.epoch && turn.answer.seq < previous.answer.seq))) return false;
     const merged = { ...previous, ...turn };
     if (isTerminal(merged)) merged.phase = null;
     session.runRevision++;

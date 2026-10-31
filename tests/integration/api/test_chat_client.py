@@ -14,6 +14,7 @@ STATIC = Path(__file__).resolve().parents[3] / "src/agentic_rag/api/static"
         "chat_state.cjs",
         "chat_tools.cjs",
         "chat_transport.cjs",
+        "chat_supervisor_stream.cjs",
         "chat_view_flow.cjs",
         "chat_recovery_flow.cjs",
     ],

@@ -118,10 +118,16 @@
         polling = false,
         initial = true;
       let lastId = Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : 0;
+      let answerV2 = false, answerEpoch = 1, answerSeq = 0, latestRun = null, latestAnswer = null;
       const check = async () => {
         const run = await api.getRun(runId, signal);
         if (signal?.aborted) return;
         if (run.run_id !== runId) throw new Error("Run identity mismatch");
+        answerV2 = run.answer_protocol_version === "answer-v2";
+        latestRun = run;
+        if (answerV2 && run.answer && (run.answer.epoch > answerEpoch || (run.answer.epoch === answerEpoch && run.answer.seq >= answerSeq))) {
+          latestAnswer = run.answer; answerEpoch = run.answer.epoch; answerSeq = run.answer.seq;
+        }
         finished = TERMINAL.has(run.status);
         await onRun(run);
       };
@@ -134,7 +140,7 @@
           cache: "no-store",
           headers: {
             Accept: "text/event-stream",
-            "Last-Event-ID": String(lastId),
+            "Last-Event-ID": answerV2 ? `${answerEpoch}:${answerSeq}` : String(lastId),
           },
         });
         if (!response.ok)
@@ -158,11 +164,11 @@
                 failures = 0;
                 continue;
               }
-              let id = null,
+              let rawId = "", id = null,
                 type = "",
                 data = [];
               for (const line of frame.split("\n")) {
-                if (line.startsWith("id:")) id = Number(line.slice(3).trim());
+                if (line.startsWith("id:")) { rawId = line.slice(3).trim(); id = Number(rawId); }
                 if (line.startsWith("event:")) type = line.slice(6).trim();
                 if (line.startsWith("data:"))
                   data.push(line.slice(5).trimStart());
@@ -171,6 +177,24 @@
               try {
                 payload = JSON.parse(data.join("\n"));
               } catch (_) {
+                continue;
+              }
+              if (answerV2) {
+                const [ep, sq] = rawId.split(":").map(Number);
+                if (payload?.run_id !== runId || !Number.isSafeInteger(ep) || !Number.isSafeInteger(sq) || ep < answerEpoch || (ep === answerEpoch && sq <= answerSeq)) continue;
+                if (ep > answerEpoch) { latestAnswer = null; answerSeq = 0; }
+                answerEpoch = ep; answerSeq = sq; failures = 0;
+                onConnection("connected");
+                if (type === "answer.delta" && typeof payload.text === "string") {
+                  latestAnswer = { protocol_version: "answer-v2", epoch: ep, seq: sq, text: "", stream_status: "streaming", faithfulness: "pending", mode: payload.mode || "partial", evidence_assessments: [], analysis_assessments: [], evidence_ids: [], limitations: [], ...latestAnswer };
+                  latestAnswer = { ...latestAnswer, epoch: ep, seq: sq, text: latestAnswer.text + payload.text, stream_status: "streaming" };
+                  await onRun({ ...latestRun, run_id: runId, status: "running", answer_protocol_version: "answer-v2", answer: latestAnswer });
+                } else if (payload.run) {
+                  latestRun = payload.run; latestAnswer = payload.run.answer;
+                  finished = TERMINAL.has(payload.run.status);
+                  await onRun(payload.run);
+                } else if (type === "answer.text_completed") await check();
+                if (finished || signal?.aborted) return;
                 continue;
               }
               if (

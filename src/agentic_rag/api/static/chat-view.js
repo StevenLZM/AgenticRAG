@@ -47,6 +47,12 @@
     } catch (_) { return null; }
   }
   function answerPresentation(run) {
+    if (run?.answer_protocol_version === "answer-v2" && run.answer?.protocol_version === "answer-v2" && typeof run.answer.text === "string") {
+      const labels = { pending: "答案核验中", passed: "答案核验通过", failed: "答案核验未通过，请核对依据", unavailable: "答案核验不可用" };
+      const stream = run.answer.stream_status;
+      const suffix = stream === "interrupted" ? "生成已中断" : stream === "cancelled" ? "生成已停止" : labels[run.answer.faithfulness] || "答案核验不可用";
+      return { text: run.answer.text + (run.answer.text ? "\n\n" : "") + suffix, hasSources: run.status === "completed" && (run.answer.evidence_ids || []).length > 0 };
+    }
     if (!run || run.status !== "completed" || run.error_code) return null;
     const answer = run.answer;
     if (!answer || !Array.isArray(answer.segments) || !answer.segments.length)
@@ -94,6 +100,7 @@
     };
   }
   function turnText(run) {
+    if (run.answer_protocol_version === "answer-v2" && run.answer?.text) return answerPresentation(run)?.text || "处理中";
     if (run.status === "queued") return "等待中";
     if (run.status === "cancel_requested") return "正在停止";
     if (run.status === "running") return phaseLabels[run.phase] || "处理中";

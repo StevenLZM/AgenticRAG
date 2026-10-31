@@ -139,7 +139,7 @@ class TransactionalRunRepository:
                 client_request_id=client_request_id,
                 transaction=transaction,
                 outbox_stream_name=(
-                    self._outbox_stream_name or DEFAULT_QUERY_OUTBOX_STREAM
+                    self._outbox_stream_name or ("agenticrag:jobs:supervisor" if snapshot.orchestration_version == "supervisor-v1" else DEFAULT_QUERY_OUTBOX_STREAM)
                 ),
             )
         async with self._factory.begin() as session:
@@ -150,7 +150,7 @@ class TransactionalRunRepository:
                 question=question,
                 client_request_id=client_request_id,
                 outbox_stream_name=(
-                    self._outbox_stream_name or DEFAULT_QUERY_OUTBOX_STREAM
+                    self._outbox_stream_name or ("agenticrag:jobs:supervisor" if snapshot.orchestration_version == "supervisor-v1" else DEFAULT_QUERY_OUTBOX_STREAM)
                 ),
             )
 

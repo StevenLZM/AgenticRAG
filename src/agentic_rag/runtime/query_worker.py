@@ -149,6 +149,10 @@ class QueryWorker:
         return True
 
     async def process_message(self, message: StreamMessage) -> None:
+        existing = await self._runs.get_for_delivery(message.aggregate_id)
+        if existing is not None and existing.runtime_config_snapshot.get("orchestration_version") is not None:
+            await self._broker.ack(QUERY_STREAM, QUERY_GROUP, message.id)
+            return
         claim = await self._runs.claim(message.aggregate_id, self._worker_id, self._lease_seconds)
         if claim is None:
             existing = await self._runs.get_for_delivery(message.aggregate_id)

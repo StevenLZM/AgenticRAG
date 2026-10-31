@@ -42,6 +42,16 @@ class ModelCall(BaseModel):
     timeout_seconds: float | None = None
     temperature: float | None = None
     max_output_tokens: int | None = Field(default=None, ge=1)
+    max_provider_attempts: int | None = Field(default=None, ge=1)
+    # Explicit opt-in for DeepSeek calls; legacy callers keep provider defaults.
+    thinking: Literal["enabled", "disabled"] | None = None
+
+    def thinking_options(self, protocol: Literal["chat", "responses"]) -> dict[str, Any]:
+        if self.thinking is None:
+            return {}
+        if protocol == "chat":
+            return {"extra_body": {"thinking": {"type": self.thinking}}}
+        return {"reasoning": {"effort": "none" if self.thinking == "disabled" else "high"}}
 
     @property
     def requested_model(self) -> str:
@@ -72,10 +82,15 @@ class ModelResponse(BaseModel, Generic[T]):
     output_tokens: int
     attempts: int
     latency_ms: int
+    usage_complete: bool = False
 
 
 class StructuredOutputValidationError(ValueError):
     """The model failed its one permitted schema-repair attempt."""
+
+
+class ModelOutputTruncatedError(ValueError):
+    """The provider exhausted its output limit; same-limit repair cannot help."""
 
 
 class ModelProtocolError(TypeError):
@@ -130,6 +145,11 @@ class ModelGateway:
             float(client_timeout_seconds) if client_timeout_seconds is not None else None
         )
 
+    def stream(self, call: ModelCall):
+        """Yield native final-answer deltas; never retry an emitted prefix."""
+        from agentic_rag.runtime.model_stream import stream_model
+        return stream_model(self, call)
+
     async def complete(self, call: ModelCall) -> ModelResponse[str]:
         """Return plain text, retrying only transient provider failures."""
         started = time.perf_counter()
@@ -145,6 +165,7 @@ class ModelGateway:
             output_tokens=_usage_value(response, "output_tokens", "completion_tokens"),
             attempts=attempts,
             latency_ms=round((time.perf_counter() - started) * 1_000),
+            usage_complete=attempts == 1 and _reports_output_usage(response),
         )
         await emit_model_usage(
             input_tokens=result.input_tokens,
@@ -161,14 +182,19 @@ class ModelGateway:
         started = time.perf_counter()
         deadline = self._operation_deadline(call)
         response, attempts = await self._request_with_retries(
-            call, structured=True, schema=schema, deadline=deadline, phase="initial"
+            call, structured=True, schema=schema, deadline=deadline, phase="initial",
         )
+        _require_untruncated(response)
         input_tokens = _usage_value(response, "input_tokens", "prompt_tokens")
         output_tokens = _usage_value(response, "output_tokens", "completion_tokens")
+        usage_complete = attempts == 1 and _reports_output_usage(response)
         text = _extract_text(response)
         try:
             value = _validate_schema(schema, text)
         except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as error:
+            if call.max_provider_attempts is not None and attempts >= call.max_provider_attempts:
+                await self._emit_repair_skipped(call, attempt=attempts)
+                raise StructuredOutputValidationError("provider attempt budget leaves no schema repair") from error
             remaining_after_initial = self._remaining(deadline)
             if remaining_after_initial is not None and remaining_after_initial <= 0:
                 await self._emit_repair_skipped(call, attempt=attempts)
@@ -187,6 +213,8 @@ class ModelGateway:
             )
             attempts += repair_attempts
             response = repair_response
+            _require_untruncated(response)
+            usage_complete = usage_complete and repair_attempts == 1 and _reports_output_usage(response)
             input_tokens += _usage_value(response, "input_tokens", "prompt_tokens")
             output_tokens += _usage_value(response, "output_tokens", "completion_tokens")
             remaining_after_repair = self._remaining(deadline)
@@ -230,6 +258,7 @@ class ModelGateway:
             output_tokens=output_tokens,
             attempts=attempts,
             latency_ms=round((time.perf_counter() - started) * 1_000),
+            usage_complete=usage_complete,
         )
         await emit_model_usage(
             input_tokens=result.input_tokens,
@@ -250,6 +279,8 @@ class ModelGateway:
         max_retries: int | None = None,
     ) -> tuple[object, int]:
         retry_limit = self._max_retries if max_retries is None else max_retries
+        if call.max_provider_attempts is not None:
+            retry_limit = min(retry_limit, call.max_provider_attempts - 1)
         for attempt in range(1, retry_limit + 2):
             remaining = self._remaining(deadline)
             if remaining is not None and remaining <= 0:
@@ -474,6 +505,7 @@ class ModelGateway:
                 kwargs["temperature"] = call.temperature
             if call.max_output_tokens is not None:
                 kwargs["max_tokens"] = call.max_output_tokens
+            kwargs.update(call.thinking_options("chat"))
             return await cast(Any, _get(completions, "create"))(**kwargs)
 
         if protocol in {"auto", "responses"} and responses_available:
@@ -491,11 +523,28 @@ class ModelGateway:
                 kwargs["temperature"] = call.temperature
             if call.max_output_tokens is not None:
                 kwargs["max_output_tokens"] = call.max_output_tokens
+            kwargs.update(call.thinking_options("responses"))
             return await cast(Any, _get(responses, "create"))(**kwargs)
 
         raise ModelProtocolError(
             f"client cannot satisfy requested {protocol} model protocol"
         )
+
+
+def _require_untruncated(response: object) -> None:
+    raw_choices = _get(response, "choices")
+    choices = raw_choices if isinstance(raw_choices, (list, tuple)) else ()
+    if any(_get(choice, "finish_reason") == "length" for choice in choices) or (
+        _get(response, "status") == "incomplete"
+        and _get(_get(response, "incomplete_details"), "reason") == "max_output_tokens"
+    ):
+        raise ModelOutputTruncatedError("model output limit exhausted; response is truncated")
+
+
+def _reports_output_usage(response: object) -> bool:
+    usage = _get(response, "usage")
+    return any(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+               for value in (_get(usage, "output_tokens"), _get(usage, "completion_tokens")))
 
 
 class PromptTemplate(BaseModel):

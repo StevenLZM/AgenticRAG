@@ -70,6 +70,13 @@ class FakeClient:
         self.responses = FakeResponsesApi(values)
 
 
+async def test_one_reserved_provider_attempt_never_runs_schema_repair():
+    client = FakeClient(["bad json", "{}"])
+    with pytest.raises(StructuredOutputValidationError, match="budget"):
+        await ModelGateway(client).complete_structured(ROUTE_CALL.model_copy(update={"max_provider_attempts": 1}), RouteDecision)
+    assert len(client.responses.calls) == 1
+
+
 @dataclass
 class UsageEmitter:
     calls: list[dict[str, object]] = field(default_factory=list)
@@ -93,6 +100,41 @@ class FakeChatClient:
         self.chat = type(
             "Chat", (), {"completions": FakeChatCompletionsApi(values)}
         )()
+
+
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+async def test_explicit_deepseek_thinking_policy_is_passed_to_provider(protocol):
+    client = FakeChatClient(["ok"]) if protocol == "chat" else FakeClient(["ok"])
+    call = ROUTE_CALL.model_copy(update={"protocol": protocol, "thinking": "disabled"})
+    await ModelGateway(client).complete(call)
+    kwargs = client.chat.completions.calls[0] if protocol == "chat" else client.responses.calls[0]
+    if protocol == "chat":
+        assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    else:
+        assert kwargs["reasoning"] == {"effort": "none"}
+
+
+async def test_truncated_json_is_not_repaired_with_the_same_insufficient_token_limit():
+    class Truncated(FakeChatCompletionsApi):
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                    "usage": {"completion_tokens": 2048}}
+    client = FakeChatClient([])
+    client.chat.completions = Truncated([])
+    with pytest.raises(ValueError, match="output.*limit|truncated"):
+        await ModelGateway(client).complete_structured(ROUTE_CALL, RouteDecision)
+    assert len(client.chat.completions.calls) == 1
+
+
+async def test_repair_usage_is_complete_only_when_every_response_reports_tokens():
+    from pydantic import BaseModel
+    class Value(BaseModel):
+        value: int
+    result = await ModelGateway(FakeClient(['bad json', '{"value": 1}'])).complete_structured(ROUTE_CALL, Value)
+    assert result.attempts == 2 and result.output_tokens == 6 and result.usage_complete
+    missing = await ModelGateway(FakeChatClient(['bad json', '{"value": 1}'])).complete_structured(ROUTE_CALL, Value)
+    assert not missing.usage_complete
 
 
 class DualProtocolClient(FakeChatClient):

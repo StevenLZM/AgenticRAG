@@ -46,7 +46,11 @@ class ChatSourceService:
             run = await SqlAlchemyRunRepository(db).get(run_id, scope)
             if run is None or run.thread_id != session_id:
                 raise SessionNotFound(run_id)
-            ids = cited_ids(project_public_answer(run.answer))
+            if run.runtime_config_snapshot.get("answer_protocol_version") == "answer-v2" and run.answer:
+                from agentic_rag.orchestration.streaming import PublicSupervisorAnswer
+                ids = cited_ids(PublicSupervisorAnswer.model_validate(run.answer))
+            else:
+                ids = cited_ids(project_public_answer(run.answer))
             if not ids or run.status != RunStatus.COMPLETED:
                 return SourceView(status="none")
             raw = run.answer_sources

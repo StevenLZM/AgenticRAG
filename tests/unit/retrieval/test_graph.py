@@ -147,6 +147,20 @@ def state() -> dict[str, object]:
     return {"request": REQUEST, "scope": SCOPE, "snapshot": SNAPSHOT}
 
 
+async def test_candidate_boundary_stops_after_rerank_without_parent_hydration(
+    deps: RetrievalDependencies,
+) -> None:
+    service = RetrievalService(deps)
+    assert callable(getattr(service, "retrieve_candidates", None))
+    candidates = await service.retrieve_candidates(REQUEST, SCOPE, SNAPSHOT)
+    assert {hit.child_id for hit in candidates.hits} == {"dense", "bm25"}
+    assert candidates.user_id == "user-1"
+    assert candidates.index_generation == "index-test"
+    assert candidates.observation.stages["rerank"]
+    assert deps.parent_fetcher.calls == []
+    assert not hasattr(candidates, "parents")
+
+
 async def test_batch_keeps_separate_observed_rankings(deps: RetrievalDependencies) -> None:
     class ReverseReranker:
         async def rerank(self, query, candidates, *, limit):

@@ -24,6 +24,7 @@ from agentic_rag.retrieval.models import (
     RetrievalRequest,
     RankedHitRef,
     RetrievalObservation,
+    RankedCandidates,
 )
 from agentic_rag.retrieval.parents import aggregate_parents
 from agentic_rag.retrieval.ports import LexicalIndex, VectorIndex
@@ -84,6 +85,25 @@ class RetrievalService:
 
     def __init__(self, dependencies: RetrievalDependencies) -> None:
         self._graph = build_retrieval_graph(dependencies)
+        self._candidate_graph = build_retrieval_graph(dependencies, candidates_only=True)
+
+    async def retrieve_candidates(
+        self, request: RetrievalRequest, scope: UserScope, snapshot: RuntimeConfigSnapshot,
+    ) -> RankedCandidates:
+        """Stop at rerank; the external evidence stage owns parent hydration."""
+        try:
+            state = await self._candidate_graph.ainvoke(
+                {"request": request, "scope": scope, "snapshot": snapshot}
+            )
+        except NodeCancelledError as error:
+            raise asyncio.CancelledError() from error
+        return RankedCandidates(
+            query=request.query, hits=tuple(state["reranked_hits"]),
+            user_id=scope.user_id, snapshot_id=snapshot.snapshot_id,
+            index_generation=snapshot.index_generation, document_ids=request.document_ids,
+            degraded_components=state["degraded_components"],
+            observation=_observation(cast(RetrievalState, state)),
+        )
 
     @property
     def graph(
@@ -113,6 +133,7 @@ class RetrievalService:
 
 def build_retrieval_graph(
     dependencies: RetrievalDependencies,
+    *, candidates_only: bool = False,
 ) -> CompiledStateGraph[RetrievalState, None, RetrievalState, RetrievalState]:
     """Compile the non-agent-configurable retrieval subgraph.
 
@@ -304,6 +325,13 @@ def build_retrieval_graph(
     builder.add_node("recall", recall)
     builder.add_node("rrf_fusion", rrf_fusion)
     builder.add_node("cross_encoder", cross_encoder)
+    if candidates_only:
+        builder.add_edge(START, "validate_and_filter")
+        builder.add_edge("validate_and_filter", "recall")
+        builder.add_edge("recall", "rrf_fusion")
+        builder.add_edge("rrf_fusion", "cross_encoder")
+        builder.add_edge("cross_encoder", END)
+        return builder.compile(name="RankedRetrievalGraph", checkpointer=False)
     builder.add_node("parent_aggregation", parent_aggregation)
     builder.add_node("parent_fetch", parent_fetch)
     builder.add_node("evidence_batch", evidence_batch)
@@ -316,6 +344,26 @@ def build_retrieval_graph(
     builder.add_edge("parent_fetch", "evidence_batch")
     builder.add_edge("evidence_batch", END)
     return builder.compile(name="RetrievalPipelineGraph")
+
+
+def _observation(state: RetrievalState) -> RetrievalObservation:
+    stages: dict[Literal["dense", "bm25", "rrf", "rerank"], list[ChildHit]] = {
+        "dense": state.get("dense_hits", []), "bm25": state.get("bm25_hits", []),
+        "rrf": state.get("fused_hits", []), "rerank": state.get("reranked_hits", []),
+    }
+    return RetrievalObservation(
+        user_id=state["scope"].user_id, snapshot_id=state["snapshot"].snapshot_id,
+        index_generation=state["snapshot"].index_generation,
+        stages={name: tuple(RankedHitRef(
+            child_id=hit.child_id, parent_id=hit.parent_id, user_id=hit.user_id,
+            document_id=hit.document_id, document_version_id=hit.document_version_id,
+            retrieval_score=hit.retrieval_score, rrf_score=hit.rrf_score,
+            rerank_score=hit.rerank_score,
+        ) for hit in hits) for name, hits in stages.items()},
+        selected_parent_ids=(), hydrated_parent_ids=(),
+        candidate_budget=_budget(state).model_dump(),
+        timings_ms=state["timings_ms"], candidate_counts=state["candidate_counts"],
+    )
 
 
 async def _with_timeout(
