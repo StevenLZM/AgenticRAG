@@ -33,9 +33,10 @@ class SqlAlchemyParentStagingStore:
     """Stage inactive Parents using one transaction per idempotent operation."""
 
     def __init__(
-        self, session_factory: async_sessionmaker[AsyncSession]
+        self, session_factory: async_sessionmaker[AsyncSession], *, embedding_model: str = EMBEDDING_MODEL,
     ) -> None:
         self._session_factory = session_factory
+        self._embedding_model = embedding_model
 
     async def assert_writable(self, context: StagingContext) -> None:
         async with self._session_factory() as session:
@@ -278,7 +279,7 @@ class SqlAlchemyParentStagingStore:
             row["version_no"] != context.version_no
             or row["pipeline_version"] != context.pipeline_version
             or row["embedding_version"] != context.embedding_version
-            or context.embedding_version != EMBEDDING_MODEL
+            or context.embedding_version != self._embedding_model
             or row["index_generation"] != context.index_generation
             or row["status"]
             not in {

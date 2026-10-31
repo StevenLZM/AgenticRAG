@@ -268,6 +268,8 @@ def _system(
     corrupt_manifest: bool = False,
     corrupt_canonical: bool = False,
     alias_store: object | None = None,
+    embedding_model: str = "text-embedding-v3",
+    worker_embedding_model: str | None = None,
 ) -> tuple[
     VersionPublisher,
     _PublicationRepository,
@@ -282,7 +284,7 @@ def _system(
         canonical_ast_sha256=canonical_hash,
         parent_count=2,
         child_count=3,
-        embedding_model="text-embedding-v3",
+        embedding_model=embedding_model,
         embedding_dimensions=1024,
         index_generation="index-v2",
     )
@@ -291,7 +293,7 @@ def _system(
     ).encode()
     manifest_hash = "f" * 64 if corrupt_manifest else manifest.manifest_hash
     target = PublicationTarget(
-        context=_context("version-2", 2),
+        context=_context("version-2", 2).model_copy(update={"embedding_version": embedding_model}),
         active_version_id="version-1",
         previous_context=_context("version-1", 1),
         manifest_uri=(
@@ -326,8 +328,32 @@ def _system(
         child_store=children,
         artifacts=_Artifacts(payloads),
         alias_store=cast(Any, alias_store),
+        embedding_model=worker_embedding_model or embedding_model,
     )
     return publisher, repository, parents, children, events
+
+
+async def test_publication_verifies_configured_embedding_manifest() -> None:
+    publisher, repository, _, _, events = _system(embedding_model="qwen3.7-text-embedding-flash")
+    await publisher.publish("version-2")
+    assert "finalize:version-2" in events
+    events.clear()
+    repository.target = repository.target.model_copy(update={
+        "context": repository.target.context.model_copy(update={"embedding_version": "text-embedding-v3"})})
+    from agentic_rag.ingestion.publisher import PublicationConfigurationError
+    with pytest.raises(PublicationConfigurationError, match="embedding model"):
+        await publisher.publish("version-2")
+    assert events == []
+
+
+async def test_model_rollout_does_not_quarantine_valid_older_staged_version() -> None:
+    publisher, _, parents, children, _ = _system(worker_embedding_model="qwen3.7-text-embedding-flash")
+    state = _ReconciliationRepository(stale=["version-2"])
+    reconciler = IngestionReconciler(repository=state, publisher=publisher,
+        dispatcher=_Dispatcher(), parent_store=parents, child_store=children, artifacts=_Artifacts({}))
+    report = await reconciler.run_once()
+    assert report.quarantined_versions == ()
+    assert state.quarantined == []
 
 
 async def test_publish_uses_fixed_idempotent_activation_order() -> None:

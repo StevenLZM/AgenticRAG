@@ -22,7 +22,7 @@ class VersionManifest(BaseModel):
     canonical_ast_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     parent_count: int = Field(gt=0)
     child_count: int = Field(gt=0)
-    embedding_model: Literal["text-embedding-v3"]
+    embedding_model: str = Field(min_length=1, max_length=255, pattern=r"^\S+$")
     embedding_dimensions: Literal[1024]
     index_generation: str
 

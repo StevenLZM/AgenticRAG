@@ -128,14 +128,15 @@ async def run(settings: Settings) -> None:
     embedding = QwenEmbeddingAdapter(settings)
     factory = container.repositories.session_factory
     jobs = SqlAlchemyIngestionJobStore(factory)
-    parent_store = SqlAlchemyParentStagingStore(factory)
-    child_store = ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis)
+    parent_store = SqlAlchemyParentStagingStore(factory, embedding_model=settings.embedding_model)
+    child_store = ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis, embedding_model=settings.embedding_model)
     publisher = VersionPublisher(
         repository=SqlAlchemyPublicationRepository(factory),
         parent_store=parent_store,
         child_store=child_store,
         artifacts=artifacts,
         alias_store=child_store,
+        embedding_model=settings.embedding_model,
     )
     reconciler = IngestionReconciler(
         repository=SqlAlchemyReconciliationRepository(factory),
@@ -169,6 +170,7 @@ async def run(settings: Settings) -> None:
         chunker=ChunkingPipeline(tokenizer),
         index_writer=IndexWriter(
             embedding=embedding,
+            embedding_model=settings.embedding_model,
             parent_store=parent_store,
             child_store=child_store,
             artifacts=artifacts,

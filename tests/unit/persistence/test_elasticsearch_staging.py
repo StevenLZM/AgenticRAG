@@ -23,6 +23,38 @@ class _Response:
         self.body = body
 
 
+@pytest.mark.asyncio
+async def test_embedding_model_is_recorded_and_cannot_mix_in_one_generation() -> None:
+    client = _Client()
+    new_store = ElasticsearchChildIndexStore(cast(Any, client), embedding_model="qwen3.7-text-embedding-flash")
+    await new_store.ensure_index("index-v2")
+    assert client.indices.mappings["_meta"]["embedding_model"] == "qwen3.7-text-embedding-flash"
+    old_store = ElasticsearchChildIndexStore(cast(Any, client))
+    with pytest.raises(ChildIndexMappingError, match="_meta"):
+        await old_store.stage(_context(), [_embedded_child()])
+    assert client.bulk_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_query_startup_validates_actual_model_and_alias_without_mutations() -> None:
+    client = _Client()
+    old = ElasticsearchChildIndexStore(cast(Any, client))
+    await old.ensure_index("index-v2")
+    client.indices.aliases[ACTIVE_CHILD_INDEX_ALIAS] = {"agenticrag-children-index-v2"}
+    await old.validate_search_target("index-v2")
+    incompatible = ElasticsearchChildIndexStore(cast(Any, client), embedding_model="qwen3.7-text-embedding-flash")
+    with pytest.raises(ChildIndexMappingError):
+        await incompatible.validate_search_target("index-v2")
+    client.indices.aliases[ACTIVE_CHILD_INDEX_ALIAS] = {"agenticrag-children-wrong-generation"}
+    with pytest.raises(ChildIndexWriteError):
+        await old.validate_search_target("index-v2")
+    await old.validate_search_target("index-v2", index="agenticrag-children-index-v2")
+    with pytest.raises(ChildIndexWriteError):
+        await old.validate_search_target("index-v2", index="agenticrag-children-other")
+    assert client.indices.create_calls == 1
+    assert client.indices.alias_updates == client.indices.put_alias_calls == []
+
+
 class _Indices:
     def __init__(self, *, existing_mapping: dict[str, Any] | None = None) -> None:
         self.mappings = existing_mapping

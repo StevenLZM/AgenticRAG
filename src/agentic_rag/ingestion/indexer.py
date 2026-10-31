@@ -150,6 +150,7 @@ class IndexWriter:
         artifacts: ArtifactStore,
         embedding_batch_size: int = 64,
         embedding_dimensions: int = EMBEDDING_DIMENSIONS,
+        embedding_model: str = EMBEDDING_MODEL,
     ) -> None:
         if embedding_batch_size <= 0:
             raise ValueError("embedding_batch_size must be positive")
@@ -163,6 +164,9 @@ class IndexWriter:
         self._artifacts = artifacts
         self._embedding_batch_size = embedding_batch_size
         self._embedding_dimensions = embedding_dimensions
+        if not embedding_model or len(embedding_model) > 255 or any(c.isspace() for c in embedding_model):
+            raise ValueError("embedding model must be a nonblank identifier")
+        self._embedding_model = embedding_model
 
     async def stage(
         self,
@@ -173,6 +177,8 @@ class IndexWriter:
         before_side_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> VersionManifest:
         parents = tuple(chunks)
+        if context.embedding_version != self._embedding_model:
+            raise StagingIdentityError("configured embedding model differs from durable context")
         children = self._validate_and_flatten(parents, context)
         if not await asyncio.to_thread(self._artifacts.verify, canonical_ast):
             raise StagingError("Canonical AST Artifact failed integrity verification")
@@ -217,7 +223,7 @@ class IndexWriter:
             canonical_ast_sha256=canonical_ast.sha256,
             parent_count=parent_count,
             child_count=child_count,
-            embedding_model=EMBEDDING_MODEL,
+            embedding_model=self._embedding_model,
             embedding_dimensions=EMBEDDING_DIMENSIONS,
             index_generation=context.index_generation,
         )

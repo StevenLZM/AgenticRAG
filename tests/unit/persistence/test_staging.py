@@ -132,6 +132,20 @@ def test_parent_locator_schema_has_no_512_byte_ceiling() -> None:
     assert "ast_locator LONGTEXT NOT NULL" in ddl
 
 
+async def test_staging_binds_configured_embedding_to_durable_version(manifest_store) -> None:
+    old_store, factory, _ = manifest_store
+    model = "qwen3.7-text-embedding-flash"
+    context = _context().model_copy(update={"embedding_version": model})
+    async with factory.begin() as db:
+        await db.execute(update(document_versions).values(embedding_version=model))
+    with pytest.raises(StagingVersionError):
+        await old_store.assert_writable(context)
+    store = SqlAlchemyParentStagingStore(factory, embedding_model=model)
+    await store.assert_writable(context)
+    with pytest.raises(StagingVersionError):
+        await store.assert_writable(_context())
+
+
 @pytest.mark.asyncio
 async def test_identical_manifest_retry_is_a_database_noop(
     manifest_store: tuple[

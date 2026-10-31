@@ -211,15 +211,16 @@ async def test_query_worker_alias_startup_uses_current_index_generation(
 ) -> None:
     import scripts.run_query_worker as worker_entrypoint
 
-    calls: list[tuple[object, str, str]] = []
+    calls: list[tuple[object, str, str, str]] = []
 
     class RecordingAliasStore:
-        def __init__(self, client: object, *, lexical_analysis: str = "standard") -> None:
+        def __init__(self, client: object, *, lexical_analysis: str = "standard", embedding_model: str) -> None:
             self._client = client
             self._lexical_analysis = lexical_analysis
+            self._embedding_model = embedding_model
 
         async def ensure_active_alias(self, index_generation: str) -> bool:
-            calls.append((self._client, index_generation, self._lexical_analysis))
+            calls.append((self._client, index_generation, self._lexical_analysis, self._embedding_model))
             return True
 
     client = object()
@@ -227,11 +228,11 @@ async def test_query_worker_alias_startup_uses_current_index_generation(
         worker_entrypoint, "ElasticsearchChildIndexStore", RecordingAliasStore
     )
 
-    settings = _settings(index_generation="runtime-index", lexical_analysis="ik")
+    settings = _settings(index_generation="runtime-index", lexical_analysis="ik", embedding_model="qwen3.7-text-embedding-flash")
     container = SimpleNamespace(elasticsearch=client)
     await worker_entrypoint.ensure_active_child_alias(container, settings)
 
-    assert calls == [(client, "runtime-index", "ik")]
+    assert calls == [(client, "runtime-index", "ik", "qwen3.7-text-embedding-flash")]
 
 
 def _settings(**overrides: object) -> Settings:

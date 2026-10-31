@@ -27,6 +27,10 @@ class PublicationIntegrityError(PublicationError):
     """A durable version cannot be trusted enough to publish."""
 
 
+class PublicationConfigurationError(PublicationError):
+    """A different worker configuration must resume this intact version."""
+
+
 class PublicationObsoleteError(PublicationError):
     """A newer durable winner superseded this candidate."""
 
@@ -123,12 +127,14 @@ class VersionPublisher:
         child_store: VersionLifecycleStore,
         artifacts: ManifestArtifactReader,
         alias_store: ActiveIndexAliasStore | None = None,
+        embedding_model: str = EMBEDDING_MODEL,
     ) -> None:
         self._repository = repository
         self._parent_store = parent_store
         self._child_store = child_store
         self._artifacts = artifacts
         self._alias_store = alias_store
+        self._embedding_model = embedding_model
 
     async def publish(
         self,
@@ -175,10 +181,11 @@ class VersionPublisher:
             )
 
     async def _verify(self, target: PublicationTarget) -> None:
-        if (
-            target.context.index_generation in LEGACY_INDEX_GENERATIONS
-            or target.context.embedding_version != EMBEDDING_MODEL
-        ):
+        if target.context.embedding_version != self._embedding_model:
+            # Reconciliation must not quarantine a valid staged version merely
+            # because a newer worker uses a different embedding space.
+            raise PublicationConfigurationError("version requires a different embedding model")
+        if target.context.index_generation in LEGACY_INDEX_GENERATIONS:
             raise PublicationIntegrityError(
                 "version does not use the current strict Child index contract"
             )
@@ -186,7 +193,7 @@ class VersionPublisher:
             canonical_ast_sha256=target.canonical_ast_sha256,
             parent_count=target.parent_count,
             child_count=target.child_count,
-            embedding_model=EMBEDDING_MODEL,
+            embedding_model=self._embedding_model,
             embedding_dimensions=EMBEDDING_DIMENSIONS,
             index_generation=target.context.index_generation,
         )

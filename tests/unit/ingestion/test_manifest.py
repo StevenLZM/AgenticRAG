@@ -24,12 +24,33 @@ from agentic_rag.ingestion.indexer import (
     ParentStagingStore,
     StagingContext,
     StagingCountError,
+    StagingIdentityError,
 )
 from agentic_rag.ingestion.manifest import VersionManifest
 from agentic_rag.persistence.artifacts import ArtifactRef, LocalArtifactStore
 
 
 CANONICAL_SHA256 = "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_configured_embedding_model_is_bound_to_manifest_and_context(tmp_path: Path) -> None:
+    model = "qwen3.7-text-embedding-flash"
+    events: list[str] = []
+    embedding = FakeEmbedding([[[0.0] * 1024]])
+    artifacts = LocalArtifactStore(tmp_path)
+    writer = IndexWriter(embedding=embedding, embedding_model=model,
+                         parent_store=RecordingParentStore(events),
+                         child_store=RecordingChildStore(events), artifacts=artifacts)
+    canonical = artifacts.put_bytes("canonical.json", b"canonical")
+    with pytest.raises(StagingIdentityError, match="embedding model"):
+        await writer.stage(_chunks(), context=_context(), canonical_ast=canonical)
+    assert events == [] and embedding.calls == []
+    context = _context().model_copy(update={"embedding_version": model})
+    manifest = await writer.stage(_chunks(), context=context, canonical_ast=canonical)
+    assert manifest.embedding_model == model
+    old = VersionManifest(**{**manifest.payload(), "embedding_model": "text-embedding-v3"})
+    assert old.manifest_hash != manifest.manifest_hash
 
 
 def _locator() -> AstLocator:

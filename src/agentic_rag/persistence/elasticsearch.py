@@ -49,6 +49,7 @@ class ElasticsearchChildIndexStore:
         *,
         bulk_batch_size: int = 500,
         lexical_analysis: LexicalAnalysis = "standard",
+        embedding_model: str = EMBEDDING_MODEL,
     ) -> None:
         if bulk_batch_size <= 0:
             raise ValueError("bulk_batch_size must be positive")
@@ -57,11 +58,21 @@ class ElasticsearchChildIndexStore:
         if lexical_analysis not in {"standard", "ik"}:
             raise ValueError("unsupported lexical analysis profile")
         self._lexical_analysis = lexical_analysis
+        self._embedding_model = embedding_model
 
     @staticmethod
     def index_name(index_generation: str) -> str:
         validate_index_generation(index_generation)
         return f"agenticrag-children-{index_generation}"
+
+    async def validate_search_target(self, index_generation: str, *, index: str | None = None) -> None:
+        """Check the actual query target and embedding space without repairing aliases."""
+        expected = self.index_name(index_generation)
+        if index is not None and index != expected:
+            raise ChildIndexWriteError("query index differs from configured generation")
+        await self.validate_index(index_generation)
+        if index is None:
+            await self._verify_active_alias(expected)
 
     async def ensure_active_alias(self, index_generation: str) -> bool:
         """Repair a missing active alias without changing an existing generation.
@@ -163,6 +174,8 @@ class ElasticsearchChildIndexStore:
         *,
         before_side_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
+        if context.embedding_version != self._embedding_model:
+            raise ChildIndexMappingError("embedding_model differs from durable context")
         await self.ensure_index(context.index_generation)
         index = self.index_name(context.index_generation)
         staged = 0
@@ -282,7 +295,7 @@ class ElasticsearchChildIndexStore:
                 f"Index Generation {index_generation!r} uses the legacy Child schema; "
                 f"stage new versions with {DEFAULT_INDEX_GENERATION!r}"
             )
-        expected_mapping = _index_mapping(index_generation, self._lexical_analysis)
+        expected_mapping = _index_mapping(index_generation, self._lexical_analysis, self._embedding_model)
         try:
             await self._client.indices.create(
                 index=index,
@@ -299,7 +312,7 @@ class ElasticsearchChildIndexStore:
     async def validate_index(self, index_generation: str) -> None:
         """Read-only compatibility check; never create or alter an index."""
         index = self.index_name(index_generation)
-        expected_mapping = _index_mapping(index_generation, self._lexical_analysis)
+        expected_mapping = _index_mapping(index_generation, self._lexical_analysis, self._embedding_model)
         response = await self._client.indices.get_mapping(index=index)
         mapping_body = cast(Mapping[str, Any], response.body)
         index_body = mapping_body.get(index)
@@ -401,12 +414,12 @@ def _bulk_failures(body: Mapping[str, Any]) -> list[str]:
     return failures or ["unknown bulk failure"]
 
 
-def _index_mapping(index_generation: str, lexical_analysis: LexicalAnalysis = "standard") -> dict[str, Any]:
+def _index_mapping(index_generation: str, lexical_analysis: LexicalAnalysis = "standard", embedding_model: str = EMBEDDING_MODEL) -> dict[str, Any]:
     return {
         "dynamic": "strict",
         "_meta": {
             "index_generation": index_generation,
-            "embedding_model": EMBEDDING_MODEL,
+            "embedding_model": embedding_model,
             "embedding_dimensions": EMBEDDING_DIMENSIONS,
             "schema_version": 3 if lexical_analysis == "ik" else 2,
             **({"lexical_analysis": "ik-v1"} if lexical_analysis == "ik" else {}),
