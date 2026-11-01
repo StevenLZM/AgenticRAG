@@ -34,7 +34,7 @@ class UnsupportedDateRangeError(ValueError):
     """Raised until Child index mappings store a queryable document date."""
 
 
-_HIT_SOURCE_FIELDS = (
+_LEGACY_HIT_SOURCE_FIELDS = (
     "id",
     "parent_id",
     "user_id",
@@ -43,6 +43,21 @@ _HIT_SOURCE_FIELDS = (
     "content",
     "ast_locator",
 )
+
+_REPRESENTATION_FIELDS = (
+    "contextualized_content",
+    "representation_version",
+    "content_hash",
+    "source_child_id",
+    "source_content_hash",
+    "context_ref",
+    "context_claim_ids",
+    "build_fingerprint",
+    "context_prefix",
+    "enrichment_status",
+)
+
+_HIT_SOURCE_FIELDS = _LEGACY_HIT_SOURCE_FIELDS + _REPRESENTATION_FIELDS
 
 
 def serialize_filter(filter: SearchFilter) -> list[dict[str, Any]]:
@@ -70,10 +85,19 @@ class _ElasticsearchChildSearch:
         *,
         index_generation: str,
         index: str | None = None,
+        expected_representation_version: Literal["context-v1"] | None = None,
     ) -> None:
         self._client = client
         self._index_generation = validate_index_generation(index_generation)
         self._index = index or ACTIVE_CHILD_INDEX_ALIAS
+        if expected_representation_version not in {None, "context-v1"}:
+            raise ValueError("unsupported expected representation version")
+        self._expected_representation_version = expected_representation_version
+        self._hit_source_fields = (
+            _HIT_SOURCE_FIELDS
+            if expected_representation_version
+            else _LEGACY_HIT_SOURCE_FIELDS
+        )
 
     def _validate_filter(self, filter: SearchFilter) -> list[dict[str, Any]]:
         if filter.index_generation != self._index_generation:
@@ -94,8 +118,8 @@ class _ElasticsearchChildSearch:
         if top_k <= 0:
             raise ValueError("top_k must be positive")
 
-    @staticmethod
     def _hits(
+        self,
         response: Any,
         *,
         lane: Literal["dense", "bm25"],
@@ -106,6 +130,14 @@ class _ElasticsearchChildSearch:
         hits: list[ChildHit] = []
         for rank, raw_hit in enumerate(raw_hits, start=1):
             source = cast(Mapping[str, Any], raw_hit.get("_source", {}))
+            if (
+                self._expected_representation_version is not None
+                and source.get("representation_version")
+                != self._expected_representation_version
+            ):
+                raise ValueError(
+                    "hit representation version differs from generation policy"
+                )
             locator = source.get("ast_locator", "")
             hits.append(
                 ChildHit(
@@ -123,6 +155,11 @@ class _ElasticsearchChildSearch:
                     lane=lane,
                     lane_rank=rank,
                     retrieval_score=float(raw_hit.get("_score") or 0.0),
+                    **{
+                        name: source[name]
+                        for name in _REPRESENTATION_FIELDS
+                        if name in source
+                    },
                 )
             )
         return hits
@@ -153,7 +190,7 @@ class ElasticsearchVectorIndex(_ElasticsearchChildSearch):
                 "filter": clauses,
             },
             size=top_k,
-            source_includes=list(_HIT_SOURCE_FIELDS),
+            source_includes=list(self._hit_source_fields),
         )
         return self._hits(response, lane="dense")
 
@@ -161,9 +198,21 @@ class ElasticsearchVectorIndex(_ElasticsearchChildSearch):
 class ElasticsearchBm25Index(_ElasticsearchChildSearch):
     """BM25 Child retrieval over contextualized Child content."""
 
-    def __init__(self, client: AsyncElasticsearch, *, index_generation: str,
-                 index: str | None = None, lexical_analysis: LexicalAnalysis = "standard") -> None:
-        super().__init__(client, index_generation=index_generation, index=index)
+    def __init__(
+        self,
+        client: AsyncElasticsearch,
+        *,
+        index_generation: str,
+        index: str | None = None,
+        lexical_analysis: LexicalAnalysis = "standard",
+        expected_representation_version: Literal["context-v1"] | None = None,
+    ) -> None:
+        super().__init__(
+            client,
+            index_generation=index_generation,
+            index=index,
+            expected_representation_version=expected_representation_version,
+        )
         if lexical_analysis not in {"standard", "ik"}:
             raise ValueError("unsupported lexical analysis profile")
         self._lexical_analysis = lexical_analysis
@@ -194,6 +243,6 @@ class ElasticsearchBm25Index(_ElasticsearchChildSearch):
                 }
             },
             size=top_k,
-            source_includes=list(_HIT_SOURCE_FIELDS),
+            source_includes=list(self._hit_source_fields),
         )
         return self._hits(response, lane="bm25")

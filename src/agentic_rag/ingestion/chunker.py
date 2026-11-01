@@ -33,9 +33,10 @@ from docling_core.types.doc import (  # type: ignore[import-not-found]
     TableCell,
     TableData,
 )
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from agentic_rag.ingestion.assembler import CanonicalAst, CanonicalBlock
+from agentic_rag.models.contextual import SearchRepresentation
 from agentic_rag.runtime.ids import content_id
 
 
@@ -128,6 +129,14 @@ class ChildChunk(BaseModel):
     page_to: int = Field(ge=1)
     ast_locator: AstLocator
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    search_representation: SearchRepresentation | None = None
+
+    @model_serializer(mode="wrap")
+    def _legacy_serialization(self, handler):
+        data = handler(self)
+        if self.search_representation is None:
+            data.pop("search_representation", None)
+        return data
 
     @model_validator(mode="after")
     def _valid_range(self) -> ChildChunk:
@@ -135,7 +144,61 @@ class ChildChunk(BaseModel):
             raise ValueError("child page range is reversed")
         if not self.content.strip() or not self.contextualized_content.strip():
             raise ValueError("child content must not be blank")
+        if self.search_representation is not None:
+            rep = self.search_representation.require_persisted()
+            if (
+                self.id,
+                self.content,
+                self.contextualized_content,
+                self.content_hash,
+                self.token_count,
+            ) != (
+                rep.id,
+                rep.content,
+                rep.contextualized_content,
+                rep.content_hash,
+                rep.token_count,
+            ):
+                raise ValueError("child differs from its search representation")
+            expected_id = (
+                "chi_"
+                + content_id(
+                    self.document_version_id,
+                    self.parent_id,
+                    rep.source_child_id,
+                    rep.representation_version,
+                    rep.build_fingerprint,
+                    rep.content_hash,
+                )[:32]
+            )
+            if self.id != expected_id:
+                raise ValueError("search representation ID does not bind child lineage")
         return self
+
+
+def apply_search_representation(
+    child: ChildChunk, representation: SearchRepresentation
+) -> ChildChunk:
+    """Create the final indexed child from a raw child and durable representation."""
+    representation.require_persisted()
+    if child.search_representation is not None:
+        raise ValueError("search representation adapter requires a raw child")
+    if (
+        representation.source_child_id,
+        representation.content,
+        representation.base_contextualized_content,
+    ) != (child.id, child.content, child.contextualized_content):
+        raise ValueError("search representation differs from the original child")
+    return ChildChunk.model_validate(
+        {
+            **child.model_dump(),
+            "id": representation.id,
+            "contextualized_content": representation.contextualized_content,
+            "content_hash": representation.content_hash,
+            "token_count": representation.token_count,
+            "search_representation": representation,
+        }
+    )
 
 
 class ParentChunk(BaseModel):

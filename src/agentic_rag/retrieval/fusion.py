@@ -23,8 +23,8 @@ def rrf_fuse(
 
     Each lane contributes a reciprocal-rank score.  When the same Child is
     returned by multiple lanes, its contributions are summed and the first hit
-    instance is retained because it already carries the retrieval metadata
-    needed by later pipeline stages.
+    instance is retained only after verifying that both records carry the same
+    source identity, validated search text, hashes and context references.
     """
     if limit < 0:
         raise ValueError("limit must be non-negative")
@@ -36,12 +36,19 @@ def rrf_fuse(
     hits: dict[str, ChildHit] = {}
     for lane in lanes:
         for hit in lane:
+            # Validate even model_copy/checkpoint inputs before merging identities.
+            hit = ChildHit.model_validate(hit.model_dump())
+            previous = hits.get(hit.child_id)
+            if previous is not None and previous.search_identity != hit.search_identity:
+                raise ValueError(
+                    f"conflicting search identity for Child {hit.child_id!r}"
+                )
             rank = hit.lane_rank
             if rank <= 0:
                 raise ValueError("ChildHit lane_rank must be positive")
-            scores[hit.child_id] = scores.get(hit.child_id, 0.0) + reciprocal_rank_score(
-                rank, k
-            )
+            scores[hit.child_id] = scores.get(
+                hit.child_id, 0.0
+            ) + reciprocal_rank_score(rank, k)
             best_ranks[hit.child_id] = min(best_ranks.get(hit.child_id, rank), rank)
             hits.setdefault(hit.child_id, hit)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 import logging
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from elasticsearch import AsyncElasticsearch
 from elasticsearch.exceptions import BadRequestError, NotFoundError
@@ -15,6 +15,7 @@ from agentic_rag.ingestion.indexer import (
     EmbeddedChild,
     StagingContext,
 )
+from agentic_rag.ingestion.chunker import ChildChunk
 from agentic_rag.models.indexing import (
     ACTIVE_CHILD_INDEX_ALIAS,
     DEFAULT_INDEX_GENERATION,
@@ -50,6 +51,7 @@ class ElasticsearchChildIndexStore:
         bulk_batch_size: int = 500,
         lexical_analysis: LexicalAnalysis = "standard",
         embedding_model: str = EMBEDDING_MODEL,
+        expected_representation_version: Literal["context-v1"] | None = None,
     ) -> None:
         if bulk_batch_size <= 0:
             raise ValueError("bulk_batch_size must be positive")
@@ -59,6 +61,9 @@ class ElasticsearchChildIndexStore:
             raise ValueError("unsupported lexical analysis profile")
         self._lexical_analysis = lexical_analysis
         self._embedding_model = embedding_model
+        if expected_representation_version not in {None, "context-v1"}:
+            raise ValueError("unsupported expected representation version")
+        self._expected_representation_version = expected_representation_version
 
     @staticmethod
     def index_name(index_generation: str) -> str:
@@ -176,6 +181,24 @@ class ElasticsearchChildIndexStore:
     ) -> int:
         if context.embedding_version != self._embedding_model:
             raise ChildIndexMappingError("embedding_model differs from durable context")
+        for child in children:
+            self._validate_metadata(context, child)
+            validated = ChildChunk.model_validate(child.chunk.model_dump())
+            representation = validated.search_representation
+            if self._expected_representation_version is not None:
+                if (
+                    representation is None
+                    or representation.representation_version
+                    != self._expected_representation_version
+                ):
+                    raise ChildIndexMappingError(
+                        "child representation differs from generation policy"
+                    )
+                representation.require_persisted()
+            elif representation is not None:
+                raise ChildIndexMappingError(
+                    "context representation requires an explicit generation policy"
+                )
         await self.ensure_index(context.index_generation)
         index = self.index_name(context.index_generation)
         staged = 0
@@ -295,7 +318,7 @@ class ElasticsearchChildIndexStore:
                 f"Index Generation {index_generation!r} uses the legacy Child schema; "
                 f"stage new versions with {DEFAULT_INDEX_GENERATION!r}"
             )
-        expected_mapping = _index_mapping(index_generation, self._lexical_analysis, self._embedding_model)
+        expected_mapping = _index_mapping(index_generation, self._lexical_analysis, self._embedding_model, self._expected_representation_version)
         try:
             await self._client.indices.create(
                 index=index,
@@ -312,7 +335,7 @@ class ElasticsearchChildIndexStore:
     async def validate_index(self, index_generation: str) -> None:
         """Read-only compatibility check; never create or alter an index."""
         index = self.index_name(index_generation)
-        expected_mapping = _index_mapping(index_generation, self._lexical_analysis, self._embedding_model)
+        expected_mapping = _index_mapping(index_generation, self._lexical_analysis, self._embedding_model, self._expected_representation_version)
         response = await self._client.indices.get_mapping(index=index)
         mapping_body = cast(Mapping[str, Any], response.body)
         index_body = mapping_body.get(index)
@@ -401,6 +424,24 @@ class ElasticsearchChildIndexStore:
             "index_generation": context.index_generation,
             "search_type": "document",
             "is_active": False,
+            **(
+                {
+                    "representation_version": child.search_representation.representation_version,
+                    "source_child_id": child.search_representation.source_child_id,
+                    "source_content_hash": child.search_representation.source_content_hash,
+                    "context_prefix": child.search_representation.context_prefix,
+                    "context_ref": child.search_representation.context_ref.model_dump(
+                        mode="json"
+                    ),
+                    "context_claim_ids": list(
+                        child.search_representation.context_claim_ids
+                    ),
+                    "enrichment_status": child.search_representation.enrichment_status,
+                    "build_fingerprint": child.search_representation.build_fingerprint,
+                }
+                if child.search_representation is not None
+                else {}
+            ),
         }
 
 
@@ -414,14 +455,26 @@ def _bulk_failures(body: Mapping[str, Any]) -> list[str]:
     return failures or ["unknown bulk failure"]
 
 
-def _index_mapping(index_generation: str, lexical_analysis: LexicalAnalysis = "standard", embedding_model: str = EMBEDDING_MODEL) -> dict[str, Any]:
+def _index_mapping(
+    index_generation: str,
+    lexical_analysis: LexicalAnalysis = "standard",
+    embedding_model: str = EMBEDDING_MODEL,
+    expected_representation_version: Literal["context-v1"] | None = None,
+) -> dict[str, Any]:
     return {
         "dynamic": "strict",
         "_meta": {
             "index_generation": index_generation,
             "embedding_model": embedding_model,
             "embedding_dimensions": EMBEDDING_DIMENSIONS,
-            "schema_version": 3 if lexical_analysis == "ik" else 2,
+            "schema_version": (5 if lexical_analysis == "ik" else 4)
+            if expected_representation_version
+            else (3 if lexical_analysis == "ik" else 2),
+            **(
+                {"representation_version": expected_representation_version}
+                if expected_representation_version
+                else {}
+            ),
             **({"lexical_analysis": "ik-v1"} if lexical_analysis == "ik" else {}),
         },
         "properties": {
@@ -441,8 +494,19 @@ def _index_mapping(index_generation: str, lexical_analysis: LexicalAnalysis = "s
             "content": {"type": "text"},
             "contextualized_content": {
                 "type": "text",
-                **({"fields": {"zh": {"type": "text", "analyzer": "ik_max_word", "search_analyzer": "ik_smart"}}}
-                   if lexical_analysis == "ik" else {}),
+                **(
+                    {
+                        "fields": {
+                            "zh": {
+                                "type": "text",
+                                "analyzer": "ik_max_word",
+                                "search_analyzer": "ik_smart",
+                            }
+                        }
+                    }
+                    if lexical_analysis == "ik"
+                    else {}
+                ),
             },
             "token_count": {"type": "integer"},
             "page_from": {"type": "integer"},
@@ -458,6 +522,20 @@ def _index_mapping(index_generation: str, lexical_analysis: LexicalAnalysis = "s
             "index_generation": {"type": "keyword"},
             "search_type": {"type": "keyword"},
             "is_active": {"type": "boolean"},
+            **(
+                {
+                    "representation_version": {"type": "keyword"},
+                    "source_child_id": {"type": "keyword"},
+                    "source_content_hash": {"type": "keyword"},
+                    "context_prefix": {"type": "text", "index": False},
+                    "context_ref": {"type": "object", "enabled": False},
+                    "context_claim_ids": {"type": "keyword"},
+                    "enrichment_status": {"type": "keyword"},
+                    "build_fingerprint": {"type": "keyword"},
+                }
+                if expected_representation_version
+                else {}
+            ),
         },
     }
 

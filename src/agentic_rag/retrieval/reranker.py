@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from agentic_rag.retrieval.models import ChildHit
 
@@ -21,6 +21,84 @@ class RerankerUnavailable(RuntimeError):
     """An operational model failure that permits RRF-order degradation."""
 
 
+class RerankInputTooLong(RerankerUnavailable):
+    """The full document and complete query cannot fit in at most two pairs."""
+
+
+@dataclass(frozen=True, slots=True)
+class QueryWindows:
+    """Original body slices, with explicit complete coverage or impossibility."""
+
+    windows: tuple[str, ...]
+    complete: bool
+
+
+class PairTokenizer(Protocol):
+    """Process-owned tokenizer contract, including all pair special tokens."""
+
+    max_pair_tokens: int
+
+    def count_pair(self, query: str, document: str) -> int: ...
+
+    def query_windows(
+        self, body: str, *, query_prefix: str, document: str, max_windows: int
+    ) -> QueryWindows: ...
+
+
+class TokenizerPairAdapter:
+    """Wrap an already-loaded fast tokenizer; never download or clip text.
+
+    The composition owner must use the same tokenizer and effective capacity as
+    the Cross-Encoder. Offset mappings split original query text losslessly.
+    """
+
+    def __init__(
+        self, tokenizer: Callable[..., Mapping[str, Any]], *, max_pair_tokens: int
+    ) -> None:
+        if type(max_pair_tokens) is not int or max_pair_tokens <= 0:
+            raise ValueError("max_pair_tokens must be a positive integer")
+        self.max_pair_tokens = max_pair_tokens
+        self._tokenizer = tokenizer
+
+    def count_pair(self, query: str, document: str) -> int:
+        encoded = self._tokenizer(
+            query, document, add_special_tokens=True, truncation=False
+        )
+        return len(encoded["input_ids"])
+
+    def query_windows(
+        self, body: str, *, query_prefix: str, document: str, max_windows: int = 2
+    ) -> QueryWindows:
+        if max_windows not in {1, 2}:
+            raise ValueError("query windows must be bounded to at most two")
+        if self.count_pair(query_prefix + body, document) <= self.max_pair_tokens:
+            return QueryWindows((body,), complete=True)
+        if max_windows == 1 or not body:
+            return QueryWindows((), complete=False)
+        encoded = self._tokenizer(
+            body,
+            add_special_tokens=False,
+            truncation=False,
+            return_offsets_mapping=True,
+        )
+        boundaries: set[int] = set()
+        for start, end in encoded["offset_mapping"]:
+            if not 0 <= start <= end <= len(body):
+                raise ValueError("tokenizer returned invalid query offsets")
+            if 0 < end < len(body):
+                boundaries.add(end)
+        # Prefer balanced complete windows. Each actual pair is measured because
+        # prefixes, separators, and special tokens need not count additively.
+        for boundary in sorted(boundaries, key=lambda n: (abs(n - len(body) / 2), n)):
+            windows = (body[:boundary], body[boundary:])
+            if all(
+                self.count_pair(query_prefix + window, document) <= self.max_pair_tokens
+                for window in windows
+            ):
+                return QueryWindows(windows, complete=True)
+        return QueryWindows((), complete=False)
+
+
 @dataclass(frozen=True, slots=True)
 class RerankResult:
     """Reranked hits and observability data for the retrieval pipeline."""
@@ -28,6 +106,8 @@ class RerankResult:
     hits: list[ChildHit]
     degraded: bool
     model_version: str
+    degradation_reason: str | None = None
+    window_counts: tuple[int, ...] = ()
 
 
 class Reranker:
@@ -44,6 +124,7 @@ class Reranker:
         max_concurrent_reranks: int = 1,
         executor: Executor | None = None,
         max_candidates: int = 30,
+        pair_tokenizer: PairTokenizer | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -62,6 +143,54 @@ class Reranker:
             thread_name_prefix="agentic-rag-reranker",
         )
         self._closed = False
+        self._pair_tokenizer = pair_tokenizer
+
+    def _predict(
+        self, query: str, input_hits: Sequence[ChildHit], query_prefix: str
+    ) -> tuple[list[float], tuple[int, ...]]:
+        pairs: list[tuple[str, str]] = []
+        counts: list[int] = []
+        for hit in input_hits:
+            document = hit.search_content
+            windows = (query,)
+            tokenizer = self._pair_tokenizer
+            if tokenizer is not None:
+                if tokenizer.count_pair(query, document) > tokenizer.max_pair_tokens:
+                    plan = tokenizer.query_windows(
+                        query[len(query_prefix) :],
+                        query_prefix=query_prefix,
+                        document=document,
+                        max_windows=2,
+                    )
+                    if not plan.complete:
+                        raise RerankInputTooLong("rerank_input_too_long")
+                    if (
+                        not 1 <= len(plan.windows) <= 2
+                        or "".join(plan.windows) != query[len(query_prefix) :]
+                        or any(not window for window in plan.windows)
+                    ):
+                        raise ValueError("query window coverage mismatch")
+                    windows = tuple(query_prefix + window for window in plan.windows)
+                    if any(
+                        tokenizer.count_pair(window, document)
+                        > tokenizer.max_pair_tokens
+                        for window in windows
+                    ):
+                        raise RerankInputTooLong("rerank_input_too_long")
+            pairs.extend((window, document) for window in windows)
+            counts.append(len(windows))
+        # No inference runs until every candidate's complete text passes preflight.
+        scores = self.model.predict(pairs)
+        if len(scores) != len(pairs):
+            raise ValueError("Cross-Encoder returned a score count mismatch")
+        aggregated: list[float] = []
+        offset = 0
+        for count in counts:
+            aggregated.append(
+                max(float(score) for score in scores[offset : offset + count])
+            )
+            offset += count
+        return aggregated, tuple(counts)
 
     @property
     def closed(self) -> bool:
@@ -81,13 +210,23 @@ class Reranker:
         await asyncio.to_thread(self.close)
 
     async def rerank(
-        self, query: str, candidates: Sequence[ChildHit], *, limit: int = 10
+        self,
+        query: str,
+        candidates: Sequence[ChildHit],
+        *,
+        limit: int = 10,
+        protected_query_context: str = "",
     ) -> RerankResult:
         """Rerank up to thirty candidates or preserve RRF order when degraded."""
         if self._closed:
             raise RuntimeError("Reranker is closed")
         if limit < 0:
             raise ValueError("limit must be non-negative")
+        query_prefix = (
+            protected_query_context + "\n\n" if protected_query_context else ""
+        )
+        if query_prefix and not query.startswith(query_prefix):
+            raise ValueError("protected query context must be the exact query prefix")
 
         input_hits = list(candidates[: self.max_candidates])
         result_limit = min(limit, self.max_candidates)
@@ -99,15 +238,16 @@ class Reranker:
                 model_version=self._model_version,
             )
 
-        pairs = [(query, hit.content) for hit in input_hits]
-        prediction: asyncio.Future[Sequence[float]] | None = None
+        prediction: asyncio.Future[tuple[list[float], tuple[int, ...]]] | None = None
         await self._semaphore.acquire()
         release_slot = True
         try:
             loop = asyncio.get_running_loop()
-            prediction = loop.run_in_executor(self._executor, self.model.predict, pairs)
+            prediction = loop.run_in_executor(
+                self._executor, self._predict, query, input_hits, query_prefix
+            )
             try:
-                scores = await asyncio.wait_for(
+                scores, window_counts = await asyncio.wait_for(
                     asyncio.shield(prediction), timeout=self._timeout_seconds
                 )
             except asyncio.TimeoutError:
@@ -117,12 +257,21 @@ class Reranker:
                     hits=fallback,
                     degraded=True,
                     model_version=self._model_version,
+                    degradation_reason="reranker_unavailable",
+                )
+            except RerankInputTooLong:
+                return RerankResult(
+                    hits=fallback,
+                    degraded=True,
+                    model_version=self._model_version,
+                    degradation_reason="rerank_input_too_long",
                 )
             except (RerankerUnavailable, OSError):
                 return RerankResult(
                     hits=fallback,
                     degraded=True,
                     model_version=self._model_version,
+                    degradation_reason="reranker_unavailable",
                 )
         finally:
             if prediction is not None and not prediction.done() and release_slot:
@@ -147,4 +296,5 @@ class Reranker:
             hits=ranked[:result_limit],
             degraded=False,
             model_version=self._model_version,
+            window_counts=window_counts,
         )

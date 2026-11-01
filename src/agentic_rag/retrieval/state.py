@@ -43,6 +43,7 @@ class RetrievalState(TypedDict, total=False):
     bm25_hits: list[ChildHit]
     fused_hits: list[ChildHit]
     reranked_hits: list[ChildHit]
+    rerank_window_counts: tuple[int, ...]
     selected_parents: list[ParentEvidence]
     hydrated_parents: list[ParentEvidence]
     degraded_components: tuple[str, ...]

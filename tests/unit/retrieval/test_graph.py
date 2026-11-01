@@ -147,6 +147,24 @@ def state() -> dict[str, object]:
     return {"request": REQUEST, "scope": SCOPE, "snapshot": SNAPSHOT}
 
 
+async def test_rerank_window_inference_counts_survive_graph_observation(
+    deps: RetrievalDependencies,
+) -> None:
+    class WindowedReranker:
+        async def rerank(self, query, candidates, *, limit):
+            return RerankResult(
+                hits=list(candidates[:limit]),
+                degraded=False,
+                model_version="fake",
+                window_counts=(2, 1),
+            )
+
+    dependencies = replace(deps, reranker=WindowedReranker())
+    result = await build_retrieval_graph(dependencies).ainvoke(state())
+    assert result["rerank_window_counts"] == (2, 1)
+    assert result["evidence_batch"].observation.candidate_counts["rerank_pairs"] == 3
+
+
 async def test_candidate_boundary_stops_after_rerank_without_parent_hydration(
     deps: RetrievalDependencies,
 ) -> None:

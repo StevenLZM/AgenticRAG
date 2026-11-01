@@ -12,6 +12,12 @@ from pydantic import (
     model_validator,
 )
 
+from agentic_rag.models.contextual import (
+    ContextArtifactRef,
+    SHA256_PATTERN,
+    text_sha256,
+)
+
 
 class DateRange(BaseModel):
     """An optional inclusive date range supplied as a retrieval selector."""
@@ -69,6 +75,95 @@ class ChildHit(BaseModel):
     )
     rrf_score: float | None = None
     rerank_score: float | None = None
+    contextualized_content: str | None = None
+    representation_version: Literal["context-v1"] | None = None
+    content_hash: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    source_child_id: str | None = None
+    source_content_hash: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    context_ref: ContextArtifactRef | None = None
+    context_claim_ids: tuple[str, ...] = ()
+    build_fingerprint: str | None = None
+    context_prefix: str | None = None
+    enrichment_status: Literal["enriched", "structural_only", "partial"] | None = None
+
+    @model_validator(mode="after")
+    def _valid_representation(self) -> "ChildHit":
+        if self.representation_version is None and (
+            self.source_child_id is not None
+            or self.source_content_hash is not None
+            or self.context_ref is not None
+            or self.context_claim_ids
+            or self.build_fingerprint is not None
+            or self.context_prefix is not None
+            or self.enrichment_status is not None
+        ):
+            raise ValueError("context metadata requires representation_version")
+        if self.representation_version is not None:
+            if (
+                "context_claim_ids" not in self.model_fields_set
+                or self.context_prefix is None
+                or self.enrichment_status is None
+            ):
+                raise ValueError("context-v1 requires explicit context metadata")
+            if not all(
+                (
+                    self.contextualized_content and self.contextualized_content.strip(),
+                    self.content_hash,
+                    self.source_child_id and self.source_child_id.strip(),
+                    self.source_content_hash,
+                    self.context_ref,
+                    self.build_fingerprint and self.build_fingerprint.strip(),
+                )
+            ):
+                raise ValueError("context-v1 requires complete representation fields")
+            if text_sha256(self.content) != self.source_content_hash:
+                raise ValueError("original content hash mismatch")
+            if text_sha256(self.contextualized_content) != self.content_hash:
+                raise ValueError("search content hash mismatch")
+            if bool(self.context_prefix) != bool(self.context_claim_ids) or (
+                self.enrichment_status == "structural_only"
+            ) != (not self.context_claim_ids):
+                raise ValueError(
+                    "context prefix, claims and enrichment status disagree"
+                )
+            prefix = self.context_prefix + "\n\n" if self.context_prefix else ""
+            if not self.contextualized_content.startswith(prefix):
+                raise ValueError("rendered context prefix mismatch")
+            if self.content not in self.contextualized_content[len(prefix) :]:
+                raise ValueError("search representation must retain original content")
+            if len(self.context_claim_ids) != len(set(self.context_claim_ids)):
+                raise ValueError("context claim IDs must be unique")
+        return self
+
+    @property
+    def search_content(self) -> str:
+        """Select validated context-v1 text or explicit legacy original content."""
+        self._valid_representation()
+        return (
+            self.contextualized_content if self.representation_version else self.content
+        )
+
+    @property
+    def search_identity(self) -> tuple[object, ...]:
+        """Immutable source/search identity, excluding lane-specific scores."""
+        return (
+            self.parent_id,
+            self.user_id,
+            self.document_id,
+            self.document_version_id,
+            self.content,
+            self.ast_locator,
+            self.representation_version,
+            self.content_hash,
+            self.source_child_id,
+            self.source_content_hash,
+            self.context_ref,
+            self.context_claim_ids,
+            self.build_fingerprint,
+            self.search_content,
+            self.context_prefix,
+            self.enrichment_status,
+        )
 
     @property
     def ranking_score(self) -> float:

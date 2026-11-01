@@ -247,7 +247,7 @@ def build_retrieval_graph(
         if result.degraded:
             await emit_degradation(
                 component="reranker",
-                reason="reranker_unavailable",
+                reason=result.degradation_reason or "reranker_unavailable",
                 run_id=None,
                 snapshot_id=state["snapshot"].snapshot_id,
                 attempt=1,
@@ -260,6 +260,8 @@ def build_retrieval_graph(
             "cross_encoder",
             started,
             reranked_hits=result.hits,
+            rerank_window_counts=result.window_counts,
+            rerank_pairs=sum(result.window_counts),
             reranker=len(result.hits),
             degraded_components=degraded,
         )
@@ -412,7 +414,7 @@ def _stage_update(
     timings = dict(state["timings_ms"])
     timings[stage] = _elapsed_ms(started)
     counts = dict(state["candidate_counts"])
-    for key in ("rrf", "reranker", "parents_selected", "parents_hydrated"):
+    for key in ("rrf", "reranker", "rerank_pairs", "parents_selected", "parents_hydrated"):
         value = update.pop(key, None)
         if value is not None:
             counts[key] = cast(int, value)
