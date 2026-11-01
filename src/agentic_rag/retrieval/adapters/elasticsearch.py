@@ -67,6 +67,8 @@ def serialize_filter(filter: SearchFilter) -> list[dict[str, Any]]:
         {"term": {"is_active": True}},
         {"term": {"index_generation": filter.index_generation}},
     ]
+    if filter.match_none:
+        clauses.append({"match_none": {}})
     if filter.search_type is not None:
         clauses.append({"term": {"search_type": filter.search_type}})
     if filter.document_ids:
@@ -222,6 +224,7 @@ class ElasticsearchBm25Index(_ElasticsearchChildSearch):
         query_text: str,
         filter: SearchFilter,
         top_k: int,
+        *, scope_terms: tuple[str, ...] = (),
     ) -> list[ChildHit]:
         self._validate_top_k(top_k)
         clauses = self._validate_filter(filter)
@@ -240,6 +243,7 @@ class ElasticsearchBm25Index(_ElasticsearchChildSearch):
                 "bool": {
                     "filter": clauses,
                     "must": text_query,
+                    **({"should": [{"match": {"contextualized_content": term}} for term in scope_terms], "minimum_should_match": 0} if scope_terms else {}),
                 }
             },
             size=top_k,

@@ -146,7 +146,7 @@ class Reranker:
         self._pair_tokenizer = pair_tokenizer
 
     def _predict(
-        self, query: str, input_hits: Sequence[ChildHit], query_prefix: str
+        self, query: str, input_hits: Sequence[ChildHit], query_prefix: str, allow_query_windows: bool
     ) -> tuple[list[float], tuple[int, ...]]:
         pairs: list[tuple[str, str]] = []
         counts: list[int] = []
@@ -156,6 +156,8 @@ class Reranker:
             tokenizer = self._pair_tokenizer
             if tokenizer is not None:
                 if tokenizer.count_pair(query, document) > tokenizer.max_pair_tokens:
+                    if not allow_query_windows:
+                        raise RerankInputTooLong("rerank_input_too_long")
                     plan = tokenizer.query_windows(
                         query[len(query_prefix) :],
                         query_prefix=query_prefix,
@@ -216,6 +218,7 @@ class Reranker:
         *,
         limit: int = 10,
         protected_query_context: str = "",
+        allow_query_windows: bool = True,
     ) -> RerankResult:
         """Rerank up to thirty candidates or preserve RRF order when degraded."""
         if self._closed:
@@ -244,7 +247,7 @@ class Reranker:
         try:
             loop = asyncio.get_running_loop()
             prediction = loop.run_in_executor(
-                self._executor, self._predict, query, input_hits, query_prefix
+                self._executor, self._predict, query, input_hits, query_prefix, allow_query_windows
             )
             try:
                 scores, window_counts = await asyncio.wait_for(

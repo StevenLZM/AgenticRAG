@@ -18,6 +18,7 @@ from agentic_rag.query.tools import ResearchContext, ResearchToolset
 from agentic_rag.retrieval.models import EvidenceBatch
 from agentic_rag.runtime.concurrency import ConcurrencyManager
 from agentic_rag.safety.context import DataEnvelope
+from agentic_rag.retrieval.query_compiler import QueryCompiler
 
 
 class UnresolvedDependencyError(ValueError):
@@ -43,6 +44,7 @@ class ChildResearchState:
     dependency_results: Mapping[str, object] = field(default_factory=dict)
     runtime_config_snapshot: Mapping[str, object] = field(default_factory=dict)
     tool_context: Mapping[str, object] = field(default_factory=dict)
+    business_context: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +229,7 @@ class SubagentDispatcher:
             dependency_context="\n".join(dependency_text),
             dependency_results=_freeze_mapping(dependency_results),
             runtime_config_snapshot=_freeze_mapping(context.snapshot.model_dump(mode="json")),
+            business_context=_freeze_mapping(QueryCompiler.for_task(context.business_context, item.title, task_ref=f"todo:{item.id}").model_dump(mode="json")) if context.business_context else MappingProxyType({}),
             tool_context=_freeze_mapping({"run_id": context.tool_context.run_id,
                 "session_id": context.tool_context.session_id, "deadline": context.tool_context.deadline,
                 "call_prefix": f"{context.call_prefix}:child:{item.id}"}) if context.tool_context is not None else MappingProxyType({}),

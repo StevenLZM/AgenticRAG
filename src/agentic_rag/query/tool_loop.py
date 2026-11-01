@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, RootModel, TypeAdapter
 
 from agentic_rag.query.evidence_builder import EvidenceBuilder, EvidenceCoverageTarget
-from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
+from agentic_rag.query.state import business_from_state, QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.retrieval.models import EvidenceBatch
 from agentic_rag.runtime.model_gateway import ModelCall, load_prompt
 from agentic_rag.tool_runtime.models import ToolContext, ToolDefinition, ToolError, ToolResult
@@ -76,7 +76,7 @@ def tool_context(state: QueryState) -> ToolContext:
         deadline = time.time() + snapshot.query_run_timeout_seconds
     return ToolContext(scope=scope_from_state(state), run_id=state["run_id"],
                        session_id=str(state.get("request", {}).get("thread_id") or state["run_id"]),
-                       snapshot=snapshot, deadline=float(deadline))
+                       snapshot=snapshot, deadline=float(deadline), business_context=business_from_state(state))
 
 
 def tool_results(state: QueryState) -> list[ToolResult]:

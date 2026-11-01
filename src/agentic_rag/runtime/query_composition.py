@@ -131,6 +131,7 @@ def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
         retrieval_config_version="retrieval-ik-v1" if settings.lexical_analysis == "ik" else "retrieval-v1",
         index_generation=settings.index_generation,
         memory_config_version="agent_memories_v1-v1",
+        query_context_version="business-v1" if settings.query_context_enabled else None,
         max_research_rounds=settings.max_research_rounds,
         max_answer_revisions=settings.max_answer_revisions,
         query_run_timeout_seconds=settings.query_run_timeout_seconds,
@@ -160,10 +161,12 @@ def build_subagent_dispatcher(
         child_scope = UserScope.model_validate(dict(child.scope))
         inherited = RuntimeConfigSnapshot.model_validate(dict(child.runtime_config_snapshot))
         from agentic_rag.tool_runtime.models import ToolContext
+        from agentic_rag.retrieval.query_context import QueryBusinessContext
+        business = QueryBusinessContext.model_validate(dict(child.business_context)) if child.business_context else None
         metadata = child.tool_context
-        context = ResearchContext(scope=child_scope, snapshot=inherited,
+        context = ResearchContext(scope=child_scope, snapshot=inherited, business_context=business,
             tool_context=ToolContext(scope=child_scope, snapshot=inherited, run_id=str(metadata["run_id"]),
-                session_id=str(metadata["session_id"]), deadline=float(str(metadata["deadline"]))) if metadata else None,
+                session_id=str(metadata["session_id"]), deadline=float(str(metadata["deadline"])), business_context=business) if metadata else None,
             call_prefix=str(metadata.get("call_prefix", "child")))
         return await child_tools.retrieve_evidence(
             query=child.question,

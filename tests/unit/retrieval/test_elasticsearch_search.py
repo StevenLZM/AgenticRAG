@@ -187,3 +187,16 @@ async def test_rejects_a_filter_for_another_index_generation_before_search(
             await index.search("termination clause", _filter(index_generation="index-v1"), 3)
 
     assert client.calls == []
+
+
+async def test_scope_terms_only_supplement_required_core_and_empty_filter_fails_closed():
+    client = _Client()
+    lexical = ElasticsearchBm25Index(client, index_generation="index-v2")
+    await lexical.search("住宿标准", _filter(match_none=True), 7, scope_terms=("星河公司", "普通员工"))
+    query = client.calls[0]["query"]["bool"]
+    assert query["must"] == {"match": {"contextualized_content": "住宿标准"}}
+    assert query["should"] == [{"match": {"contextualized_content": value}} for value in ("星河公司", "普通员工")]
+    assert query["minimum_should_match"] == 0
+    assert {"match_none": {}} in query["filter"]
+    assert {"term": {"user_id": "u1"}} in query["filter"]
+    assert len(client.calls) == 1

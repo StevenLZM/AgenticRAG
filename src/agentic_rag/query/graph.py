@@ -56,6 +56,7 @@ from agentic_rag.query.routing_context import (
 from agentic_rag.query.routing_policy import RuntimeCapabilities, decide_grade, policy_update, technical_failure
 from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.retrieval.graph import RetrievalService
+from agentic_rag.retrieval.query_compiler import QueryCompiler
 from agentic_rag.retrieval.models import EvidenceBatch
 from agentic_rag.runtime.concurrency import ConcurrencyManager
 from agentic_rag.runtime.model_gateway import ModelGateway
@@ -90,6 +91,7 @@ class QueryGraphDependencies:
     capabilities: RuntimeCapabilities | None = None
     conversations: ConversationReader | None = None
     tool_runtime: Any = None
+    query_compiler: QueryCompiler | None = None
 
 
 def query_checkpoint_config(state: QueryState) -> RunnableConfig:
@@ -135,8 +137,14 @@ def build_query_graph(
         _assert_server_checkpoint_namespace(state, config)
         await phase_reporter(state)("processing")
         prepared: dict[str, object] = {}
+        if dependencies.query_compiler is not None:
+            if state.get("business_context_run_id") != state["run_id"]:
+                frozen = await dependencies.query_compiler.freeze(question_from_state(state), scope_from_state(state), task_intent_ref=state["run_id"])
+                prepared.update(business_context=frozen.model_dump(mode="json"), business_context_run_id=state["run_id"])
+                state = cast(QueryState, {**state, **prepared})
+
         if dependencies.capabilities is not None:
-            prepared = fresh_routing_state(state)
+            prepared.update(fresh_routing_state(state))
             state = cast(QueryState, {**state, **prepared})
             try:
                 prepared.update(await prepare_routing_state(state, capabilities=dependencies.capabilities,

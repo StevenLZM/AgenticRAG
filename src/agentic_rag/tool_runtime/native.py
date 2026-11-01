@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from agentic_rag.query.calculator import SafeCalculator, UnsafeExpression
 from agentic_rag.query.tools import RetrievalPort
 from agentic_rag.retrieval.models import RetrievalRequest
+from agentic_rag.retrieval.query_context import business_kwargs
 from agentic_rag.tool_runtime.models import ToolContext, ToolDefinition, ToolError
 
 
@@ -56,7 +57,7 @@ class NativeAdapter:
                 if "top_k_override" in arguments:
                     raise ToolError("invalid_arguments")
                 request = RetrievalRequest.model_validate(arguments)
-                batch = await self._retrieval.retrieve(request, context.scope, context.snapshot)
+                batch = await self._retrieval.retrieve(request, context.scope, context.snapshot, **business_kwargs(context.business_context))
                 for parent in batch.parents:
                     if not parent.child_hits or any(
                         hit.user_id != context.scope.user_id

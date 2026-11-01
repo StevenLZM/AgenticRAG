@@ -27,4 +27,5 @@ class LexicalIndex(Protocol):
         query_text: str,
         filter: SearchFilter,
         top_k: int,
+        *, scope_terms: tuple[str, ...] = (),
     ) -> list[ChildHit]: ...

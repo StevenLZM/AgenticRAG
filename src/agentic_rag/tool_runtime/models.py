@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from agentic_rag.retrieval.query_context import QueryBusinessContext
+
 import json
 import math
 import re
@@ -63,6 +65,7 @@ class ToolContext:
     session_id: str
     snapshot: RuntimeConfigSnapshot
     deadline: float
+    business_context: QueryBusinessContext | None = None
 
     def __post_init__(self) -> None:
         if not self.run_id or not self.session_id or not math.isfinite(self.deadline):

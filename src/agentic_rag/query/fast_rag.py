@@ -12,7 +12,8 @@ from pydantic import ValidationError
 from agentic_rag.models.schemas import EvidenceGrade, RouteDecision
 from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.query.evidence_builder import EvidenceBuilder, EvidenceCoverageTarget, PackedEvidence
-from agentic_rag.query.state import QueryState, question_from_state, scope_from_state, snapshot_from_state
+from agentic_rag.retrieval.query_context import business_kwargs
+from agentic_rag.query.state import business_from_state, QueryState, question_from_state, scope_from_state, snapshot_from_state
 from agentic_rag.retrieval.graph import RetrievalService, RetrievalUnavailable
 from agentic_rag.retrieval.models import RetrievalRequest
 from agentic_rag.models.schemas import RouteAssessment
@@ -68,7 +69,7 @@ async def run_fast_rag(
     await report_safely(report_phase, "retrieving")
     try:
         if dependencies.tool_runtime is None:
-            batch = await dependencies.retrieval.retrieve(request, scope, snapshot)
+            batch = await dependencies.retrieval.retrieve(request, scope, snapshot, **business_kwargs(business_from_state(state)))
         else:
             from agentic_rag.query.tool_loop import tool_context
             from agentic_rag.retrieval.models import EvidenceBatch

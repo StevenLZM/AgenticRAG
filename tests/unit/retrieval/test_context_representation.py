@@ -494,3 +494,21 @@ async def test_mixed_candidate_window_scores_are_aggregated_per_original_hit() -
         ]
     finally:
         service.close()
+
+
+async def test_explicit_scope_disables_windows_and_keeps_complete_pair():
+    hit = ChildHit(**hit_payload())
+    query = "星河公司普通员工abcdefghiz"
+    for extra, degraded in ((10, True), (len(query), False)):
+        capacity = len(hit.search_content) + extra + 3
+        model = LengthCheckingEncoder(capacity)
+        service = Reranker(model, model_version="offline", pair_tokenizer=reranker_module.TokenizerPairAdapter(CharacterTokenizer(), max_pair_tokens=capacity))
+        try:
+            result = await service.rerank(query, [hit], allow_query_windows=False)
+            assert result.degraded is degraded
+            if degraded:
+                assert result.degradation_reason == "rerank_input_too_long" and not model.calls
+            else:
+                assert model.calls == [[(query, hit.search_content)]]
+        finally:
+            service.close()

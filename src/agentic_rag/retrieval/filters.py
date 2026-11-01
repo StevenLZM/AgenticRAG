@@ -23,3 +23,11 @@ class FilterBuilder:
             content_types=request.content_types,
             date_range=request.date_range,
         )
+
+
+def intersect_documents(search_filter: SearchFilter, document_ids: tuple[str, ...] | None) -> SearchFilter:
+    """None is unrestricted; an empty trusted intersection is explicitly empty."""
+    if document_ids is None:
+        return search_filter
+    ids = tuple(d for d in document_ids if not search_filter.document_ids or d in search_filter.document_ids)
+    return search_filter.model_copy(update={"document_ids": ids, "match_none": search_filter.match_none or not ids})

@@ -11,6 +11,7 @@ import json
 from typing import Any, NotRequired, TypedDict, cast
 
 from agentic_rag.domain.models import UserScope
+from agentic_rag.retrieval.query_context import QueryBusinessContext
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 
@@ -20,6 +21,8 @@ JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "Jso
 class QueryState(TypedDict):
     """Checkpoint-safe state shared by the Phase 4 query runtime."""
 
+    business_context: NotRequired[dict[str, JsonValue]]
+    business_context_run_id: NotRequired[str]
     request: dict[str, JsonValue]
     run_id: str
     scope: dict[str, JsonValue]
@@ -119,3 +122,13 @@ def question_from_state(state: QueryState) -> str:
     if not isinstance(question, str) or not (normalized := question.strip()):
         raise InvalidQueryState("state does not include a valid question")
     return normalized
+
+
+def business_from_state(state: QueryState) -> QueryBusinessContext | None:
+    value = state.get("business_context")
+    if value is None:
+        return None
+    context = QueryBusinessContext.model_validate(value)
+    if context.owner_id != scope_from_state(state).user_id:
+        raise InvalidQueryState("business context owner mismatch")
+    return context

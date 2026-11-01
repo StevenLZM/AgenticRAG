@@ -1,0 +1,321 @@
+"""Compile trusted business meaning without granting document access."""
+
+import re
+
+from agentic_rag.domain.models import UserScope
+from agentic_rag.models.contextual import ContextArtifactRef
+from agentic_rag.persistence.artifacts import ArtifactRef, ArtifactStore
+from agentic_rag.retrieval.filters import FilterBuilder, intersect_documents
+from agentic_rag.retrieval.models import QueryPlan, RetrievalRequest
+from agentic_rag.retrieval.query_context import (
+    BusinessScopeCoverageProvider,
+    QueryBusinessContext,
+    ScopeResolution,
+    TrustedBusinessEntityDirectory,
+    TrustedBusinessProfileProvider,
+)
+from agentic_rag.runtime.models import RuntimeConfigSnapshot
+
+
+class BusinessScopeConflict(ValueError):
+    """Generated search changed the run's assigned business target."""
+
+
+def _literal_mentions(text: str) -> tuple[ScopeResolution, ...]:
+    # Deliberately finite grammar: exact suffixed company names, never alias guesses.
+    pattern = r"(?:(?<=^)|(?<=[，。；、\s与和]))(?:查询|比较|请问|关于)?(?P<company>[\u4e00-\u9fffA-Za-z0-9]{2,20}?公司)"
+    found = []
+    for match in re.finditer(pattern, text):
+        value = match.group("company")
+        if value in {"我们公司", "我的公司", "本公司", "其他公司", "哪个公司"}:
+            continue
+        found.append(
+            ScopeResolution(
+                field="company",
+                value=value,
+                source_kind="explicit_user",
+                source_ref="user-question",
+                source_span=match.span("company"),
+                resolution_status="unresolved"
+                if re.search(r"[两多各几]家公司$", value)
+                else "resolved",
+            )
+        )
+    for match in re.finditer(r"普通员工|管理人员|外包人员", text):
+        found.append(
+            ScopeResolution(
+                field="population",
+                value=match.group(),
+                source_kind="explicit_user",
+                source_ref="user-question",
+                source_span=match.span(),
+            )
+        )
+    return tuple(found)
+
+
+class QueryCompiler:
+    def __init__(
+        self,
+        *,
+        profiles: TrustedBusinessProfileProvider | None = None,
+        directory: TrustedBusinessEntityDirectory | None = None,
+        coverage: BusinessScopeCoverageProvider | None = None,
+        artifacts: ArtifactStore | None = None,
+        filter_builder: FilterBuilder | None = None,
+    ) -> None:
+        self.profiles, self.directory, self.coverage, self.artifacts = (
+            profiles,
+            directory,
+            coverage,
+            artifacts,
+        )
+        self.filter_builder = filter_builder or FilterBuilder()
+
+    async def mentions(self, text: str) -> tuple[ScopeResolution, ...]:
+        items = (
+            await self.directory.resolve_mentions(text)
+            if self.directory
+            else _literal_mentions(text)
+        )
+        for item in items:
+            if item.source_span is None or text[slice(*item.source_span)] != item.value:
+                raise ValueError(
+                    "entity resolution must retain exact input source span"
+                )
+        return items
+
+    async def freeze(
+        self, question: str, scope: UserScope, *, task_intent_ref: str = "user-question"
+    ) -> QueryBusinessContext:
+        profile = await self.profiles.get_profile(scope) if self.profiles else None
+        if profile is not None and profile.owner_id != scope.user_id:
+            raise ValueError("profile owner mismatch")
+        return QueryBusinessContext(
+            owner_id=scope.user_id,
+            source_question=question,
+            task_intent_ref=task_intent_ref,
+            trusted_profile=profile,
+            source_scope=await self.mentions(question),
+        )
+
+    @staticmethod
+    def _meaning(
+        business: QueryBusinessContext,
+    ) -> tuple[tuple[ScopeResolution, ...], str]:
+        resolved = business.source_scope or business.confirmed_reference
+        if business.task_targets:
+            if any(
+                t.value
+                not in {r.value for r in business.source_scope if r.field == t.field}
+                for t in business.task_targets
+                if any(r.field == t.field for r in business.source_scope)
+            ):
+                raise BusinessScopeConflict(
+                    "task target conflicts with explicit user target"
+                )
+            fields = {t.field for t in business.task_targets}
+            resolved = (
+                tuple(r for r in resolved if r.field not in fields)
+                + business.task_targets
+            )
+        status = "resolved"
+        self_directed = bool(
+            re.search(
+                r"我们公司|我的公司|我(?:去|要|出差)|本公司", business.source_question
+            )
+        )
+        if not any(r.field == "company" for r in resolved) and self_directed:
+            profile = business.trusted_profile
+            if profile is None or not profile.companies:
+                status = "unresolved"
+            elif len(profile.companies) != 1:
+                status = "ambiguous"
+            else:
+                existing = {r.field for r in resolved}
+                resolved += tuple(
+                    ScopeResolution(
+                        field=field,
+                        value=value,
+                        source_kind="trusted_profile",
+                        source_ref=profile.revision,
+                        resolution_status="defaulted",
+                        is_default=True,
+                    )
+                    for field, value in (
+                        ("company", profile.companies[0]),
+                        ("population", profile.population),
+                    )
+                    if value and field not in existing
+                )
+                status = "defaulted"
+        return resolved, status
+
+    @classmethod
+    def for_task(
+        cls,
+        business: QueryBusinessContext,
+        target: str,
+        *,
+        task_ref: str,
+        document_ids: tuple[str, ...] = (),
+    ) -> QueryBusinessContext:
+        """Project only already assigned literal targets; task prose grants no authority."""
+        meaning, _ = cls._meaning(business)
+        targets = tuple(
+            r.model_copy(
+                update={
+                    "source_kind": "task_target",
+                    "source_ref": task_ref,
+                    "source_span": None,
+                }
+            )
+            for r in meaning
+            if r.value in target
+        )
+        permitted = business.permitted_document_ids
+        if document_ids:
+            permitted = tuple(
+                d for d in document_ids if permitted is None or d in permitted
+            )
+        return business.model_copy(
+            update={
+                "task_targets": targets or business.task_targets,
+                "task_intent_ref": task_ref,
+                "permitted_document_ids": permitted,
+            }
+        )
+
+    async def compile(
+        self,
+        request: RetrievalRequest,
+        scope: UserScope,
+        snapshot: RuntimeConfigSnapshot,
+        business: QueryBusinessContext | None,
+    ) -> QueryPlan:
+        business = (
+            business
+            if business is not None
+            else await self.freeze(request.query, scope)
+        )
+        if business.owner_id != scope.user_id or (
+            business.trusted_profile
+            and business.trusted_profile.owner_id != scope.user_id
+        ):
+            raise ValueError("business context owner mismatch")
+        explicit = (
+            business.source_scope
+            if request.query == business.source_question
+            else await self.mentions(request.query)
+        )
+        resolved, status = self._meaning(business)
+        # A generated search may narrow an assigned comparison, never invent a target.
+        if request.query != business.source_question:
+            for item in explicit:
+                allowed = {r.value for r in resolved if r.field == item.field}
+                if item.value not in allowed or item.resolution_status not in {
+                    "resolved",
+                    "defaulted",
+                }:
+                    raise BusinessScopeConflict(
+                        "query target requires coordinator reassignment"
+                    )
+            fields = {r.field for r in explicit}
+            selected = {(r.field, r.value) for r in explicit}
+            resolved = tuple(
+                r
+                for r in resolved
+                if r.field not in fields or (r.field, r.value) in selected
+            )
+        if any(r.resolution_status in {"ambiguous", "unresolved"} for r in resolved):
+            status = (
+                "ambiguous"
+                if any(r.resolution_status == "ambiguous" for r in resolved)
+                else "unresolved"
+            )
+        usable = tuple(
+            r for r in resolved if r.resolution_status in {"resolved", "defaulted"}
+        )
+        added = tuple(
+            dict.fromkeys(r.value for r in usable if r.value not in request.query)
+        )
+        prefix = "；".join(added)
+        semantic = prefix + "\n\n" + request.query if prefix else request.query
+        authorization = self.filter_builder.build(request, scope, snapshot)
+        effective = intersect_documents(authorization, request.document_ids or None)
+        effective = intersect_documents(effective, business.permitted_document_ids)
+        business_filter = None
+        binding = None
+        companies = {r.value for r in usable if r.field == "company"}
+        if self.coverage and companies and status not in {"ambiguous", "unresolved"}:
+            cert = await self.coverage.coverage(scope, snapshot)
+            current = await self.coverage.current_binding(scope, snapshot)
+            if (
+                cert
+                and cert.complete
+                and not cert.unresolved_document_ids
+                and not cert.ambiguous_document_ids
+                and cert.binding == current
+                and cert.owner_id == scope.user_id
+                and cert.index_generation == snapshot.index_generation
+            ):
+                binding = current
+                business_filter = tuple(
+                    sorted(
+                        {
+                            doc
+                            for doc, company in cert.document_companies
+                            if company in companies
+                        }
+                    )
+                )
+                effective = intersect_documents(effective, business_filter)
+        return QueryPlan(
+            original_query=request.query,
+            task_intent_ref=business.task_intent_ref,
+            profile_revision=business.trusted_profile.revision
+            if business.trusted_profile
+            else None,
+            effective_business_scope=resolved,
+            dense_query=semantic,
+            lexical_core_query=request.query,
+            lexical_scope_terms=added,
+            rerank_query=semantic,
+            protected_query_context=prefix,
+            allow_query_windows=not any(r.value in request.query for r in usable),
+            authorization_filter=authorization,
+            business_filter=business_filter,
+            effective_filter=effective,
+            coverage_binding=binding,
+            snapshot_id=snapshot.snapshot_id,
+            resolution_status=status,
+        )
+
+    def persist(self, plan: QueryPlan) -> ContextArtifactRef | None:
+        if self.artifacts is None:
+            return None
+        ref = self.artifacts.put_json(
+            f"query-plans/{plan.plan_hash}.json", plan.model_dump(mode="json")
+        )
+        return ContextArtifactRef(
+            uri=ref.uri, sha256=ref.sha256, size_bytes=ref.size_bytes
+        )
+
+    def load(
+        self,
+        ref: ContextArtifactRef,
+        *,
+        scope: UserScope,
+        snapshot: RuntimeConfigSnapshot,
+    ) -> QueryPlan:
+        if self.artifacts is None:
+            raise ValueError("query plan artifact store missing")
+        plan = QueryPlan.model_validate(
+            self.artifacts.read_json(ArtifactRef(**ref.model_dump()))
+        )
+        if (
+            plan.effective_filter.user_id != scope.user_id
+            or plan.snapshot_id != snapshot.snapshot_id
+        ):
+            raise ValueError("query plan owner or snapshot mismatch")
+        return plan

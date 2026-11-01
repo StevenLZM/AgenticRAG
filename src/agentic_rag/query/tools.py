@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from agentic_rag.domain.models import UserScope
+from agentic_rag.retrieval.query_context import QueryBusinessContext, business_kwargs
 from agentic_rag.query.calculator import SafeCalculator, UnsafeExpression
 from agentic_rag.query.evidence_builder import EvidenceBuilder, EvidenceCoverageTarget, PackedEvidence
 from agentic_rag.retrieval.models import EvidenceBatch, RetrievalRequest
@@ -20,6 +21,7 @@ class RetrievalPort(Protocol):
         request: RetrievalRequest,
         scope: UserScope,
         snapshot: RuntimeConfigSnapshot,
+        *, business_context: QueryBusinessContext | None = None,
     ) -> EvidenceBatch: ...
 
 
@@ -31,6 +33,7 @@ class ResearchContext:
     snapshot: RuntimeConfigSnapshot
     tool_context: ToolContext | None = None
     call_prefix: str = "research"
+    business_context: QueryBusinessContext | None = None
 
 
 class ResearchToolset:
@@ -47,7 +50,7 @@ class ResearchToolset:
     ) -> tuple[EvidenceBatch, PackedEvidence]:
         request = RetrievalRequest(query=query)
         if self._runtime is None:
-            batch = await self._retrieval.retrieve(request, ctx.scope, ctx.snapshot)
+            batch = await self._retrieval.retrieve(request, ctx.scope, ctx.snapshot, **business_kwargs(ctx.business_context))
         else:
             if ctx.tool_context is None:
                 raise ToolError("tool_context_missing")

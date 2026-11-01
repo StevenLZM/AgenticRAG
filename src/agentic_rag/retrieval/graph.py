@@ -16,6 +16,8 @@ from agentic_rag.domain.models import UserScope
 from agentic_rag.models.embeddings import EmbeddingPort
 from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.retrieval.filters import FilterBuilder
+from agentic_rag.retrieval.query_compiler import QueryCompiler
+from agentic_rag.retrieval.query_context import QueryBusinessContext
 from agentic_rag.retrieval.fusion import rrf_fuse
 from agentic_rag.retrieval.models import (
     ChildHit,
@@ -37,7 +39,8 @@ class RerankerPort(Protocol):
     """Minimal reranking boundary required by the retrieval graph."""
 
     async def rerank(
-        self, query: str, candidates: Sequence[ChildHit], *, limit: int
+        self, query: str, candidates: Sequence[ChildHit], *, limit: int,
+        protected_query_context: str = "", allow_query_windows: bool = True,
     ) -> RerankResult: ...
 
 
@@ -74,6 +77,7 @@ class RetrievalDependencies:
     parent_fetcher: ParentHydrator
     filter_builder: FilterBuilder = field(default_factory=FilterBuilder)
     lane_timeout_seconds: float = 10.0
+    query_compiler: QueryCompiler | None = None
 
     def __post_init__(self) -> None:
         if self.lane_timeout_seconds <= 0:
@@ -89,16 +93,18 @@ class RetrievalService:
 
     async def retrieve_candidates(
         self, request: RetrievalRequest, scope: UserScope, snapshot: RuntimeConfigSnapshot,
+        *, business_context: QueryBusinessContext | None = None,
     ) -> RankedCandidates:
         """Stop at rerank; the external evidence stage owns parent hydration."""
         try:
             state = await self._candidate_graph.ainvoke(
-                {"request": request, "scope": scope, "snapshot": snapshot}
+                {"request": request, "scope": scope, "snapshot": snapshot, "business_context": business_context}
             )
         except NodeCancelledError as error:
             raise asyncio.CancelledError() from error
         return RankedCandidates(
             query=request.query, hits=tuple(state["reranked_hits"]),
+            **_plan_output(state),
             user_id=scope.user_id, snapshot_id=snapshot.snapshot_id,
             index_generation=snapshot.index_generation, document_ids=request.document_ids,
             degraded_components=state["degraded_components"],
@@ -117,11 +123,12 @@ class RetrievalService:
         request: RetrievalRequest,
         scope: UserScope,
         snapshot: RuntimeConfigSnapshot,
+        *, business_context: QueryBusinessContext | None = None,
     ) -> EvidenceBatch:
         """Run the immutable retrieval path and return safely scoped evidence."""
         try:
             result = await self._graph.ainvoke(
-                {"request": request, "scope": scope, "snapshot": snapshot}
+                {"request": request, "scope": scope, "snapshot": snapshot, "business_context": business_context}
             )
         except NodeCancelledError as error:
             # LangGraph turns a node's deliberate CancelledError into its own
@@ -148,7 +155,17 @@ def build_retrieval_graph(
         search_filter = dependencies.filter_builder.build(
             state["request"], state["scope"], state["snapshot"]
         )
+        compiled = {}
+        if dependencies.query_compiler is not None:
+            plan = await dependencies.query_compiler.compile(state["request"], state["scope"], state["snapshot"], state.get("business_context"))
+            if plan.authorization_filter != search_filter:
+                raise ValueError("compiler authorization differs from retrieval authorization policy")
+            search_filter = plan.effective_filter
+            compiled = {"query_plan": plan, "query_plan_ref": dependencies.query_compiler.persist(plan), "query_plan_hash": plan.plan_hash}
+        elif state.get("business_context") is not None:
+            raise ValueError("business context requires an enabled QueryCompiler")
         return {
+            **compiled,
             "search_filter": search_filter,
             "degraded_components": (),
             "lane_failures": {},
@@ -165,13 +182,20 @@ def build_retrieval_graph(
         dense_limit = budget.dense_k if fixed else request.top_k_override or budget.dense_k
         bm25_limit = budget.bm25_k if fixed else request.top_k_override or budget.bm25_k
 
+        plan = state.get("query_plan")
+
         async def dense() -> list[ChildHit]:
-            vector = await dependencies.embedding.embed_query(request.query)
+            if search_filter.match_none:
+                return []
+            vector = await dependencies.embedding.embed_query(plan.dense_query if plan else request.query)
             return await dependencies.vector.search(vector, search_filter, dense_limit)
 
         async def bm25() -> list[ChildHit]:
+            if search_filter.match_none:
+                return []
             return await dependencies.lexical.search(
-                request.query, search_filter, bm25_limit
+                plan.lexical_core_query if plan else request.query, search_filter, bm25_limit,
+                **({"scope_terms": plan.lexical_scope_terms} if plan and plan.lexical_scope_terms else {})
             )
 
         dense_result, bm25_result = await asyncio.gather(
@@ -240,8 +264,15 @@ def build_retrieval_graph(
 
     async def cross_encoder(state: RetrievalState) -> dict[str, object]:
         started = perf_counter()
+        plan = state.get("query_plan")
+        options = {}
+        if plan and plan.protected_query_context:
+            options["protected_query_context"] = plan.protected_query_context
+        if plan and not plan.allow_query_windows:
+            options["allow_query_windows"] = False
         result = await dependencies.reranker.rerank(
-            state["request"].query, state["fused_hits"], limit=_budget(state).rerank_k
+            plan.rerank_query if plan else state["request"].query, state["fused_hits"], limit=_budget(state).rerank_k,
+            **options,
         )
         degraded = state["degraded_components"]
         if result.degraded:
@@ -302,6 +333,7 @@ def build_retrieval_graph(
         }
         batch = EvidenceBatch(
             query=state["request"].query,
+            **_plan_output(state),
             parents=tuple(state["hydrated_parents"]),
             degraded_components=state["degraded_components"],
             document_ids=state["request"].document_ids,
@@ -421,3 +453,7 @@ def _stage_update(
     update["timings_ms"] = timings
     update["candidate_counts"] = counts
     return update
+
+
+def _plan_output(state: Mapping[str, object]) -> dict[str, object]:
+    return {key: state[key] for key in ("query_plan", "query_plan_ref", "query_plan_hash") if key in state}

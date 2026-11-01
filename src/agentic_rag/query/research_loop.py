@@ -19,6 +19,7 @@ from agentic_rag.query.evidence_builder import (
     PackedEvidence,
 )
 from agentic_rag.query.state import (
+    business_from_state,
     QueryState,
     question_from_state,
     scope_from_state,
@@ -142,7 +143,7 @@ class ResearchAgentLoop:
         if self._tool_runtime is not None and (has_external_requirement(state) or (state.get("tool_state") or {}).get("active")):
             return await run_tool_step(state, self._gateway, self._tool_runtime, strategy="research")
         snapshot = snapshot_from_state(state)
-        context = ResearchContext(scope=scope_from_state(state), snapshot=snapshot,
+        context = ResearchContext(scope=scope_from_state(state), snapshot=snapshot, business_context=business_from_state(state),
                                   tool_context=tool_context(state) if self._tool_runtime is not None else None,
                                   call_prefix=f"research:{state['run_id']}:{state.get('research_attempt_count', 0)}")
         research = _research_state(state)

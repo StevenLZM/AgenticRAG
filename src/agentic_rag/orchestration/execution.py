@@ -12,6 +12,7 @@ from agentic_rag.orchestration.evidence import EvidencePreparer
 from agentic_rag.orchestration.store import CoordinationStore, WorkClaim
 from agentic_rag.orchestration.supervisor import Supervisor
 from agentic_rag.retrieval.models import RetrievalRequest
+from agentic_rag.retrieval.query_context import QueryBusinessContext, business_kwargs
 from agentic_rag.runtime.model_gateway import ModelCall, ModelGateway
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
@@ -21,6 +22,8 @@ class ModelExecution:
         self.store, self.claim, self.gateway = store, claim, gateway
         self.scope = UserScope(user_id=claim.user_id)
         self.question = claim.state["question"]
+        raw_business = claim.state.get("business_context")
+        self.business_context = QueryBusinessContext.model_validate(raw_business) if raw_business is not None else None
         self.snapshot = RuntimeConfigSnapshot.model_validate(claim.state["snapshot"])
 
     async def debit(self, kind: str, amount: int = 1) -> None:
@@ -66,7 +69,7 @@ class StageExecutor:
             return {"input_hash": payload["input_hash"], "decision": (await self.supervisor.decide(claim.state, claim.state.get("feedback", []), execution)).model_dump(mode="json")}
         if stage == "fast_retrieval":
             await execution.debit("queries")
-            candidate = await self.retrieval.retrieve_candidates(RetrievalRequest(query=claim.state["question"]), execution.scope, execution.snapshot)
+            candidate = await self.retrieval.retrieve_candidates(RetrievalRequest(query=claim.state["question"]), execution.scope, execution.snapshot, **business_kwargs(execution.business_context))
             return CandidateResult(origin_key="fast", origin="fast_pipeline", criterion_ids=("answer",), candidates=(candidate,)).model_dump(mode="json")
         if stage == "prepare":
             frozen = await self.store.read_snapshot(payload["snapshot_id"])

@@ -16,6 +16,8 @@ from agentic_rag.orchestration.contracts import (
 )
 from agentic_rag.query.calculator import SafeCalculator
 from agentic_rag.retrieval.models import RankedCandidates, RetrievalRequest
+from agentic_rag.retrieval.query_context import QueryBusinessContext, business_kwargs
+from agentic_rag.retrieval.query_compiler import QueryCompiler
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
 T = TypeVar("T", bound=Contract)
@@ -25,13 +27,14 @@ class Execution(Protocol):
     scope: UserScope
     snapshot: RuntimeConfigSnapshot
     question: str
+    business_context: QueryBusinessContext | None
 
     async def structured(self, role: str, payload: dict[str, Any], schema: type[T], *, light: bool = False) -> T: ...
     async def debit(self, kind: str, amount: int = 1) -> None: ...
 
 
 class Retriever(Protocol):
-    async def retrieve_candidates(self, request: RetrievalRequest, scope: UserScope, snapshot: RuntimeConfigSnapshot) -> RankedCandidates: ...
+    async def retrieve_candidates(self, request: RetrievalRequest, scope: UserScope, snapshot: RuntimeConfigSnapshot, *, business_context: QueryBusinessContext | None = None) -> RankedCandidates: ...
 
 
 class QueryPlan(Contract):
@@ -92,12 +95,16 @@ class RetrievalAgent:
         if len(prior) + len(plan.queries) > task.budget.max_queries:
             raise ValueError("query plan exceeds remaining task budget")
         batches = []
+        business = getattr(execution, "business_context", None)
+        if business is not None:
+            business = QueryCompiler.for_task(business, task.objective, task_ref=f"task:{task.key}:{task_revision}", document_ids=task.sources.document_ids)
         for query in plan.queries:
             await execution.debit("queries")
             # Selectors come from the validated task. There is no model argument
             # that can broaden this hard scope or supply a different tenant.
             batch = await self.retrieval.retrieve_candidates(
                 RetrievalRequest(query=query, document_ids=task.sources.document_ids), execution.scope, execution.snapshot,
+                **business_kwargs(business),
             )
             if any(hit.user_id != execution.scope.user_id or (
                 task.sources.document_ids and hit.document_id not in task.sources.document_ids

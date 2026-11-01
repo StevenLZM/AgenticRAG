@@ -62,6 +62,8 @@ class EvidencePreparer:
         batches = [
             EvidenceBatch(
                 query=batch.query,
+                query_plan=batch.query_plan, query_plan_ref=batch.query_plan_ref,
+                query_plan_hash=batch.query_plan_hash,
                 parents=tuple(by_key[(p.parent_id, p.document_version_id)] for p in selected),
                 document_ids=batch.document_ids, target_ids=(coverage_aliases or {}).get(result.origin_key, result.criterion_ids),
                 degraded_components=batch.degraded_components,

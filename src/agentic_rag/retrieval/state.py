@@ -7,7 +7,10 @@ from typing import TypedDict
 from pydantic import BaseModel, ConfigDict
 
 from agentic_rag.domain.models import UserScope
+from agentic_rag.models.contextual import ContextArtifactRef
+from agentic_rag.retrieval.query_context import QueryBusinessContext
 from agentic_rag.retrieval.models import (
+    QueryPlan,
     ChildHit,
     EvidenceBatch,
     ParentEvidence,
@@ -35,6 +38,10 @@ class RetrievalState(TypedDict, total=False):
     indexes, tenant filters, or model clients into the pipeline.
     """
 
+    business_context: QueryBusinessContext | None
+    query_plan: QueryPlan
+    query_plan_ref: ContextArtifactRef | None
+    query_plan_hash: str
     request: RetrievalRequest
     scope: UserScope
     snapshot: RuntimeConfigSnapshot

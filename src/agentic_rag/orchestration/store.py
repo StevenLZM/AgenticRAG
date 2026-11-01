@@ -16,6 +16,8 @@ from agentic_rag.orchestration.contracts import CandidateResult, DispatchPlan, c
 from agentic_rag.orchestration.store_sql import (
     RESULT_STREAM, WAKE_STREAM, enqueue, lock_run, notify, now, save_run, utc,
 )
+from agentic_rag.domain.models import UserScope
+from agentic_rag.retrieval.query_compiler import QueryCompiler
 from agentic_rag.runtime.ids import new_id
 from agentic_rag.runtime.models import RuntimeConfigSnapshot
 
@@ -42,8 +44,9 @@ class WorkClaim:
 
 
 class CoordinationStore:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, capacity_limits: dict[str, int] | None = None, enforce_source_access: bool = True, max_active_runs: int | None = None) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, capacity_limits: dict[str, int] | None = None, enforce_source_access: bool = True, max_active_runs: int | None = None, query_compiler: QueryCompiler | None = None) -> None:
         self.session_factory = session_factory
+        self.query_compiler = query_compiler
         self.capacity_limits = capacity_limits or {}
         self.enforce_source_access = enforce_source_access
         if max_active_runs is not None and max_active_runs < 1:
@@ -89,6 +92,9 @@ class CoordinationStore:
                     )},
                     "answer": None,
                 }
+                if self.query_compiler is not None:
+                    business = await self.query_compiler.freeze(question, UserScope(user_id=user_id), task_intent_ref=run_id)
+                    data["business_context"] = business.model_dump(mode="json")
                 if expired:
                     data["termination_reason"] = "deadline"
                 await db.execute(insert(schema.runs).values(

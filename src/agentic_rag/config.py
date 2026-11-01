@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     deepseek_protocol: Literal["auto", "chat", "responses"] = "auto"
     qwen_embedding_base_url: str
     qwen_api_key: SecretStr | None = None
+    query_context_enabled: bool = False
     context_pipeline_enabled: bool = False
     context_build: ContextBuildConfig = Field(default_factory=ContextBuildConfig)
     mem0_enabled: bool = True
