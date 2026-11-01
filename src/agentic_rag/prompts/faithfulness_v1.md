@@ -18,3 +18,12 @@ claims that lack semantic support; `reasons` gives bounded factual-support issue
 
 # FAIL-CLOSED RULES
 Do not validate citation syntax or coverage, generate replacements, retrieve new evidence, or infer support absent from the Manifest.
+
+Original business-scope evidence is required for company, population, period, unit,
+currency and exclusions. `resolved` requirements certify source availability only;
+`semantic_status=pending` requires your own applicability assessment. A company
+mention or customer example is not evidence that a policy applies to that company.
+Check the original supporting passages and their relation to the cited body, including
+accepted claims omitted from the search prefix. Missing/conflicting dependencies
+cannot support a scoped fact. Query/profile/task text is not documentary evidence.
+Any additional qualifier in an answer or finding also needs original source support.

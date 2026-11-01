@@ -257,7 +257,19 @@ class EvidenceReducer:
         for result in sorted(results, key=lambda value: value.todo_id):
             for item in sorted(result.evidence.items, key=lambda value: value.evidence_id):
                 manifest = result.evidence.manifest.get(item.evidence_id)
-                if item.evidence_id in selected or not _matches_manifest(item, manifest):
+                if item.evidence_id in selected:
+                    prior_item, prior_manifest = selected[item.evidence_id]
+                    if prior_item.schema_version == 2 or item.schema_version == 2:
+                        from agentic_rag.query.evidence_builder import merge_evidence_items, evidence_projection
+                        if not _matches_manifest(item, manifest):
+                            raise EvidenceConsistencyError("invalid evidence source identity")
+                        try:
+                            merged = merge_evidence_items(prior_item, item)
+                        except ValueError as error:
+                            raise EvidenceConsistencyError(str(error)) from error
+                        selected[item.evidence_id] = (merged, EvidenceManifestEntry(**evidence_projection(merged)))
+                    continue
+                if not _matches_manifest(item, manifest):
                     continue
                 assert manifest is not None
                 selected[item.evidence_id] = (item, manifest)
@@ -272,12 +284,31 @@ class EvidenceReducer:
             ).render()
             for item in ordered
         )
+        from agentic_rag.models.contextual import SupportingContext
+        requirements, sources = {}, {}
+        for result in results:
+            for requirement in result.evidence.evidence_requirements:
+                if requirement.id in requirements and requirements[requirement.id] != requirement:
+                    raise EvidenceConsistencyError("conflicting scope requirement")
+                requirements[requirement.id] = requirement
+            for source in result.evidence.supporting_context.sources:
+                prior = sources.get(source.evidence_id)
+                if prior is not None:
+                    relations = {"context_refs", "supports_claim_ids", "source_child_ids"}
+                    if prior.model_dump(exclude=relations) != source.model_dump(exclude=relations):
+                        raise EvidenceConsistencyError("conflicting context source")
+                    source = source.model_copy(update={name: tuple(dict.fromkeys((*getattr(prior, name), *getattr(source, name)))) for name in relations})
+                sources[source.evidence_id] = source
+        supporting = SupportingContext(sources=tuple(sources.values()), requirements=tuple(requirements.values()),
+            verified_child_ids=tuple(dict.fromkeys(cid for r in results for cid in r.evidence.supporting_context.verified_child_ids)))
         return PackedEvidence(
             items=ordered,
             manifest=merged_manifest,
             rendered_context=rendered,
             token_count=len(rendered),
             index_generation=index_generation,
+            supporting_context=supporting, evidence_requirements=tuple(requirements.values()),
+            scope_evidence_missing=tuple(dict.fromkeys(g for r in results for g in r.evidence.scope_evidence_missing)),
         )
 
 
@@ -293,21 +324,9 @@ def _validate_independent(items: Sequence[TodoItem], *, resolved_todo_ids: froze
 
 
 def _matches_manifest(item: EvidenceItem, manifest: EvidenceManifestEntry | None) -> bool:
-    return manifest is not None and (
-        manifest.evidence_id,
-        manifest.parent_id,
-        manifest.document_id,
-        manifest.document_version_id,
-        manifest.ast_locator,
-        manifest.heading_path,
-    ) == (
-        item.evidence_id,
-        item.parent_id,
-        item.document_id,
-        item.document_version_id,
-        item.ast_locator,
-        item.heading_path,
-    )
+    from agentic_rag.query.evidence_builder import matches_manifest
+    return matches_manifest(item, manifest)
+
 
 
 def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, object]:

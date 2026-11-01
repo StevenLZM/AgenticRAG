@@ -116,6 +116,7 @@ class ParentFetcher:
                     document_id=evidence.document_id,
                     document_version_id=evidence.document_version_id,
                     content=parent.content,
+                    ast_locator=parent.ast_locator,
                     child_hits=evidence.child_hits,
                     retrieval_score=evidence.retrieval_score,
                     rrf_score=evidence.rrf_score,

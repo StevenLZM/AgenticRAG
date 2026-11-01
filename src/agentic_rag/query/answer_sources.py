@@ -15,7 +15,7 @@ from pydantic import (
 )
 
 from agentic_rag.ingestion.chunker import AstLocator
-from agentic_rag.query.evidence_builder import PackedEvidence
+from agentic_rag.query.evidence_builder import PackedEvidence, EvidenceManifestEntry, matches_manifest
 from agentic_rag.query.public_answer import PublicAnswer
 
 if TYPE_CHECKING:
@@ -36,7 +36,9 @@ class AnswerSource(BaseModel):
     evidence_id: SourceId
     document_id: SourceId
     document_version_id: SourceId
-    parent_id: SourceId
+    source_kind: Literal["parent_chunk", "canonical_excerpt"] = "parent_chunk"
+    parent_id: SourceId | None
+    source_provenance: EvidenceManifestEntry | None = None
     heading_path: tuple[str, ...] = Field(default=(), max_length=16)
     heading_truncated: bool = False
     page_from: int | None = Field(default=None, ge=1, le=2147483647)
@@ -47,6 +49,16 @@ class AnswerSource(BaseModel):
 
     @model_validator(mode="after")
     def bounded_heading(self):
+        if (self.source_kind == "parent_chunk" and self.parent_id is None) or (self.source_kind == "canonical_excerpt" and (self.parent_id is not None or self.page_from is None)):
+            raise ValueError("invalid source kind identity")
+        if self.source_provenance is not None:
+            entry = self.source_provenance
+            if (entry.evidence_id, entry.document_id, entry.document_version_id, entry.parent_id, entry.source_kind) != (self.evidence_id, self.document_id, self.document_version_id, self.parent_id, self.source_kind):
+                raise ValueError("source snapshot provenance differs")
+            if entry.source_ref is not None and (self.page_from, self.page_to) != (entry.source_ref.page_from, entry.source_ref.page_to):
+                raise ValueError("source snapshot page provenance differs")
+        if self.source_kind == "canonical_excerpt" and self.source_provenance is None:
+            raise ValueError("canonical source snapshot requires private provenance")
         if sum(map(len, self.heading_path)) > 128:
             raise ValueError("heading too long")
         if (self.page_from is None) != (self.page_to is None) or (
@@ -58,7 +70,7 @@ class AnswerSource(BaseModel):
 
 class AnswerSources(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     run_id: SourceId
     runtime_config_snapshot_id: SourceId
     items: tuple[AnswerSource, ...] = Field(max_length=64)
@@ -66,6 +78,8 @@ class AnswerSources(BaseModel):
 
     @model_validator(mode="after")
     def bounded_storage(self):
+        if self.schema_version == 1 and any(i.source_kind != "parent_chunk" for i in self.items):
+            raise ValueError("canonical sources require schema v2")
         if not within_budget(self.model_dump(mode="json")):
             raise ValueError("source snapshot exceeds byte budget")
         if len({item.evidence_id for item in self.items}) != len(self.items):
@@ -113,8 +127,7 @@ def build_answer_sources(
             if (
                 item is None
                 or manifest is None
-                or item.model_dump(exclude={"content", "covered_target_ids"})
-                != manifest.model_dump()
+                or not matches_manifest(item, manifest)
             ):
                 raise InvalidAnswerSources("packed evidence and manifest disagree")
             headings, remaining = [], 128
@@ -134,11 +147,15 @@ def build_answer_sources(
                     pages = (low, high)
             except (ValidationError, ValueError, TypeError):
                 pass
+            if item.source_kind == "canonical_excerpt":
+                pages = (item.source_ref.page_from, item.source_ref.page_to)
             source = AnswerSource(
                 evidence_id=eid,
                 document_id=item.document_id,
                 document_version_id=item.document_version_id,
                 parent_id=item.parent_id,
+                source_kind=item.source_kind,
+                source_provenance=manifest if item.schema_version == 2 else None,
                 heading_path=tuple(headings),
                 heading_truncated=tuple(headings) != item.heading_path,
                 page_from=pages[0],
@@ -151,7 +168,7 @@ def build_answer_sources(
                 contents.append(item.content)
         # Reserve all bounded metadata before allocating text in citation order.
         candidate = dict(
-            schema_version=1,
+            schema_version=2 if any(s["source_kind"] == "canonical_excerpt" for s in sources) else 1,
             run_id=run_id,
             runtime_config_snapshot_id=snapshot_id,
             items=sources,

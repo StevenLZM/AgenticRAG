@@ -78,7 +78,7 @@ async def append_delta(store: CoordinationStore, claim: WorkClaim, text: str) ->
         run, _ = await store._verified(db, claim)
         answer = verify_epoch(run, claim)
         from agentic_rag.orchestration.authorization import authorize_sources
-        await authorize_sources(db, run, answer["input"]["evidence"])
+        await authorize_sources(db, run, answer["input"]["evidence"], context_sources=store.context_sources)
         if claim.stage != "answer" or answer["status"] not in ("frozen", "streaming"):
             raise StaleClaim("answer stream is closed")
         if len(answer["text"]) + len(text) > 1_000_000:
@@ -133,7 +133,11 @@ async def complete_quality(store: CoordinationStore, claim: WorkClaim, result: Q
             raise StaleClaim("quality assessment does not bind the frozen text")
         allowed = {e["evidence_id"] for e in answer["input"]["evidence"]}
         citations = set(citation_ids(answer["text"]))
+        from agentic_rag.query.evidence_builder import expand_support_ids
+        from agentic_rag.orchestration.authorization import authorize_sources
+        await authorize_sources(db, run, answer["input"]["evidence"], context_sources=store.context_sources)
         valid = citations <= allowed and (bool(citations) or not allowed)
+        valid = valid and expand_support_ids(citations, answer["input"].get("support_links", {})) <= citations
         answer["faithfulness"] = result.faithfulness if valid else "failed"
         answer["quality_issues"] = [*result.issues, *([] if valid else ["Answer contains invalid or missing evidence citations"])]
         # A model judge cannot replace an unavailable required analysis. This
@@ -186,7 +190,7 @@ async def read_chunks(store: CoordinationStore, run_id: str, user_id: str, epoch
             raise KeyError(run_id)
         from agentic_rag.orchestration.authorization import authorize_sources
         if run["data"].get("answer"):
-            await authorize_sources(db, dict(run), run["data"]["answer"]["input"]["evidence"])
+            await authorize_sources(db, dict(run), run["data"]["answer"]["input"]["evidence"], context_sources=store.context_sources)
         rows = (await db.execute(select(schema.chunks).where(schema.chunks.c.run_id == run_id,
             (schema.chunks.c.epoch > epoch) | ((schema.chunks.c.epoch == epoch) & (schema.chunks.c.seq > seq)),
         ).order_by(schema.chunks.c.epoch, schema.chunks.c.seq).limit(100))).mappings()
@@ -227,18 +231,15 @@ async def execute_output(store: CoordinationStore, claim: WorkClaim, execution: 
 
 
 def source_snapshot(run: dict[str, Any]) -> dict[str, Any] | None:
-    from agentic_rag.query.answer_sources import AnswerSource, AnswerSources
+    from agentic_rag.query.answer_sources import build_answer_sources
+    from agentic_rag.query.evidence_builder import EvidenceItem, EvidenceManifestEntry, PackedEvidence, evidence_projection
     from agentic_rag.runtime.models import RuntimeConfigSnapshot
     answer = public_answer(run)
     if not answer.evidence_ids:
         return None
-    lookup = {e["evidence_id"]: e for e in run["data"]["answer"]["input"]["evidence"]}
-    items = []
-    for key in answer.evidence_ids[:64]:
-        item = lookup[key]
-        heading = " / ".join(item["heading_path"])
-        items.append(AnswerSource(evidence_id=key, document_id=item["document_id"], document_version_id=item["document_version_id"], parent_id=item["parent_id"],
-            heading_path=(heading[:128],) if heading else (), heading_truncated=len(heading) > 128,
-            excerpt=item["content"][:2000], truncated=len(item["content"]) > 2000))
-    return AnswerSources(run_id=run["id"], runtime_config_snapshot_id=RuntimeConfigSnapshot.model_validate(run["data"]["snapshot"]).snapshot_id,
-                         items=tuple(items), omitted_source_count=max(0, len(answer.evidence_ids) - 64)).model_dump(mode="json")
+    snapshot = RuntimeConfigSnapshot.model_validate(run["data"]["snapshot"])
+    items = tuple(EvidenceItem.model_validate(e) for e in run["data"]["answer"]["input"]["evidence"])
+    packed = PackedEvidence(items=items, manifest={i.evidence_id: EvidenceManifestEntry(**evidence_projection(i)) for i in items},
+        rendered_context="", token_count=0, index_generation=snapshot.index_generation)
+    sources = build_answer_sources(answer, packed, run_id=run["id"], snapshot_id=snapshot.snapshot_id)
+    return sources.model_dump(mode="json") if sources else None

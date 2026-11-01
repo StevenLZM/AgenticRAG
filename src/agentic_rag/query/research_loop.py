@@ -573,21 +573,9 @@ def _packed_validation_error(value: object, snapshot: Any) -> str | None:
 def _matches_manifest(
     item: EvidenceItem, manifest: EvidenceManifestEntry | None
 ) -> bool:
-    return manifest is not None and (
-        manifest.evidence_id,
-        manifest.parent_id,
-        manifest.document_id,
-        manifest.document_version_id,
-        manifest.ast_locator,
-        manifest.heading_path,
-    ) == (
-        item.evidence_id,
-        item.parent_id,
-        item.document_id,
-        item.document_version_id,
-        item.ast_locator,
-        item.heading_path,
-    )
+    from agentic_rag.query.evidence_builder import matches_manifest
+    return matches_manifest(item, manifest)
+
 
 
 def _coverage_targets(
@@ -646,9 +634,15 @@ def _validate_packed_inputs(
             prior = selected.get(item.evidence_id)
             if prior is not None:
                 prior_item, prior_manifest, prior_backed = prior
-                if prior_manifest != manifest or (
-                    prior_item.content != item.content and not (prior_backed and backed)
-                ):
+                if item.schema_version == 2 and prior_item.schema_version == 2:
+                    relations = {"supports_claim_ids", "support_source_refs", "source_child_ids", "context_refs"}
+                    if prior_backed and backed and item.source_kind == "parent_chunk":
+                        relations.add("content_hash")
+                    if prior_manifest.model_dump(exclude=relations) != manifest.model_dump(exclude=relations):
+                        raise ValueError("conflicting evidence metadata for evidence id")
+                elif prior_manifest != manifest:
+                    raise ValueError("conflicting evidence metadata for evidence id")
+                if prior_item.content != item.content and not (prior_backed and backed):
                     raise ValueError("conflicting evidence metadata for evidence id")
             selected[item.evidence_id] = (item, manifest, backed)
 

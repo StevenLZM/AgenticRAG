@@ -8,10 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agentic_rag.orchestration import schema
 from agentic_rag.orchestration.contracts import GradeResult, PreparedBundle, content_hash
 from agentic_rag.orchestration.store_sql import enqueue
+from agentic_rag.query.evidence_builder import EvidenceItem, merge_evidence_items, support_links as packed_support_links, expand_support_ids
 
 
 def bound_inputs(evidence: list[dict[str, Any]], analyses: list[dict[str, Any]], assessments: list[dict[str, Any]],
-                 groups: dict[str, list[str]], *, budget: int, mode: str):
+                 groups: dict[str, list[str]], *, budget: int, mode: str, support_links=None):
     """Keep complete supporting units; never trim a quote under an old grade."""
     def cost(items, reports):
         return len(json.dumps({"evidence": items, "analyses": reports}, ensure_ascii=False))
@@ -23,20 +24,23 @@ def bound_inputs(evidence: list[dict[str, Any]], analyses: list[dict[str, Any]],
     reports: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []
     indexed = {item["evidence_id"]: item for item in evidence}
+    support_links = support_links or {}
     # A verified computation is indivisible: its whole source excerpts travel
     # with it, or the computation is explicitly omitted.
     for report in analyses:
         result = report["result"]
         refs = {r for f in result["findings"] for r in f["evidence_refs"] if r != "query"}
         refs.update(o["evidence_ref"] for c in result["calculations"] for o in c["operands"] if o["source_kind"] == "evidence")
+        refs = expand_support_ids(refs, support_links)
         combined = {**selected, **{key: indexed[key] for key in refs if key in indexed}}
         if refs <= indexed.keys() and cost(list(combined.values()), [*reports, report]) <= budget:
             selected, reports = combined, [*reports, report]
         else:
             gaps.append({"missing_analysis": report["task_key"], "reason": "answer_context_budget"})
     for key, group_refs in groups.items():
-        combined = {**selected, **{ref: indexed[ref] for ref in group_refs}}
-        if cost(list(combined.values()), reports) <= budget:
+        group_refs = expand_support_ids(group_refs, support_links)
+        combined = {**selected, **{ref: indexed[ref] for ref in group_refs if ref in indexed}}
+        if group_refs <= indexed.keys() and cost(list(combined.values()), reports) <= budget:
             selected = combined
         else:
             gaps.append({"partial_group": key, "reason": "answer_context_budget"})
@@ -44,7 +48,7 @@ def bound_inputs(evidence: list[dict[str, Any]], analyses: list[dict[str, Any]],
     return list(selected.values()), reports, assessments, gaps
 
 
-async def freeze_answer(db: AsyncSession, run: dict[str, Any], *, mode: str = "full", clarification: str = "") -> None:
+async def freeze_answer(db: AsyncSession, run: dict[str, Any], *, mode: str = "full", clarification: str = "", context_sources=None) -> None:
     data = run["data"]
     if data.get("answer") is not None:
         return
@@ -61,17 +65,27 @@ async def freeze_answer(db: AsyncSession, run: dict[str, Any], *, mode: str = "f
     assessments: list[dict[str, Any]] = []
     limitations: list[dict[str, Any]] = []
     group_evidence: dict[str, list[str]] = {}
+    links, requirements = {}, {}
     for key, accepted in data["accepted"].items():
         grade_raw = (await db.execute(select(schema.results.c.payload).where(schema.results.c.id == accepted["grade_ref"]))).scalar_one()
         grade = GradeResult.model_validate(grade_raw)
         bundle_raw = (await db.execute(select(schema.results.c.payload).where(schema.results.c.id == accepted["bundle_ref"]))).scalar_one()
         bundle = PreparedBundle.model_validate(bundle_raw)
         allowed = {ref for c in grade.coverage if c.status == "supported" for ref in c.evidence_refs}
+        for body_id, dependencies in packed_support_links(bundle.packed).items():
+            if body_id in allowed:
+                links[body_id] = tuple(dict.fromkeys((*links.get(body_id, ()), *dependencies)))
+        allowed = expand_support_ids(allowed, links)
         group_evidence[key] = sorted(allowed)
+        for requirement in bundle.packed.evidence_requirements:
+            requirements[requirement.id] = requirement.model_dump(mode="json")
         for item in bundle.packed.items:
             if item.evidence_id in allowed:
                 previous = evidence.get(item.evidence_id)
                 raw = item.model_dump(mode="json")
+                if previous is not None and item.schema_version == 2:
+                    evidence[item.evidence_id] = merge_evidence_items(EvidenceItem.model_validate(previous), item).model_dump(mode="json")
+                    continue
                 if previous is not None and {k: v for k, v in previous.items() if k not in ("covered_target_ids", "content")} != {k: v for k, v in raw.items() if k not in ("covered_target_ids", "content")}:
                     # IDs are local to a pack. Preserve an unambiguous global
                     # locator rather than silently conflating two evidence items.
@@ -99,13 +113,15 @@ async def freeze_answer(db: AsyncSession, run: dict[str, Any], *, mode: str = "f
     selected, analyses, assessments, omissions = bound_inputs(list(evidence.values()), analyses, assessments, group_evidence,
         # Preserve the historical limit for existing Runs; initialization must
         # never backfill or reset a persisted run's execution boundaries.
-        budget=data.get("answer_input_char_limit", data["snapshot"]["max_evidence_tokens"]), mode=mode)
+        budget=data.get("answer_input_char_limit", data["snapshot"]["max_evidence_tokens"]), mode=mode, support_links=links)
     limitations.extend(omissions)
     frozen_input = {"question": data["question"], "mode": "clarification" if clarification else mode,
                     "clarification": clarification, "evidence": selected, "analyses": analyses,
-                    "assessments": assessments, "limitations": limitations}
+                    "assessments": assessments, "limitations": limitations,
+                    "support_links": {key: value for key, value in links.items() if key in {e["evidence_id"] for e in selected}},
+                    "evidence_requirements": [r for r in requirements.values() if r["child_id"] in {cid for e in selected for cid in e.get("source_child_ids", ())}]}
     from agentic_rag.orchestration.authorization import authorize_sources
-    await authorize_sources(db, run, frozen_input["evidence"])
+    await authorize_sources(db, run, frozen_input["evidence"], context_sources=context_sources)
     data["answer"] = {"input": frozen_input, "input_hash": content_hash(frozen_input), "epoch": 1,
                       "seq": 0, "text": "", "status": "frozen", "faithfulness": "pending"}
     data["phase"] = "answering"

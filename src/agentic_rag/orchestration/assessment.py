@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 
 def validate_grade(grade: GradeResult, bundle: PreparedBundle) -> None:
+    if grade.decision == "sufficient" and bundle.packed.scope_evidence_missing:
+        raise ValueError("scope_evidence_missing prevents sufficient grade")
     if grade.bundle_hash != bundle.bundle_hash:
         raise ValueError("grade binds a different evidence bundle")
     criteria = {c.id for c in bundle.criteria}

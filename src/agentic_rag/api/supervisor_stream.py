@@ -32,7 +32,7 @@ async def project_run(request: Request, run):
     try:
         async with store_for(request).session_factory() as db:
             if durable["data"].get("answer"):
-                await authorize_sources(db, durable, durable["data"]["answer"]["input"]["evidence"])
+                await authorize_sources(db, durable, durable["data"]["answer"]["input"]["evidence"], context_sources=store_for(request).context_sources)
     except SourceAccessRevoked:
         return replace(run, status=RunStatus.FAILED, answer=None, error_code="SOURCE_ACCESS_REVOKED")
     status = RunStatus.RUNNING if durable["status"] in ("active", "finalizing") else RunStatus(durable["status"])

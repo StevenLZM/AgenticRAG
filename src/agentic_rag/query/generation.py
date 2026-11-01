@@ -59,6 +59,8 @@ class AnswerGenerator:
             "question": question,
             "packed_context": packed_evidence.rendered_context,
             "evidence_manifest": model_evidence_manifest(packed_evidence.manifest),
+            "evidence_requirements": [r.model_dump(mode="json") for r in packed_evidence.evidence_requirements],
+            "scope_evidence_missing": packed_evidence.scope_evidence_missing,
             "repair_issues": list(repair_issues),
         }
         call = ModelCall(

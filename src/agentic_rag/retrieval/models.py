@@ -18,6 +18,7 @@ from agentic_rag.retrieval.query_context import CoverageBinding, ScopeResolution
 
 from agentic_rag.models.contextual import (
     ContextArtifactRef,
+    SupportingContext,
     SHA256_PATTERN,
     text_sha256,
 )
@@ -244,6 +245,7 @@ class ParentEvidence(BaseModel):
     document_version_id: str
     content: str
     child_hits: tuple[ChildHit, ...]
+    ast_locator: str | None = None
     retrieval_score: float = 0.0
     rrf_score: float | None = None
     rerank_score: float | None = None
@@ -289,6 +291,17 @@ class RetrievalObservation(BaseModel):
     candidate_counts: dict[str, int] = Field(default_factory=dict)
 
 
+def _validate_frozen_plan(value):
+    plan = value.query_plan
+    if plan is None:
+        if value.query_plan_hash is not None or value.query_plan_ref is not None:
+            raise ValueError("query plan identity requires frozen inline meaning")
+    elif ((value.query_plan_hash is not None and value.query_plan_hash != plan.plan_hash)
+          or (value.query_plan_ref is not None and value.query_plan_ref.sha256 != plan.plan_hash)):
+        raise ValueError("query plan ref/hash differs from frozen meaning")
+    return value
+
+
 class EvidenceBatch(BaseModel):
     """The evidence supplied by one retrieval execution.
 
@@ -305,6 +318,11 @@ class EvidenceBatch(BaseModel):
     document_ids: tuple[str, ...] = ()
     target_ids: tuple[str, ...] = ()
     observation: RetrievalObservation | None = None
+    supporting_context: SupportingContext = Field(default_factory=SupportingContext)
+
+    @model_validator(mode="after")
+    def frozen_plan(self):
+        return _validate_frozen_plan(self)
 
 
 class RankedCandidates(BaseModel):
@@ -322,3 +340,7 @@ class RankedCandidates(BaseModel):
     document_ids: tuple[str, ...] = ()
     degraded_components: tuple[str, ...] = ()
     observation: RetrievalObservation | None = None
+
+    @model_validator(mode="after")
+    def frozen_plan(self):
+        return _validate_frozen_plan(self)

@@ -224,3 +224,47 @@ class SearchRepresentation(_FrozenModel):
         if validated.context_ref is None:
             raise ValueError("context-v1 publication requires context_ref")
         return self
+
+
+class EvidenceRequirement(_FrozenModel):
+    """Source availability never certifies semantic applicability."""
+
+    id: str
+    child_id: str
+    query_plan_hash: str | None = None
+    field: str
+    value: str = Field(min_length=0)
+    claim_ids: tuple[str, ...] = ()
+    source_refs: tuple[CanonicalSourceRef, ...] = ()
+    exclusion_conditions: tuple[str, ...] = ()
+    status: Literal['resolved', 'missing', 'conflicting']
+    semantic_status: Literal['pending'] = 'pending'
+    reason: str | None = None
+
+
+class EvidenceRequirements(_FrozenModel):
+    entries: tuple[EvidenceRequirement, ...] = ()
+
+
+class CanonicalExcerpt(_FrozenModel):
+    evidence_id: str
+    content: str
+    source_ref: CanonicalSourceRef
+    build_fingerprint: str
+    context_refs: tuple[ContextArtifactRef, ...]
+    supports_claim_ids: tuple[str, ...]
+    source_child_ids: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def original_content_hash(self):
+        if text_sha256(self.content) != self.source_ref.quote_sha256:
+            raise ValueError("supporting source content hash mismatch")
+        if not self.context_refs or not self.supports_claim_ids or not self.source_child_ids:
+            raise ValueError("supporting source requires complete relation provenance")
+        return self
+
+
+class SupportingContext(_FrozenModel):
+    verified_child_ids: tuple[str, ...] = ()
+    sources: tuple[CanonicalExcerpt, ...] = ()
+    requirements: tuple[EvidenceRequirement, ...] = ()

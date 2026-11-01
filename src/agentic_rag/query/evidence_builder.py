@@ -7,7 +7,16 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import Literal
+
+from agentic_rag.models.contextual import (
+    CanonicalSourceRef,
+    ContextArtifactRef,
+    SupportingContext,
+    EvidenceRequirement,
+    text_sha256,
+)
 
 from agentic_rag.domain.models import UserScope
 from agentic_rag.retrieval.models import ChildHit, EvidenceBatch, ParentEvidence
@@ -29,32 +38,111 @@ class EvidenceCoverageTarget(BaseModel):
     description: str = Field(min_length=1)
 
 
-class EvidenceItem(BaseModel):
-    """One prompt-safe parent fragment and its immutable source provenance."""
-
-    model_config = ConfigDict(frozen=True)
-
-    evidence_id: str
-    parent_id: str
-    document_id: str
-    document_version_id: str
-    content: str
-    ast_locator: str
-    covered_target_ids: tuple[str, ...]
-    heading_path: tuple[str, ...] = ()
-
-
 class EvidenceManifestEntry(BaseModel):
-    """Citation-validatable metadata for an included evidence item only."""
+    """Versioned source union; metadata-only evidence is deliberately disabled."""
 
-    model_config = ConfigDict(frozen=True)
-
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    schema_version: Literal[1, 2] = 1
     evidence_id: str
-    parent_id: str
+    source_kind: Literal["parent_chunk", "canonical_excerpt"] = "parent_chunk"
+    parent_id: str | None
     document_id: str
     document_version_id: str
     ast_locator: str
     heading_path: tuple[str, ...] = ()
+    content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_ref: CanonicalSourceRef | None = None
+    build_fingerprint: str | None = None
+    context_refs: tuple[ContextArtifactRef, ...] = ()
+    supports_claim_ids: tuple[str, ...] = ()
+    support_source_refs: tuple[CanonicalSourceRef, ...] = ()
+    source_child_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def source_contract(self):
+        if self.schema_version == 1 and (
+            self.content_hash is not None
+            or self.context_refs
+            or self.source_ref is not None
+            or self.build_fingerprint is not None
+            or self.supports_claim_ids
+            or self.support_source_refs
+            or self.source_child_ids
+        ):
+            raise ValueError("context provenance requires evidence schema v2")
+        if self.schema_version == 2 and self.content_hash is None:
+            raise ValueError("v2 evidence requires content hash")
+        if self.source_kind == "parent_chunk":
+            if not self.parent_id or self.source_ref is not None:
+                raise ValueError("parent evidence requires real Parent identity")
+        else:
+            ref = self.source_ref
+            if (
+                self.schema_version != 2
+                or self.parent_id is not None
+                or ref is None
+                or not self.build_fingerprint
+                or not self.context_refs
+                or not self.supports_claim_ids
+                or not self.source_child_ids
+                or self.support_source_refs
+            ):
+                raise ValueError(
+                    "canonical evidence requires source/build/support provenance"
+                )
+            if (
+                ref.document_id != self.document_id
+                or ref.document_version_id != self.document_version_id
+                or ref.quote_sha256 != self.content_hash
+                or ref.canonical_path != self.ast_locator
+            ):
+                raise ValueError("canonical evidence provenance mismatch")
+        return self
+
+
+class EvidenceItem(EvidenceManifestEntry):
+    content: str
+    covered_target_ids: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def content_integrity(self):
+        if self.content_hash is not None and self.content_hash != text_sha256(
+            self.content
+        ):
+            raise ValueError("evidence content hash mismatch")
+        return self
+
+
+def evidence_projection(item: EvidenceItem) -> dict:
+    return item.model_dump(exclude={"content", "covered_target_ids"})
+
+
+def matches_manifest(item: EvidenceItem, entry: EvidenceManifestEntry | None) -> bool:
+    return entry is not None and evidence_projection(item) == entry.model_dump()
+
+
+def merge_evidence_items(left: EvidenceItem, right: EvidenceItem) -> EvidenceItem:
+    """Union support relations only after checking the complete source identity."""
+    relations = {
+        "supports_claim_ids",
+        "support_source_refs",
+        "source_child_ids",
+        "context_refs",
+        "covered_target_ids",
+    }
+    if left.model_dump(exclude=relations) != right.model_dump(exclude=relations):
+        raise ValueError("conflicting evidence source identity")
+    return EvidenceItem(
+        **{
+            **left.model_dump(),
+            **{
+                name: tuple(
+                    dict.fromkeys((*getattr(left, name), *getattr(right, name)))
+                )
+                for name in relations
+            },
+        }
+    )
 
 
 class PackedEvidence(BaseModel):
@@ -67,6 +155,72 @@ class PackedEvidence(BaseModel):
     rendered_context: str
     token_count: int
     index_generation: str
+    supporting_context: SupportingContext = Field(default_factory=SupportingContext)
+    evidence_requirements: tuple[EvidenceRequirement, ...] = ()
+    scope_evidence_missing: tuple[str, ...] = ()
+
+
+def support_links(packed: PackedEvidence) -> dict[str, tuple[str, ...]]:
+    """Exact source closure for every body; reused by grading and final freeze."""
+    links = {}
+    for item in packed.items:
+        if item.source_kind != "parent_chunk":
+            continue
+        required = [
+            r
+            for r in packed.evidence_requirements
+            if r.child_id in item.source_child_ids
+        ]
+        refs = []
+        for requirement in required:
+            if (
+                requirement.status != "resolved"
+                or requirement.id in packed.scope_evidence_missing
+            ):
+                raise ValueError("scope_evidence_missing")
+            for source_ref in requirement.source_refs:
+                source = next(
+                    (
+                        s
+                        for s in packed.supporting_context.sources
+                        if s.source_ref == source_ref
+                    ),
+                    None,
+                )
+                match = next(
+                    (
+                        candidate
+                        for candidate in packed.items
+                        if candidate.source_ref == source_ref
+                        or (
+                            source is not None
+                            and candidate.source_kind == "parent_chunk"
+                            and source_ref in candidate.support_source_refs
+                            and set(requirement.claim_ids)
+                            <= set(candidate.supports_claim_ids)
+                            and source.content in candidate.content
+                        )
+                    ),
+                    None,
+                )
+                if match is None:
+                    raise ValueError("scope_evidence_missing")
+                if match.evidence_id != item.evidence_id:
+                    refs.append(match.evidence_id)
+        if refs:
+            links[item.evidence_id] = tuple(dict.fromkeys(refs))
+    return links
+
+
+def expand_support_ids(ids, links):
+    selected = set(ids)
+    pending = list(selected)
+    while pending:
+        for dependency in links.get(pending.pop(), ()):
+            if dependency not in selected:
+                selected.add(dependency)
+                pending.append(dependency)
+    return selected
 
 
 def model_evidence_manifest(
@@ -84,6 +238,16 @@ def model_evidence_manifest(
             "document_id": entry.document_id,
             "document_version_id": entry.document_version_id,
             "heading_path": entry.heading_path,
+            **(
+                {
+                    "source_kind": entry.source_kind,
+                    "content_hash": entry.content_hash,
+                    "supports_claim_ids": entry.supports_claim_ids,
+                    "source_child_ids": entry.source_child_ids,
+                }
+                if entry.schema_version == 2
+                else {}
+            ),
         }
         for evidence_id, entry in manifest.items()
     }
@@ -125,10 +289,29 @@ class EvidenceBuilder:
         capacity = min(
             max_tokens, snapshot.max_evidence_tokens, MAX_PACKED_EVIDENCE_TOKENS
         )
-        candidates = self._candidates(batches, coverage_targets, scope, rank_across_batches=rank_across_batches)
-        allow_single_document = bool(candidates) and len(
-            {candidate.parent.document_id for candidate in candidates}
-        ) == 1
+        if any(
+            b.supporting_context.requirements
+            or b.supporting_context.sources
+            or b.query_plan is not None
+            or any(h.context_ref for p in b.parents for h in p.child_hits)
+            for b in batches
+        ):
+            return self._build_contextual(
+                batches,
+                coverage_targets,
+                scope,
+                snapshot,
+                capacity,
+                rank_across_batches,
+                balance_targets,
+            )
+        candidates = self._candidates(
+            batches, coverage_targets, scope, rank_across_batches=rank_across_batches
+        )
+        allow_single_document = (
+            bool(candidates)
+            and len({candidate.parent.document_id for candidate in candidates}) == 1
+        )
 
         items: list[EvidenceItem] = []
         rendered: list[str] = []
@@ -145,9 +328,13 @@ class EvidenceBuilder:
                     continue
                 target_capacity = capacity
                 if balance_targets:
-                    remaining_targets = len({t.target_id for t in coverage_targets} - covered_target_ids)
+                    remaining_targets = len(
+                        {t.target_id for t in coverage_targets} - covered_target_ids
+                    )
                     used = _estimate_tokens("\n".join(rendered))
-                    target_capacity = used + (capacity - used) // max(1, remaining_targets)
+                    target_capacity = used + (capacity - used) // max(
+                        1, remaining_targets
+                    )
                 packed = self._pack_candidate(candidate, rendered, target_capacity)
                 if (
                     packed is None
@@ -177,9 +364,7 @@ class EvidenceBuilder:
                 allow_single_document=allow_single_document,
             ):
                 continue
-            packed = self._pack_candidate(
-                candidate, rendered, capacity
-            )
+            packed = self._pack_candidate(candidate, rendered, capacity)
             if packed is None:
                 continue
             item, rendered_envelope = packed
@@ -206,6 +391,263 @@ class EvidenceBuilder:
             token_count=_estimate_tokens(rendered_context),
             index_generation=snapshot.index_generation,
         )
+
+    def _build_contextual(
+        self, batches, targets, scope, snapshot, capacity, rank, balance
+    ):
+        from agentic_rag.retrieval.context_evidence import (
+            EvidenceRequirementResolver,
+            ContextSourceHydrator,
+        )
+        import json
+
+        requirements = {}
+        sources = {}
+        for batch in batches:
+            ContextSourceHydrator._check_plan(batch.query_plan, scope, snapshot)
+            for requirement in batch.supporting_context.requirements:
+                prior = requirements.get(requirement.id)
+                if prior is not None and prior != requirement:
+                    raise ValueError("conflicting evidence requirements")
+                requirements[requirement.id] = requirement
+            for source in batch.supporting_context.sources:
+                old = sources.get(source.evidence_id)
+                if old is not None:
+                    if old.model_dump(
+                        exclude={
+                            "supports_claim_ids",
+                            "source_child_ids",
+                            "context_refs",
+                        }
+                    ) != source.model_dump(
+                        exclude={
+                            "supports_claim_ids",
+                            "source_child_ids",
+                            "context_refs",
+                        }
+                    ):
+                        raise ValueError("conflicting supporting source")
+                    source = source.model_copy(
+                        update={
+                            name: tuple(
+                                dict.fromkeys(
+                                    (*getattr(old, name), *getattr(source, name))
+                                )
+                            )
+                            for name in (
+                                "supports_claim_ids",
+                                "source_child_ids",
+                                "context_refs",
+                            )
+                        }
+                    )
+                sources[source.evidence_id] = source
+            hydrated = {r.child_id for r in batch.supporting_context.requirements}
+            for parent in batch.parents:
+                for hit in parent.child_hits:
+                    plan = batch.query_plan
+                    if plan is not None and (
+                        plan.effective_filter.match_none
+                        or (
+                            plan.effective_filter.document_ids
+                            and hit.document_id
+                            not in plan.effective_filter.document_ids
+                        )
+                    ):
+                        raise ValueError("source outside frozen query plan")
+                    if (
+                        hit.context_ref is not None
+                        and hit.child_id
+                        not in batch.supporting_context.verified_child_ids
+                    ):
+                        raise ValueError("context source hydration required")
+                    if hit.child_id in hydrated:
+                        continue
+                    for req in (
+                        EvidenceRequirementResolver()
+                        .resolve(batch.query_plan, hit, None)
+                        .entries
+                    ):
+                        requirements[req.id] = req
+        items, rendered, selected_sources = [], [], {}
+        gaps = set()
+        support_tokens = 0
+        counts = Counter()
+        target_covered = set()
+        candidates = self._candidates(batches, targets, scope, rank_across_batches=rank)
+        single = len({c.parent.document_id for c in candidates}) == 1
+        for candidate in candidates:
+            if not _within_document_limit(
+                candidate, counts, allow_single_document=single
+            ):
+                continue
+            children = {h.child_id for h in candidate.parent.child_hits}
+            required = [r for r in requirements.values() if r.child_id in children]
+            if any(r.status != "resolved" for r in required):
+                gaps.update(r.id for r in required if r.status != "resolved")
+                continue
+            refs = {ref for r in required for ref in r.source_refs}
+            needed = [
+                s
+                for s in sources.values()
+                if s.source_ref in refs and children.intersection(s.source_child_ids)
+            ]
+            if refs != {s.source_ref for s in needed} or any(
+                len(
+                    {
+                        ref
+                        for r in required
+                        if r.child_id == cid
+                        for ref in r.source_refs
+                    }
+                )
+                > 4
+                for cid in children
+            ):
+                gaps.update(r.id for r in required)
+                continue
+            item = self._item(candidate)
+            parent_content = candidate.parent.content
+            same, outside = [], []
+            for source in needed:
+                ref = source.source_ref
+                covered = False
+                if candidate.parent.ast_locator and source.content in parent_content:
+                    locator = json.loads(candidate.parent.ast_locator)
+                    covered = any(
+                        span.get("block_id") == ref.block_id
+                        and span.get("canonical_path") == ref.canonical_path
+                        and span.get("char_from", -1)
+                        <= ref.char_from
+                        < ref.char_to
+                        <= span.get("char_to", -1)
+                        for span in locator.get("spans", [])
+                    )
+                (same if covered else outside).append(source)
+            new_sources = [
+                source
+                for source in outside
+                if source.evidence_id not in selected_sources
+            ]
+            extra = [
+                EvidenceItem(
+                    schema_version=2,
+                    source_kind="canonical_excerpt",
+                    parent_id=None,
+                    evidence_id=source.evidence_id,
+                    document_id=source.source_ref.document_id,
+                    document_version_id=source.source_ref.document_version_id,
+                    content=source.content,
+                    content_hash=source.source_ref.quote_sha256,
+                    source_ref=source.source_ref,
+                    ast_locator=source.source_ref.canonical_path,
+                    build_fingerprint=source.build_fingerprint,
+                    context_refs=source.context_refs,
+                    supports_claim_ids=source.supports_claim_ids,
+                    source_child_ids=source.source_child_ids,
+                    covered_target_ids=(),
+                )
+                for source in new_sources
+            ]
+            extra_rendered = [self._render_item(i) for i in extra]
+            extra_cost = sum(len(v) + 1 for v in extra_rendered)
+            if support_tokens + extra_cost > capacity // 4:
+                gaps.update(r.id for r in required)
+                continue
+            envelope = DataEnvelope(
+                source_label=f"document:{item.document_id}",
+                evidence_id=item.evidence_id,
+                content=parent_content,
+                heading_path=item.heading_path,
+            )
+            group_capacity = capacity
+            if balance and set(candidate.target_ids) - target_covered:
+                remaining = {target.target_id for target in targets} - target_covered
+                used = len("\n".join(rendered))
+                group_capacity = used + (capacity - used) // max(1, len(remaining))
+            fitted = self._fit(
+                envelope,
+                (*rendered, *extra_rendered),
+                group_capacity,
+                candidate.parent.child_hits[0].content,
+            )
+            if (
+                fitted is None
+                or any(h.content not in fitted[0] for h in candidate.parent.child_hits)
+                or any(s.content not in fitted[0] for s in same)
+            ):
+                gaps.update(r.id for r in required)
+                continue
+            item = EvidenceItem(
+                **{
+                    **item.model_dump(),
+                    "schema_version": 2,
+                    "content": fitted[0],
+                    "content_hash": text_sha256(fitted[0]),
+                    "source_child_ids": tuple(sorted(children)),
+                    "context_refs": tuple(
+                        dict.fromkeys(
+                            h.context_ref
+                            for h in candidate.parent.child_hits
+                            if h.context_ref
+                        )
+                    ),
+                    "build_fingerprint": next(
+                        (
+                            h.build_fingerprint
+                            for h in candidate.parent.child_hits
+                            if h.build_fingerprint
+                        ),
+                        None,
+                    ),
+                    "supports_claim_ids": tuple(
+                        dict.fromkeys(
+                            cid for source in same for cid in source.supports_claim_ids
+                        )
+                    ),
+                    "support_source_refs": tuple(source.source_ref for source in same),
+                }
+            )
+            items.extend((item, *extra))
+            rendered.extend((self._render_item(item), *extra_rendered))
+            selected_sources.update((s.evidence_id, s) for s in needed)
+            support_tokens += extra_cost
+            counts[item.document_id] += 1
+            target_covered.update(item.covered_target_ids)
+        context = SupportingContext(
+            sources=tuple(selected_sources.values()),
+            requirements=tuple(requirements.values()),
+            verified_child_ids=tuple(
+                dict.fromkeys(
+                    cid
+                    for b in batches
+                    for cid in b.supporting_context.verified_child_ids
+                )
+            ),
+        )
+        text = "\n".join(rendered)
+        return PackedEvidence(
+            items=tuple(items),
+            manifest={
+                i.evidence_id: EvidenceManifestEntry(**evidence_projection(i))
+                for i in items
+            },
+            rendered_context=text,
+            token_count=len(text),
+            index_generation=snapshot.index_generation,
+            supporting_context=context,
+            evidence_requirements=tuple(requirements.values()),
+            scope_evidence_missing=tuple(sorted(gaps)),
+        )
+
+    @staticmethod
+    def _render_item(item):
+        return DataEnvelope(
+            source_label=f"document:{item.document_id}",
+            evidence_id=item.evidence_id,
+            content=item.content,
+            heading_path=item.heading_path,
+        ).render()
 
     def _pack_candidate(
         self,
@@ -284,7 +726,9 @@ class EvidenceBuilder:
         ranked = sorted(
             candidates,
             key=lambda candidate: (
-                -candidate.parent.ranking_score if rank_across_batches else candidate.parent_position,
+                -candidate.parent.ranking_score
+                if rank_across_batches
+                else candidate.parent_position,
                 candidate.batch_position,
                 candidate.parent_position,
                 candidate.parent.parent_id,
@@ -300,9 +744,34 @@ class EvidenceBuilder:
             else:
                 position = positions[key]
                 original = unique[position]
-                unique[position] = replace(original, target_ids=tuple(dict.fromkeys(
-                    (*original.target_ids, *candidate.target_ids)
-                )))
+                if (
+                    original.parent.document_id,
+                    original.parent.content,
+                    original.parent.heading_path,
+                ) != (
+                    candidate.parent.document_id,
+                    candidate.parent.content,
+                    candidate.parent.heading_path,
+                ):
+                    raise ValueError("conflicting parent source identity")
+                children = {hit.child_id: hit for hit in original.parent.child_hits}
+                for hit in candidate.parent.child_hits:
+                    if (
+                        hit.child_id in children
+                        and children[hit.child_id].search_identity
+                        != hit.search_identity
+                    ):
+                        raise ValueError("conflicting candidate search identity")
+                    children[hit.child_id] = hit
+                unique[position] = replace(
+                    original,
+                    parent=original.parent.model_copy(
+                        update={"child_hits": tuple(children.values())}
+                    ),
+                    target_ids=tuple(
+                        dict.fromkeys((*original.target_ids, *candidate.target_ids))
+                    ),
+                )
         return unique
 
     @staticmethod
@@ -385,13 +854,8 @@ def _within_document_limit(
         if allow_single_document is None
         else allow_single_document
     )
-    return (
-        document_counts[candidate.parent.document_id]
-        < (
-            MAX_ITEMS_SINGLE_DOCUMENT
-            if single_document
-            else MAX_ITEMS_PER_DOCUMENT
-        )
+    return document_counts[candidate.parent.document_id] < (
+        MAX_ITEMS_SINGLE_DOCUMENT if single_document else MAX_ITEMS_PER_DOCUMENT
     )
 
 

@@ -10,6 +10,7 @@ from typing import Annotated, Protocol
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from agentic_rag.domain.models import UserScope
+from agentic_rag.models.contextual import text_sha256
 from agentic_rag.observability.logging import emit_degradation
 from agentic_rag.models.schemas import EvidenceGrade, EvidenceGradeV2
 from agentic_rag.query.routing_context import RoutingContext
@@ -21,6 +22,9 @@ from agentic_rag.query.evidence_builder import (
     EvidenceManifestEntry,
     PackedEvidence,
     model_evidence_manifest,
+    matches_manifest,
+    support_links,
+    expand_support_ids,
 )
 from agentic_rag.query.generation import (
     AnswerDraft,
@@ -90,8 +94,9 @@ class EvidenceAuthorizationResolver(Protocol):
 class ParentRepositoryAuthorizationResolver:
     """Adapt the scoped active-parent repository to the audit resolver port."""
 
-    def __init__(self, parents: ParentRepository) -> None:
+    def __init__(self, parents: ParentRepository, context_sources=None) -> None:
         self._parents = parents
+        self._context_sources = context_sources
 
     async def resolve(
         self,
@@ -99,13 +104,25 @@ class ParentRepositoryAuthorizationResolver:
         scope: UserScope,
         snapshot: RuntimeConfigSnapshot,
     ) -> Mapping[str, object]:
-        parent_ids = list(dict.fromkeys(entry.parent_id for entry in manifest.values()))
+        parent_ids = list(dict.fromkeys(entry.parent_id for entry in manifest.values() if entry.source_kind == "parent_chunk"))
         rows = await self._parents.get_many(parent_ids, scope)
         by_id = {row.id: row for row in rows}
-        return {
-            evidence_id: _parent_record(by_id.get(entry.parent_id), scope, snapshot)
-            for evidence_id, entry in manifest.items()
-        }
+        result = {}
+        for evidence_id, entry in manifest.items():
+            if entry.source_kind == "canonical_excerpt":
+                if self._context_sources is None:
+                    result[evidence_id] = {}
+                else:
+                    result[evidence_id] = await self._context_sources.authorize(entry, scope, snapshot)
+            else:
+                result[evidence_id] = dict(_parent_record(by_id.get(entry.parent_id), scope, snapshot))
+                if entry.context_refs:
+                    if self._context_sources is None:
+                        result[evidence_id] = {}
+                    else:
+                        result[evidence_id].update(await self._context_sources.authorize_parent(entry, scope, snapshot))
+        return result
+
 
 
 class EvidenceGradingUnavailable(RuntimeError):
@@ -129,11 +146,13 @@ class EvidenceGrader:
         capabilities: RuntimeCapabilities | None = None,
     ) -> EvidenceGrade:
         if not packed_evidence.items or not packed_evidence.manifest:
+            gaps = tuple(dict.fromkeys(r.reason or "scope_evidence_missing" for r in packed_evidence.evidence_requirements
+                if r.status != "resolved" or r.id in packed_evidence.scope_evidence_missing)) or ("no verified evidence is available",)
             if capabilities is not None:
                 return EvidenceGradeV2(decision="insufficient", gap_type="unknown",
-                                       gaps=("no verified evidence is available",))
+                                       gaps=gaps)
             return EvidenceGrade(
-                decision="insufficient", gaps=("no verified evidence is available",)
+                decision="insufficient", gaps=gaps
             )
         payload = {
             "question": question,
@@ -143,6 +162,8 @@ class EvidenceGrader:
             # decide sufficiency; it must still treat that text as untrusted
             # data, never as instructions.
             "packed_context": packed_evidence.rendered_context,
+            "evidence_requirements": [r.model_dump(mode="json") for r in packed_evidence.evidence_requirements],
+            "scope_evidence_missing": packed_evidence.scope_evidence_missing,
             "packed_evidence_metadata": {
                 "item_count": len(packed_evidence.items),
                 "index_generation": packed_evidence.index_generation,
@@ -173,6 +194,8 @@ class EvidenceGrader:
             response = await self._gateway.complete_structured(call, schema)
             value = getattr(response, "value", response)
             grade = schema.model_validate(value)
+            if grade.decision == "sufficient" and packed_evidence.scope_evidence_missing:
+                return schema(decision="insufficient", gaps=("scope_evidence_missing",), **({"gap_type": "missing_facts"} if capabilities is not None else {}))
             if grade.decision == "sufficient" and not packed_evidence.items:
                 return EvidenceGrade(
                     decision="insufficient", gaps=("no verified evidence is available",)
@@ -212,6 +235,8 @@ class FaithfulnessAuditor:
             ],
             "evidence_manifest": model_evidence_manifest(packed_evidence.manifest),
             "packed_context": packed_evidence.rendered_context,
+            "evidence_requirements": [r.model_dump(mode="json") for r in packed_evidence.evidence_requirements],
+            "scope_evidence_missing": packed_evidence.scope_evidence_missing,
             "user_scope": scope.model_dump(mode="json"),
         }
         call = ModelCall(
@@ -265,13 +290,20 @@ class CitationValidator:
             reasons.append("stale_index_generation")
         for evidence_id, entry in manifest.items():
             item = items_by_id.get(evidence_id)
-            if item is None or not _entry_matches_item(entry, item):
+            if item is None or not _entry_matches_item(entry, item) or (item.content_hash is not None and text_sha256(item.content) != item.content_hash):
                 reasons.append("manifest_mismatch")
                 continue
             record = authorization.get(evidence_id)
             if not _authorization_allows(record, entry, scope, snapshot):
                 reasons.append("evidence_not_authorized")
+        try:
+            dependencies = support_links(packed_evidence)
+        except ValueError:
+            dependencies = {}
+            reasons.append("scope_evidence_missing")
         for segment in draft.segments:
+            if not expand_support_ids(segment.evidence_ids, dependencies) <= set(segment.evidence_ids):
+                reasons.append("missing_scope_citation")
             if segment.kind == "content" and not segment.evidence_ids:
                 reasons.append("missing_evidence")
             for evidence_id in segment.evidence_ids:
@@ -457,14 +489,7 @@ def _unique_items(
 
 
 def _entry_matches_item(entry: EvidenceManifestEntry, item: EvidenceItem) -> bool:
-    return (
-        entry.evidence_id == item.evidence_id
-        and entry.parent_id == item.parent_id
-        and entry.document_id == item.document_id
-        and entry.document_version_id == item.document_version_id
-        and entry.ast_locator == item.ast_locator
-        and entry.heading_path == item.heading_path
-    )
+    return matches_manifest(item, entry)
 
 
 def _authorization_allows(
@@ -474,6 +499,14 @@ def _authorization_allows(
     snapshot: RuntimeConfigSnapshot,
 ) -> bool:
     if not isinstance(value, Mapping):
+        return False
+    if entry.source_kind == "canonical_excerpt":
+        return (value.get("user_id") == scope.user_id
+            and value.get("index_generation") == snapshot.index_generation
+            and value.get("is_active") is True
+            and all(value.get(key) == expected for key, expected in entry.model_dump().items()))
+    if entry.context_refs and any(value.get(name) != getattr(entry, name) for name in
+                                  ("context_refs", "build_fingerprint", "source_child_ids", "support_source_refs", "supports_claim_ids")):
         return False
     return (
         value.get("user_id") == scope.user_id

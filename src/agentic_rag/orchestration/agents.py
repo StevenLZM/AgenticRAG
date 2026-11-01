@@ -133,8 +133,11 @@ class GroupGrader:
         grade = await execution.structured("evidence_grader", {
             "bundle_hash": bundle.bundle_hash, "criteria": [c.model_dump(mode="json") for c in bundle.criteria],
             "evidence": bundle.packed.rendered_context, "evidence_ids": list(bundle.packed.manifest),
+            "evidence_requirements": [r.model_dump(mode="json") for r in bundle.packed.evidence_requirements],
+            "scope_evidence_missing": bundle.packed.scope_evidence_missing,
+            "evidence_manifest": {k: v.model_dump(mode="json") for k, v in bundle.packed.manifest.items()},
             "source_contracts": list(source_contracts),
-            "instructions": "Assess each criterion, source/entity/period/unit/scope and contradictions. Unsupported facts are gaps. Do not calculate.",
+            "instructions": "Assess each criterion, source/entity/period/unit/scope and contradictions. Unsupported facts are gaps. Resolved scope requirements mean source availability only; semantic_status pending requires your applicability judgment, including exclusions. A mere company mention/customer example is not applicability evidence. Query/profile text is not evidence. Do not calculate.",
         }, GradeResult, light=True)
         validate_grade(grade, bundle)
         return grade

@@ -10,7 +10,26 @@ class SourceAccessRevoked(PermissionError):
     pass
 
 
-async def authorize_sources(db: Any, run: dict[str, Any], evidence: list[dict[str, Any]]) -> None:
+async def authorize_sources(db: Any, run: dict[str, Any], evidence: list[dict[str, Any]], *, context_sources=None) -> None:
+    contextual = [e for e in evidence if e.get("source_kind") == "canonical_excerpt" or e.get("context_refs")]
+    if contextual:
+        if context_sources is None:
+            raise SourceAccessRevoked("context source authority is required")
+        from agentic_rag.domain.models import UserScope
+        from agentic_rag.runtime.models import RuntimeConfigSnapshot
+        from agentic_rag.query.evidence_builder import EvidenceItem, EvidenceManifestEntry, evidence_projection
+        scope = UserScope(user_id=run["user_id"])
+        snapshot = RuntimeConfigSnapshot.model_validate(run["data"]["snapshot"])
+        try:
+            for raw in contextual:
+                item = EvidenceItem.model_validate(raw)
+                entry = EvidenceManifestEntry(**evidence_projection(item))
+                if item.source_kind == "canonical_excerpt":
+                    await context_sources.authorize(entry, scope, snapshot)
+                else:
+                    await context_sources.authorize_parent(entry, scope, snapshot)
+        except (ValueError, OSError, KeyError) as error:
+            raise SourceAccessRevoked("context source access was revoked or invalid") from error
     if not run["data"].get("enforce_source_access", True) or not evidence:
         return
     expected = {(e["document_id"], e["document_version_id"]) for e in evidence}

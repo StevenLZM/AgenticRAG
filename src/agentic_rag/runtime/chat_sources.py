@@ -16,6 +16,7 @@ from agentic_rag.query.public_answer import project_public_answer
 class SourceItemView(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     evidence_id: str
+    source_kind: Literal["parent_chunk", "canonical_excerpt"] = "parent_chunk"
     filename: str
     heading_path: tuple[str, ...]
     heading_truncated: bool
@@ -35,8 +36,9 @@ class SourceView(BaseModel):
 
 
 class ChatSourceService:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, context_sources=None):
         self.session_factory = session_factory
+        self.context_sources = context_sources
 
     async def get(self, scope: UserScope, session_id: str, run_id: str) -> SourceView:
         async with self.session_factory() as db:
@@ -79,10 +81,23 @@ class ChatSourceService:
                 document = access.get((source.document_id, source.document_version_id))
                 if document is None:
                     continue
+                entry = source.source_provenance
+                if source.source_kind == "canonical_excerpt" or (entry is not None and entry.context_refs):
+                    if self.context_sources is None or entry is None:
+                        continue
+                    from agentic_rag.runtime.models import RuntimeConfigSnapshot
+                    try:
+                        runtime_snapshot = RuntimeConfigSnapshot.model_validate(run.runtime_config_snapshot)
+                        if source.source_kind == "canonical_excerpt":
+                            await self.context_sources.authorize(entry, scope, runtime_snapshot)
+                        else:
+                            await self.context_sources.authorize_parent(entry, scope, runtime_snapshot)
+                    except (ValueError, OSError, KeyError):
+                        continue
                 items.append(
                     SourceItemView(
                         **source.model_dump(
-                            exclude={"document_id", "document_version_id", "parent_id"}
+                            exclude={"document_id", "document_version_id", "parent_id", "source_provenance"}
                         ),
                         filename=document.filename,
                         version_status="current"

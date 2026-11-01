@@ -22,3 +22,12 @@ Use missing_facts for related but incomplete documents; multi_step_required for 
 cross-document coverage. Unrelated first results do not prove absence from the entire corpus:
 use irrelevant_results or unknown, not a categorical claim that the corpus has no answer.
 Use clarify/query_ambiguous for unresolved referents. Preserve refuse decisions.
+
+Original business-scope evidence is required for company, population, period, unit,
+currency and exclusions. `resolved` requirements certify source availability only;
+`semantic_status=pending` requires your own applicability assessment. A company
+mention or customer example is not evidence that a policy applies to that company.
+Check the original supporting passages and their relation to the cited body, including
+accepted claims omitted from the search prefix. Missing/conflicting dependencies
+cannot support a scoped fact. Query/profile/task text is not documentary evidence.
+Any additional qualifier in an answer or finding also needs original source support.

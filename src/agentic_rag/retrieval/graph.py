@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, cast, TYPE_CHECKING
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -33,6 +33,10 @@ from agentic_rag.retrieval.ports import LexicalIndex, VectorIndex
 from agentic_rag.retrieval.reranker import RerankResult
 from agentic_rag.retrieval.state import LaneFailure, RetrievalState
 from agentic_rag.runtime.models import RetrievalBudget, RuntimeConfigSnapshot
+
+
+if TYPE_CHECKING:
+    from agentic_rag.retrieval.context_evidence import ContextSourceHydrator
 
 
 class RerankerPort(Protocol):
@@ -78,6 +82,7 @@ class RetrievalDependencies:
     filter_builder: FilterBuilder = field(default_factory=FilterBuilder)
     lane_timeout_seconds: float = 10.0
     query_compiler: QueryCompiler | None = None
+    context_sources: ContextSourceHydrator | None = None
 
     def __post_init__(self) -> None:
         if self.lane_timeout_seconds <= 0:
@@ -331,10 +336,18 @@ def build_retrieval_graph(
             "rrf": state.get("fused_hits", []),
             "rerank": state.get("reranked_hits", []),
         }
+        from agentic_rag.models.contextual import SupportingContext
+        supporting = SupportingContext()
+        selected_hits = [h for p in state["hydrated_parents"] for h in p.child_hits]
+        if dependencies.context_sources is not None:
+            supporting = await dependencies.context_sources.hydrate(selected_hits, state["scope"], state["snapshot"], state.get("query_plan"))
+        elif any(h.context_ref for h in selected_hits):
+            raise ValueError("context source hydration required")
         batch = EvidenceBatch(
             query=state["request"].query,
             **_plan_output(state),
             parents=tuple(state["hydrated_parents"]),
+            supporting_context=supporting,
             degraded_components=state["degraded_components"],
             document_ids=state["request"].document_ids,
             observation=RetrievalObservation(

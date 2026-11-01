@@ -25,7 +25,7 @@ def decision_hash(data: dict[str, Any]) -> str:
     })
 
 
-async def schedule_supervisor(db: AsyncSession, run: dict[str, Any]) -> None:
+async def schedule_supervisor(db: AsyncSession, run: dict[str, Any], *, context_sources=None) -> None:
     data = run["data"]
     if data.get("answer") or data["phase"] == "routing" or data["route"] == "fast":
         return
@@ -36,7 +36,7 @@ async def schedule_supervisor(db: AsyncSession, run: dict[str, Any]) -> None:
     if active:
         return
     if data["decision_count"] >= 8:
-        await freeze_answer(db, run, mode="partial")
+        await freeze_answer(db, run, mode="partial", context_sources=context_sources)
         return
     data["decision_count"] += 1
     await enqueue(db, run["id"], "supervisor", f"supervisor:{data['decision_count']}", {"input_hash": decision_hash(data)})
@@ -96,7 +96,7 @@ class Coordinator:
                     route = RouteDecision.model_validate(payload)
                     data["requires_analysis"] = route.kind == "analysis" or route.requires_calculation
                     if route.kind == "clarify":
-                        await freeze_answer(db, run, mode="partial", clarification=route.clarification or "请明确查询范围。")
+                        await freeze_answer(db, run, context_sources=self.store.context_sources, mode="partial", clarification=route.clarification or "请明确查询范围。")
                     elif route.fast:
                         data["route"], data["phase"] = "fast", "fast_retrieval"
                         data["budget"]["assessments"]["used"] += 1
@@ -113,7 +113,7 @@ class Coordinator:
                         data.setdefault("feedback", []).append({"group_key": group_key, "grade": payload, "acceptance": group["acceptance"]})
                         if group_key == "fast" and data["route"] == "fast":
                             if group["acceptance"] == "accepted":
-                                await freeze_answer(db, run)
+                                await freeze_answer(db, run, context_sources=self.store.context_sources)
                             else:
                                 data["route"], data["phase"] = "research", "research"
                 elif stage == "supervisor":
@@ -129,7 +129,7 @@ class Coordinator:
                                     assert decision.group_key is not None
                                     await continue_locked(db, run, result_id, run["version"], decision.group_key, list(decision.task_keys), [g.model_dump(mode="json") for g in decision.gaps])
                                 else:
-                                    await freeze_answer(db, run, mode=decision.answer_mode if decision.action == "answer" else "partial", clarification=decision.question)
+                                    await freeze_answer(db, run, context_sources=self.store.context_sources, mode=decision.answer_mode if decision.action == "answer" else "partial", clarification=decision.question)
                         except (ValueError, BudgetExceeded) as error:
                             run.clear()
                             run.update(before)
@@ -162,5 +162,5 @@ class Coordinator:
                     if task["state"] == "waiting_dependencies":
                         if await enqueue_task(db, run, key):
                             task["dependency_results"] = refs
-                await schedule_supervisor(db, run)
+                await schedule_supervisor(db, run, context_sources=self.store.context_sources)
             await save_run(db, run)

@@ -44,9 +44,10 @@ class WorkClaim:
 
 
 class CoordinationStore:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, capacity_limits: dict[str, int] | None = None, enforce_source_access: bool = True, max_active_runs: int | None = None, query_compiler: QueryCompiler | None = None) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, capacity_limits: dict[str, int] | None = None, enforce_source_access: bool = True, max_active_runs: int | None = None, query_compiler: QueryCompiler | None = None, context_sources=None) -> None:
         self.session_factory = session_factory
         self.query_compiler = query_compiler
+        self.context_sources = context_sources
         self.capacity_limits = capacity_limits or {}
         self.enforce_source_access = enforce_source_access
         if max_active_runs is not None and max_active_runs < 1:

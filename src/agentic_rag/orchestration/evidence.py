@@ -14,9 +14,10 @@ from agentic_rag.runtime.models import RuntimeConfigSnapshot
 class EvidencePreparer:
     """Consumes a frozen candidate set; it does not decide factual sufficiency."""
 
-    def __init__(self, hydrator: ParentHydrator, builder: EvidenceBuilder | None = None) -> None:
+    def __init__(self, hydrator: ParentHydrator, builder: EvidenceBuilder | None = None, *, context_sources=None) -> None:
         self.hydrator = hydrator
         self.builder = builder or EvidenceBuilder()
+        self.context_sources = context_sources
 
     async def prepare(
         self, candidates: Sequence[CandidateResult], criteria: Sequence[Criterion],
@@ -25,7 +26,7 @@ class EvidencePreparer:
         parents: dict[tuple[str, str], ParentEvidence] = {}
         sources: dict[tuple[str, str], list[str]] = {}
         selections: list[tuple[CandidateResult, RankedCandidates, list[ParentEvidence]]] = []
-        children: dict[str, tuple[str, str, str, str]] = {}
+        children: dict[str, tuple] = {}
         for result in candidates:
             for batch in result.candidates:
                 if batch.user_id != scope.user_id:
@@ -35,7 +36,7 @@ class EvidencePreparer:
                 for hit in batch.hits:
                     if hit.user_id != scope.user_id or (batch.document_ids and hit.document_id not in batch.document_ids):
                         raise ValueError("candidate source is outside scope")
-                    identity = (hit.parent_id, hit.document_id, hit.document_version_id, hit.content)
+                    identity = hit.search_identity
                     if hit.child_id in children and children[hit.child_id] != identity:
                         raise ValueError("conflicting candidate identity")
                     children[hit.child_id] = identity
@@ -59,30 +60,35 @@ class EvidencePreparer:
         by_key = {(p.parent_id, p.document_version_id): p for p in hydrated}
         if set(by_key) != set(parents):
             raise ValueError("hydration did not preserve the authorized parent set")
-        batches = [
-            EvidenceBatch(
-                query=batch.query,
-                query_plan=batch.query_plan, query_plan_ref=batch.query_plan_ref,
-                query_plan_hash=batch.query_plan_hash,
-                parents=tuple(by_key[(p.parent_id, p.document_version_id)] for p in selected),
+        batches = []
+        from agentic_rag.models.contextual import SupportingContext
+        for result, batch, selected in selections:
+            supporting = SupportingContext()
+            # Resolve each frozen plan separately, even for repeated child IDs.
+            selected_hits = [h for p in selected for h in p.child_hits]
+            if self.context_sources is not None:
+                supporting = await self.context_sources.hydrate(selected_hits, scope, snapshot, batch.query_plan)
+            elif any(h.context_ref for h in selected_hits):
+                raise ValueError("context source hydration required")
+            batches.append(EvidenceBatch(query=batch.query, query_plan=batch.query_plan,
+                query_plan_ref=batch.query_plan_ref, query_plan_hash=batch.query_plan_hash,
+                parents=tuple(by_key[(p.parent_id, p.document_version_id)].model_copy(update={"child_hits": p.child_hits}) for p in selected),
                 document_ids=batch.document_ids, target_ids=(coverage_aliases or {}).get(result.origin_key, result.criterion_ids),
-                degraded_components=batch.degraded_components,
-            )
-            for result, batch, selected in selections
-        ]
+                degraded_components=batch.degraded_components, supporting_context=supporting))
         packed = self.builder.build(
             batches, [EvidenceCoverageTarget(target_id=c.id, description=c.description) for c in criteria],
             scope, snapshot, rank_across_batches=False, balance_targets=True,
         )
-        source_map = {
-            item.evidence_id: tuple(sources[(item.parent_id, item.document_version_id)])
-            for item in packed.items
-        }
-        candidate_map: dict[str, tuple[str, ...]] = {}
+        source_map, candidate_map = {}, {}
         for item in packed.items:
-            parent = by_key[(item.parent_id, item.document_version_id)]
-            for hit in parent.child_hits:
-                candidate_map[hit.child_id] = (*candidate_map.get(hit.child_id, ()), item.evidence_id)
+            child_ids = item.source_child_ids
+            if item.source_kind == "parent_chunk":
+                child_ids = tuple(h.child_id for h in by_key[(item.parent_id, item.document_version_id)].child_hits)
+            origins = tuple(dict.fromkeys(result.origin_key for result, batch, selected in selections
+                if any(h.child_id in child_ids for p in selected for h in p.child_hits)))
+            source_map[item.evidence_id] = origins
+            for child_id in child_ids:
+                candidate_map[child_id] = (*candidate_map.get(child_id, ()), item.evidence_id)
         covered = {target for item in packed.items for target in item.covered_target_ids}
         return PreparedBundle(
             packed=packed,
