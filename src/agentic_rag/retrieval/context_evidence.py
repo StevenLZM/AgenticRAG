@@ -211,6 +211,110 @@ class EvidenceRequirementResolver:
         return EvidenceRequirements(entries=tuple(entries))
 
 
+def parent_excerpt_range(parent_locator: str, child_locator: str, content: str):
+    """Resolve a Child's actual Parent offsets and pages from trusted Parent spans.
+
+    Opaque legacy locators can designate only the exact whole Parent. They do
+    not grant an invented Child offset or a first textual occurrence.
+    """
+    from agentic_rag.query.audit import _ast_locator_is_authorized
+
+    if not _ast_locator_is_authorized(parent_locator, child_locator):
+        raise ContextSourceViolation("Parent excerpt locator is outside source")
+    try:
+        parent = AstLocator.model_validate_json(parent_locator)
+        child = AstLocator.model_validate_json(child_locator)
+    except ValueError:
+        if parent_locator == child_locator:
+            return 0, len(content), None, None
+        raise ContextSourceViolation("Parent excerpt has no verified coordinates")
+    for span in child.spans:
+        matches = [
+            p
+            for p in parent.spans
+            if p.block_id == span.block_id
+            and p.canonical_path == span.canonical_path
+            and p.char_from <= span.char_from < span.char_to <= p.char_to
+            and p.parent_char_from
+            <= span.parent_char_from
+            < span.parent_char_to
+            <= p.parent_char_to
+        ]
+        if not matches or not any(
+            (p.page_from, p.page_to) == (span.page_from, span.page_to) for p in matches
+        ):
+            raise ContextSourceViolation(
+                "Parent excerpt pages differ from original spans"
+            )
+        # Ordinary spans have an exact affine map between canonical and Parent
+        # offsets. Table header repetition has its own chunker mapping; current
+        # Parent bounds and original page metadata still constrain those rows.
+        if not any(
+            p.table_header_row_to
+            or (
+                span.char_from - p.char_from
+                == span.parent_char_from - p.parent_char_from
+                and span.char_to - p.char_from
+                == span.parent_char_to - p.parent_char_from
+            )
+            for p in matches
+        ):
+            raise ContextSourceViolation("Parent excerpt coordinates disagree")
+    start = child.parent_char_from - parent.parent_char_from
+    end = child.parent_char_to - parent.parent_char_from
+    if not 0 <= start < end <= len(content):
+        raise ContextSourceViolation("Parent excerpt range is outside original bytes")
+    return (
+        start,
+        end,
+        min(span.page_from for span in child.spans),
+        max(span.page_to for span in child.spans),
+    )
+
+
+def reconstruct_parent_excerpt(entry, parent):
+    """Return authenticated crop bytes; neither the frozen hash nor length is authority."""
+    from agentic_rag.query.evidence_builder import _crop_around_child, _crop_bounds
+
+    locator = (
+        parent.ast_locator.model_dump_json()
+        if isinstance(parent.ast_locator, AstLocator)
+        else parent.ast_locator
+    )
+    start, end, page_from, page_to = parent_excerpt_range(
+        locator, entry.ast_locator, parent.content
+    )
+    if (
+        entry.heading_path != tuple(parent.heading_path)
+        or entry.parent_excerpt_length is None
+    ):
+        raise ContextSourceViolation(
+            "Parent excerpt heading/length differs from original"
+        )
+    content = _crop_around_child(
+        parent.content, "", entry.parent_excerpt_length, anchor_offset=start
+    )
+    crop_from, crop_to = _crop_bounds(
+        parent.content, entry.parent_excerpt_length, start
+    )
+    if (
+        len(content) != entry.parent_excerpt_length
+        or text_sha256(content) != entry.content_hash
+        or not crop_from <= start < end <= crop_to
+    ):
+        raise ContextSourceViolation(
+            "Parent excerpt differs from authoritative original content"
+        )
+    return dict(
+        verified_content=content,
+        verified_heading_path=tuple(parent.heading_path),
+        verified_page_from=page_from,
+        verified_page_to=page_to,
+        content_hash=entry.content_hash,
+        parent_excerpt_length=entry.parent_excerpt_length,
+    )
+
+
 class ContextSourceHydrator:
     def __init__(
         self,
@@ -396,15 +500,59 @@ class ContextSourceHydrator:
             != {members[cid] for cid in entry.source_child_ids}
         ):
             raise ContextSourceViolation("parent context members differ")
+        locator = AstLocator.model_validate_json(entry.ast_locator)
+        anchor = next(
+            (
+                child
+                for child in parent.children
+                if child.id in entry.source_child_ids and child.ast_locator == locator
+            ),
+            None,
+        )
+        if anchor is None:
+            raise ContextSourceViolation(
+                "Parent locator differs from authoritative Child"
+            )
+        verified = reconstruct_parent_excerpt(entry, parent)
+        content = verified["verified_content"]
+        from agentic_rag.query.evidence_builder import _crop_bounds
+
+        anchor_offset = (
+            anchor.ast_locator.parent_char_from - parent.ast_locator.parent_char_from
+        )
+        crop_from, crop_to = _crop_bounds(
+            parent.content, entry.parent_excerpt_length, anchor_offset
+        )
+        for child in parent.children:
+            if child.id in entry.source_child_ids and not (
+                crop_from
+                <= child.ast_locator.parent_char_from
+                - parent.ast_locator.parent_char_from
+                < child.ast_locator.parent_char_to - parent.ast_locator.parent_char_from
+                <= crop_to
+            ):
+                raise ContextSourceViolation(
+                    "Parent crop drops selected Child coordinates"
+                )
         for source_ref in entry.support_source_refs:
             text = catalog.verify_source(source_ref)
-            if text not in parent.content or not any(
+            if text not in content or not any(
                 span.block_id == source_ref.block_id
                 and span.canonical_path == source_ref.canonical_path
                 and span.char_from
                 <= source_ref.char_from
                 < source_ref.char_to
                 <= span.char_to
+                and crop_from
+                <= span.parent_char_from
+                - parent.ast_locator.parent_char_from
+                + source_ref.char_from
+                - span.char_from
+                < span.parent_char_from
+                - parent.ast_locator.parent_char_from
+                + source_ref.char_to
+                - span.char_from
+                <= crop_to
                 for span in parent.ast_locator.spans
             ):
                 raise ContextSourceViolation(
@@ -433,6 +581,7 @@ class ContextSourceHydrator:
                 "parent support relation is outside accepted artifact"
             )
         return dict(
+            **verified,
             context_refs=entry.context_refs,
             build_fingerprint=entry.build_fingerprint,
             source_child_ids=entry.source_child_ids,
@@ -452,6 +601,7 @@ class ContextSourceHydrator:
         if (
             entry.build_fingerprint != manifest.build_fingerprint
             or entry.source_ref is None
+            or entry.heading_path != ()
         ):
             raise ContextSourceViolation("excerpt build/source mismatch")
         members = {
@@ -500,5 +650,9 @@ class ContextSourceHydrator:
             user_id=scope.user_id,
             index_generation=snapshot.index_generation,
             is_active=True,
+            verified_content=content,
+            verified_heading_path=(),
+            verified_page_from=entry.source_ref.page_from,
+            verified_page_to=entry.source_ref.page_to,
             **entry.model_dump(),
         )

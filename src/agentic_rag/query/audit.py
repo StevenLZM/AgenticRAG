@@ -116,7 +116,9 @@ class ParentRepositoryAuthorizationResolver:
                     result[evidence_id] = await self._context_sources.authorize(entry, scope, snapshot)
             else:
                 result[evidence_id] = dict(_parent_record(by_id.get(entry.parent_id), scope, snapshot))
-                if entry.context_refs:
+                if entry.schema_version == 2 and not entry.context_refs:
+                    result[evidence_id] = authorize_repository_parent_excerpt(entry, by_id.get(entry.parent_id), scope, snapshot)
+                elif entry.context_refs:
                     if self._context_sources is None:
                         result[evidence_id] = {}
                     else:
@@ -506,8 +508,19 @@ def _authorization_allows(
             and value.get("is_active") is True
             and all(value.get(key) == expected for key, expected in entry.model_dump().items()))
     if entry.context_refs and any(value.get(name) != getattr(entry, name) for name in
-                                  ("context_refs", "build_fingerprint", "source_child_ids", "support_source_refs", "supports_claim_ids")):
+                                  ("context_refs", "build_fingerprint", "source_child_ids", "support_source_refs", "supports_claim_ids", "content_hash", "parent_excerpt_length")):
         return False
+    if entry.schema_version == 2 and (
+        value.get("content_hash") != entry.content_hash
+        or value.get("parent_excerpt_length") != entry.parent_excerpt_length
+        or not isinstance(value.get("verified_content"), str)
+        or text_sha256(value["verified_content"]) != entry.content_hash
+    ):
+        return False
+    return _parent_identity_allows(value, entry, scope, snapshot)
+
+
+def _parent_identity_allows(value, entry, scope, snapshot):
     return (
         value.get("user_id") == scope.user_id
         and value.get("index_generation") == snapshot.index_generation
@@ -518,6 +531,16 @@ def _authorization_allows(
         and _heading_path_is_authorized(value.get("heading_path"), entry.heading_path)
         and _ast_locator_is_authorized(value.get("ast_locator"), entry.ast_locator)
     )
+
+
+def authorize_repository_parent_excerpt(entry, parent, scope, snapshot):
+    """Bind schema-v2 legacy Parent text to scoped repository bytes."""
+    from agentic_rag.retrieval.context_evidence import reconstruct_parent_excerpt
+    record = dict(_parent_record(parent, scope, snapshot))
+    if not _parent_identity_allows(record, entry, scope, snapshot):
+        raise ValueError("Parent source is outside current authorized scope")
+    record.update(reconstruct_parent_excerpt(entry, parent))
+    return record
 
 
 def _heading_path_is_authorized(value: object, expected: tuple[str, ...]) -> bool:

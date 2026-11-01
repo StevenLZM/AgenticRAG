@@ -637,7 +637,7 @@ def _validate_packed_inputs(
                 if item.schema_version == 2 and prior_item.schema_version == 2:
                     relations = {"supports_claim_ids", "support_source_refs", "source_child_ids", "context_refs"}
                     if prior_backed and backed and item.source_kind == "parent_chunk":
-                        relations.add("content_hash")
+                        relations.update({"content_hash", "parent_excerpt_length"})
                     if prior_manifest.model_dump(exclude=relations) != manifest.model_dump(exclude=relations):
                         raise ValueError("conflicting evidence metadata for evidence id")
                 elif prior_manifest != manifest:

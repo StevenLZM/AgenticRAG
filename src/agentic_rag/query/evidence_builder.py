@@ -51,6 +51,9 @@ class EvidenceManifestEntry(BaseModel):
     ast_locator: str
     heading_path: tuple[str, ...] = ()
     content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    parent_excerpt_length: int | None = Field(
+        default=None, ge=1, le=MAX_PACKED_EVIDENCE_TOKENS
+    )
     source_ref: CanonicalSourceRef | None = None
     build_fingerprint: str | None = None
     context_refs: tuple[ContextArtifactRef, ...] = ()
@@ -61,7 +64,8 @@ class EvidenceManifestEntry(BaseModel):
     @model_validator(mode="after")
     def source_contract(self):
         if self.schema_version == 1 and (
-            self.content_hash is not None
+            self.parent_excerpt_length is not None
+            or self.content_hash is not None
             or self.context_refs
             or self.source_ref is not None
             or self.build_fingerprint is not None
@@ -75,6 +79,10 @@ class EvidenceManifestEntry(BaseModel):
         if self.source_kind == "parent_chunk":
             if not self.parent_id or self.source_ref is not None:
                 raise ValueError("parent evidence requires real Parent identity")
+            if self.context_refs and self.parent_excerpt_length is None:
+                raise ValueError(
+                    "contextual Parent requires reproducible excerpt length"
+                )
         else:
             ref = self.source_ref
             if (
@@ -86,6 +94,7 @@ class EvidenceManifestEntry(BaseModel):
                 or not self.supports_claim_ids
                 or not self.source_child_ids
                 or self.support_source_refs
+                or self.parent_excerpt_length is not None
             ):
                 raise ValueError(
                     "canonical evidence requires source/build/support provenance"
@@ -106,6 +115,10 @@ class EvidenceItem(EvidenceManifestEntry):
 
     @model_validator(mode="after")
     def content_integrity(self):
+        if self.parent_excerpt_length is not None and self.parent_excerpt_length != len(
+            self.content
+        ):
+            raise ValueError("Parent excerpt length mismatch")
         if self.content_hash is not None and self.content_hash != text_sha256(
             self.content
         ):
@@ -470,6 +483,7 @@ class EvidenceBuilder:
                     ):
                         requirements[req.id] = req
         items, rendered, selected_sources = [], [], {}
+        included_excerpt_ids = set()
         gaps = set()
         support_tokens = 0
         counts = Counter()
@@ -527,7 +541,7 @@ class EvidenceBuilder:
             new_sources = [
                 source
                 for source in outside
-                if source.evidence_id not in selected_sources
+                if source.evidence_id not in included_excerpt_ids
             ]
             extra = [
                 EvidenceItem(
@@ -565,14 +579,41 @@ class EvidenceBuilder:
                 remaining = {target.target_id for target in targets} - target_covered
                 used = len("\n".join(rendered))
                 group_capacity = used + (capacity - used) // max(1, len(remaining))
+            from agentic_rag.retrieval.context_evidence import parent_excerpt_range
+
+            try:
+                selected_ranges = (
+                    [
+                        parent_excerpt_range(
+                            candidate.parent.ast_locator, h.ast_locator, parent_content
+                        )
+                        for h in candidate.parent.child_hits
+                    ]
+                    if candidate.parent.ast_locator
+                    else [(0, len(parent_content), None, None)]
+                )
+            except ValueError:
+                gaps.update(r.id for r in required)
+                continue
+            anchor_offset = selected_ranges[0][0]
             fitted = self._fit(
                 envelope,
                 (*rendered, *extra_rendered),
                 group_capacity,
                 candidate.parent.child_hits[0].content,
+                matching_child_offset=anchor_offset,
+            )
+            crop_range = (
+                _crop_bounds(parent_content, len(fitted[0]), anchor_offset)
+                if fitted
+                else (0, 0)
             )
             if (
                 fitted is None
+                or any(
+                    not crop_range[0] <= start < end <= crop_range[1]
+                    for start, end, _, _ in selected_ranges
+                )
                 or any(h.content not in fitted[0] for h in candidate.parent.child_hits)
                 or any(s.content not in fitted[0] for s in same)
             ):
@@ -584,6 +625,7 @@ class EvidenceBuilder:
                     "schema_version": 2,
                     "content": fitted[0],
                     "content_hash": text_sha256(fitted[0]),
+                    "parent_excerpt_length": len(fitted[0]),
                     "source_child_ids": tuple(sorted(children)),
                     "context_refs": tuple(
                         dict.fromkeys(
@@ -602,7 +644,11 @@ class EvidenceBuilder:
                     ),
                     "supports_claim_ids": tuple(
                         dict.fromkeys(
-                            cid for source in same for cid in source.supports_claim_ids
+                            cid
+                            for source in same
+                            for requirement in required
+                            if source.source_ref in requirement.source_refs
+                            for cid in requirement.claim_ids
                         )
                     ),
                     "support_source_refs": tuple(source.source_ref for source in same),
@@ -611,6 +657,7 @@ class EvidenceBuilder:
             items.extend((item, *extra))
             rendered.extend((self._render_item(item), *extra_rendered))
             selected_sources.update((s.evidence_id, s) for s in needed)
+            included_excerpt_ids.update(source.evidence_id for source in new_sources)
             support_tokens += extra_cost
             counts[item.document_id] += 1
             target_covered.update(item.covered_target_ids)
@@ -806,6 +853,8 @@ class EvidenceBuilder:
         rendered: Sequence[str],
         capacity: int,
         matching_child_content: str,
+        *,
+        matching_child_offset: int | None = None,
     ) -> tuple[str, str] | None:
         separator = "\n" if rendered else ""
         existing = "\n".join(rendered)
@@ -818,7 +867,10 @@ class EvidenceBuilder:
         while low <= high:
             length = (low + high) // 2
             cropped = _crop_around_child(
-                envelope.content, matching_child_content, length
+                envelope.content,
+                matching_child_content,
+                length,
+                anchor_offset=matching_child_offset,
             )
             candidate = envelope.model_copy(update={"content": cropped}).render()
             if _estimate_tokens(f"{existing}{separator}{candidate}") <= capacity:
@@ -864,23 +916,41 @@ def _has_usable_content(content: str) -> bool:
     return any(character not in {"…", " ", "\n", "\r", "\t"} for character in content)
 
 
-def _crop_around_child(content: str, child_content: str, limit: int = 1_200) -> str:
-    """Deterministically preserve a matching child passage when clipping a parent."""
+def _crop_bounds(content: str, limit: int, position: int) -> tuple[int, int]:
+    if len(content) <= limit:
+        return 0, len(content)
+    start = max(0, position - limit // 2)
+    end = min(len(content), start + limit)
+    start = max(0, end - limit)
+    available = max(0, limit - int(start > 0) - int(end < len(content)))
+    if end < len(content):
+        end = min(len(content), start + available)
+    else:
+        start = max(start, end - available)
+    return start, end
+
+
+def _crop_around_child(
+    content: str,
+    child_content: str,
+    limit: int = 1_200,
+    *,
+    anchor_offset: int | None = None,
+) -> str:
+    """Contextual crops use verified coordinates; legacy callers retain text lookup."""
     if limit < 1:
         return ""
     if len(content) <= limit:
         return content
-    position = content.find(child_content) if child_content else len(content) // 2
-    if position < 0:
-        position = len(content) // 2
-    start = max(0, position - limit // 2)
-    end = min(len(content), start + limit)
-    start = max(0, end - limit)
-    prefix = "…" if start else ""
-    suffix = "…" if end < len(content) else ""
-    available = max(0, limit - len(prefix) - len(suffix))
-    end = min(len(content), start + available)
-    return f"{prefix}{content[start:end]}{suffix}"
+    position = anchor_offset
+    if position is None:
+        position = content.find(child_content) if child_content else len(content) // 2
+        if position < 0:
+            position = len(content) // 2
+    start, end = _crop_bounds(content, limit, position)
+    return (
+        f"{'…' if start else ''}{content[start:end]}{'…' if end < len(content) else ''}"
+    )
 
 
 def _estimate_tokens(text: str) -> int:

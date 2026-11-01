@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from agentic_rag.domain.chat_sessions import SessionNotFound
 from agentic_rag.domain.models import RunStatus, UserScope
 from agentic_rag.persistence.chat_sessions import SqlAlchemyChatSessionRepository
-from agentic_rag.persistence.repositories import SqlAlchemyRunRepository
-from agentic_rag.query.answer_sources import AnswerSources, cited_ids, within_budget
+from agentic_rag.persistence.repositories import SqlAlchemyRunRepository, SqlAlchemyParentRepository
+from agentic_rag.query.answer_sources import AnswerSources, cited_ids, within_budget, source_snapshot_matches_verified
 from agentic_rag.query.public_answer import project_public_answer
 
 
@@ -36,9 +36,10 @@ class SourceView(BaseModel):
 
 
 class ChatSourceService:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, context_sources=None):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, context_sources=None, parent_repository_factory=SqlAlchemyParentRepository):
         self.session_factory = session_factory
         self.context_sources = context_sources
+        self.parent_repository_factory = parent_repository_factory
 
     async def get(self, scope: UserScope, session_id: str, run_id: str) -> SourceView:
         async with self.session_factory() as db:
@@ -82,16 +83,23 @@ class ChatSourceService:
                 if document is None:
                     continue
                 entry = source.source_provenance
-                if source.source_kind == "canonical_excerpt" or (entry is not None and entry.context_refs):
-                    if self.context_sources is None or entry is None:
+                if snapshot.schema_version == 2 or entry is not None or source.source_kind == "canonical_excerpt":
+                    if entry is None or ((source.source_kind == "canonical_excerpt" or entry.context_refs) and self.context_sources is None):
                         continue
                     from agentic_rag.runtime.models import RuntimeConfigSnapshot
                     try:
                         runtime_snapshot = RuntimeConfigSnapshot.model_validate(run.runtime_config_snapshot)
                         if source.source_kind == "canonical_excerpt":
-                            await self.context_sources.authorize(entry, scope, runtime_snapshot)
+                            authorization = await self.context_sources.authorize(entry, scope, runtime_snapshot)
+                        elif entry.context_refs:
+                            authorization = await self.context_sources.authorize_parent(entry, scope, runtime_snapshot)
                         else:
-                            await self.context_sources.authorize_parent(entry, scope, runtime_snapshot)
+                            from agentic_rag.query.audit import authorize_repository_parent_excerpt
+                            rows = await self.parent_repository_factory(db).get_many([entry.parent_id], scope)
+                            parent = next((row for row in rows if row.id == entry.parent_id), None)
+                            authorization = authorize_repository_parent_excerpt(entry, parent, scope, runtime_snapshot)
+                        if not source_snapshot_matches_verified(source, authorization):
+                            continue
                     except (ValueError, OSError, KeyError):
                         continue
                 items.append(

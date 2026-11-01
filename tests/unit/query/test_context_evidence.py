@@ -64,6 +64,8 @@ async def built(
     two_children=False,
     prefix_omit=False,
     all_support=False,
+    split_parents=False,
+    preserve_parent=False,
 ):
     from agentic_rag.ingestion.contextualization.service import (
         ContextualizationService,
@@ -97,7 +99,29 @@ async def built(
     )
     artifacts, ast, ref, parent, claim = setup(tmp_path, texts)
     if not same_parent:
+        full_parent = parent
         parent, _ = isolated_target(parent, len(texts) - 1, texts[-1])
+        if preserve_parent:
+            child = parent.children[0]
+            offset = len(full_parent.content) - len(child.content)
+            span = child.ast_locator.spans[0].model_copy(
+                update={
+                    "parent_char_from": offset,
+                    "parent_char_to": offset + len(child.content),
+                }
+            )
+            locator = child.ast_locator.model_copy(
+                update={
+                    "spans": (span,),
+                    "parent_char_from": offset,
+                    "parent_char_to": offset + len(child.content),
+                }
+            )
+            parent = full_parent.model_copy(
+                update={
+                    "children": (child.model_copy(update={"ast_locator": locator}),)
+                }
+            )
 
     if two_children:
         parent = parent.model_copy(
@@ -110,6 +134,29 @@ async def built(
                 )
             }
         )
+
+    parents = [parent]
+    if split_parents:
+        from tests.unit.ingestion.test_context_sources import _child
+        from agentic_rag.ingestion.chunker import ParentChunk
+
+        first_child = _child(*texts[:-1]).model_copy(update={"id": "first-child"})
+        first = ParentChunk(
+            **{
+                **first_child.model_dump(
+                    exclude={"parent_id", "parent_ordinal", "search_representation"}
+                ),
+                "id": first_child.parent_id,
+                "children": (first_child,),
+            }
+        )
+        second_child = parent.children[0].model_copy(
+            update={"id": "second-child", "parent_id": "parent-2"}
+        )
+        second = parent.model_copy(
+            update={"id": "parent-2", "children": (second_child,)}
+        )
+        parents = [first, second]
 
     class Model:
         async def extract(self, input):
@@ -153,7 +200,7 @@ async def built(
         count_model_tokens=lambda text, _: len(text),
     ).enrich(
         ast,
-        [parent],
+        parents,
         canonical_ref=ref,
         build=build,
         claim=claim,
@@ -162,8 +209,8 @@ async def built(
     manifest = VersionManifest(
         schema_version=2,
         canonical_ast_sha256=ref.sha256,
-        parent_count=1,
-        child_count=len(result.parents[0].children),
+        parent_count=len(result.parents),
+        child_count=sum(len(p.children) for p in result.parents),
         embedding_model="test",
         embedding_dimensions=1024,
         index_generation=SNAPSHOT.index_generation,
@@ -172,12 +219,13 @@ async def built(
         build_fingerprint=result.build_fingerprint,
         representation_version="context-v1",
         child_id_hash_digest=child_identity_digest(
-            [(c.id, c.content_hash) for c in result.parents[0].children]
+            [(c.id, c.content_hash) for p in result.parents for c in p.children]
         ),
         enrichment_counts={
             k: sum(
                 c.search_representation.enrichment_status == k
-                for c in result.parents[0].children
+                for p in result.parents
+                for c in p.children
             )
             for k in ("enriched", "partial", "structural_only")
         },
@@ -206,7 +254,7 @@ async def built(
         expected_representation_version="context-v1",
     )
     hits = []
-    for final_child in result.parents[0].children:
+    for final_child in (c for p in result.parents for c in p.children):
         embedded = replace(_embedded_child(), chunk=final_child)
         document = ElasticsearchChildIndexStore._document(_context(), embedded)
         hits.extend(
@@ -234,6 +282,20 @@ async def built(
     hydrator = ContextSourceHydrator(artifacts=artifacts, authority=authority)
     from agentic_rag.retrieval.models import ParentEvidence
 
+    if split_parents:
+        selected = tuple(
+            ParentEvidence(
+                parent_id=p.id,
+                document_id=p.document_id,
+                document_version_id=p.document_version_id,
+                content=p.content,
+                ast_locator=p.ast_locator.model_dump_json(),
+                heading_path=p.heading_path,
+                child_hits=tuple(h for h in hits if h.parent_id == p.id),
+            )
+            for p in result.parents
+        )
+        return hydrator, authority, hits, selected
     parent_evidence = ParentEvidence(
         parent_id=parent.id,
         document_id=parent.document_id,
@@ -949,7 +1011,23 @@ async def test_full_retrieval_entry_uses_shared_original_source_service(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(tmp_path):
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        None,
+        "full",
+        "truncated",
+        "heading",
+        "page",
+        "flags",
+        "missing_provenance",
+        "valid_prefix",
+    ],
+)
+@pytest.mark.parametrize("source_mode", ["contextual", "legacy_v2"])
+async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(
+    tmp_path, tamper, source_mode
+):
     from sqlalchemy import insert, update
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
     from agentic_rag.persistence.repositories import (
@@ -965,8 +1043,43 @@ async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(tmp_
     from datetime import UTC, datetime
     from uuid import uuid4
 
-    hydrator, authority, hit, parent = await built(tmp_path / "artifacts")
-    packed = await pack(hydrator, hit, parent)
+    if source_mode == "legacy_v2":
+        from agentic_rag.retrieval.models import ChildHit, EvidenceBatch
+        from agentic_rag.query.evidence_builder import EvidenceBuilder
+
+        hydrator, authority, hit, parent = await built(
+            tmp_path / "artifacts",
+            structural=True,
+            texts=("星河公司普通员工上海标准500一晚。",),
+        )
+        legacy = ChildHit(
+            **{
+                name: getattr(hit, name)
+                for name in (
+                    "child_id",
+                    "parent_id",
+                    "user_id",
+                    "document_id",
+                    "document_version_id",
+                    "content",
+                    "ast_locator",
+                    "lane",
+                    "lane_rank",
+                    "retrieval_score",
+                )
+            }
+        )
+        parent = parent.model_copy(update={"child_hits": (legacy,)})
+        packed = EvidenceBuilder().build(
+            [EvidenceBatch(query="q", query_plan=await plan(), parents=(parent,))],
+            (),
+            SCOPE,
+            SNAPSHOT,
+        )
+        assert packed.items and not packed.items[0].context_refs
+    else:
+        hydrator, authority, hit, parent = await built(tmp_path / "artifacts")
+        packed = await pack(hydrator, hit, parent)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/chat.db")
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
@@ -1013,6 +1126,48 @@ async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(tmp_
         await db.execute(
             update(documents).values(active_version_id=parent.document_version_id)
         )
+        if source_mode == "legacy_v2":
+            from agentic_rag.persistence.repositories import parent_chunks
+            from agentic_rag.models.contextual import text_sha256
+
+            await db.execute(
+                insert(parent_chunks).values(
+                    id=parent.parent_id,
+                    user_id=SCOPE.user_id,
+                    document_id=parent.document_id,
+                    document_version_id=parent.document_version_id,
+                    ordinal=0,
+                    heading_path=list(parent.heading_path),
+                    content_type="text",
+                    content=parent.content,
+                    ast_locator=parent.ast_locator,
+                    content_hash=text_sha256(parent.content),
+                    status="active",
+                )
+            )
+            from agentic_rag.orchestration.authorization import (
+                authorize_sources,
+                SourceAccessRevoked,
+            )
+
+            proof_run = dict(
+                user_id=SCOPE.user_id,
+                data=dict(
+                    enforce_source_access=False,
+                    snapshot=SNAPSHOT.model_dump(mode="json"),
+                ),
+            )
+            await authorize_sources(
+                db, proof_run, [i.model_dump(mode="json") for i in packed.items]
+            )
+            bad = packed.items[0].model_dump(mode="json")
+            bad.update(
+                content="forged",
+                content_hash=text_sha256("forged"),
+                parent_excerpt_length=6,
+            )
+            with pytest.raises(SourceAccessRevoked):
+                await authorize_sources(db, proof_run, [bad])
         await db.execute(
             update(agent_runs)
             .where(agent_runs.c.id == run.id)
@@ -1028,9 +1183,39 @@ async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(tmp_
     assert view.status == "available"
     assert {
         s.page_from for s in view.items if s.source_kind == "canonical_excerpt"
-    } == {1, 2}
+    } == ({1, 2} if source_mode == "contextual" else set())
     assert all("source_provenance" not in s.model_dump() for s in view.items)
+    if tamper:
+        changed = sources.model_dump(mode="json")
+        for item in changed["items"]:
+            if tamper in {"full", "truncated"}:
+                item.update(
+                    excerpt="伪造：本公司99999一晚。", truncated=tamper == "truncated"
+                )
+            elif tamper == "missing_provenance":
+                item["source_provenance"] = None
+            elif tamper == "heading":
+                item.update(heading_path=["伪造适用范围"], heading_truncated=True)
+            elif tamper == "page":
+                item.update(page_from=99, page_to=99)
+            elif tamper == "flags":
+                item.update(truncated=True, excerpt_omitted=True)
+            else:
+                item.update(excerpt=item["excerpt"][:3], truncated=True)
+        async with factory.begin() as db:
+            await db.execute(
+                update(agent_runs)
+                .where(agent_runs.c.id == run.id)
+                .values(answer_sources=changed)
+            )
+        changed_view = await reader.get(SCOPE, session.id, run.id)
+        assert changed_view.status == (
+            "available" if tamper == "valid_prefix" else "unavailable"
+        )
     authority.revoked = True
+    if source_mode == "legacy_v2":
+        async with factory.begin() as db:
+            await db.execute(update(documents).values(deletion_status="pending"))
     view = await reader.get(SCOPE, session.id, run.id)
     assert view.status == "unavailable" and not view.items
     await engine.dispose()
@@ -1146,3 +1331,283 @@ async def test_complete_verifier_closure_obeys_four_source_cap(tmp_path, count):
         assert len(packed.items) == 5 and not packed.scope_evidence_missing
     else:
         assert not packed.items and packed.scope_evidence_missing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["body", "heading", "locator"])
+async def test_reauthorization_binds_parent_body_and_metadata(tmp_path, damage):
+    from agentic_rag.query.evidence_builder import (
+        EvidenceItem,
+        EvidenceManifestEntry,
+        evidence_projection,
+    )
+    from agentic_rag.models.contextual import text_sha256
+    from agentic_rag.orchestration.authorization import (
+        authorize_sources,
+        SourceAccessRevoked,
+    )
+
+    hydrator, _, hit, parent = await built(tmp_path)
+    packed = await pack(hydrator, hit, parent)
+    body = packed.items[0]
+    changes = (
+        {
+            "content": "上海标准99999一晚。",
+            "content_hash": text_sha256("上海标准99999一晚。"),
+            "parent_excerpt_length": len("上海标准99999一晚。"),
+        }
+        if damage == "body"
+        else {"heading_path": ("伪造章节",)}
+        if damage == "heading"
+        else {"ast_locator": "forged-locator"}
+    )
+    forged = EvidenceItem(**{**body.model_dump(), **changes})
+    entry = EvidenceManifestEntry(**evidence_projection(forged))
+    with pytest.raises(ValueError):
+        await hydrator.authorize_parent(entry, SCOPE, SNAPSHOT)
+    run = dict(
+        user_id=SCOPE.user_id,
+        data=dict(
+            enforce_source_access=False, snapshot=SNAPSHOT.model_dump(mode="json")
+        ),
+    )
+    with pytest.raises(SourceAccessRevoked):
+        await authorize_sources(
+            None, run, [forged.model_dump(mode="json")], context_sources=hydrator
+        )
+    from agentic_rag.query.audit import (
+        CitationValidator,
+        ParentRepositoryAuthorizationResolver,
+    )
+    from agentic_rag.query.generation import AnswerDraft, AnswerSegment
+    from types import SimpleNamespace
+
+    class Parents:
+        async def get_many(self, ids, scope):
+            return [
+                SimpleNamespace(
+                    id=parent.parent_id,
+                    user_id=SCOPE.user_id,
+                    status="active",
+                    index_generation=SNAPSHOT.index_generation,
+                    document_id=parent.document_id,
+                    document_version_id=parent.document_version_id,
+                    ast_locator=parent.ast_locator,
+                    heading_path=parent.heading_path,
+                )
+            ]
+
+    forged_pack = packed.model_copy(
+        update={
+            "items": (forged, *packed.items[1:]),
+            "manifest": {**packed.manifest, body.evidence_id: entry},
+        }
+    )
+    draft = AnswerDraft(
+        segments=(
+            AnswerSegment(
+                kind="content", text="99999", evidence_ids=tuple(packed.manifest)
+            ),
+        )
+    )
+    validation = await CitationValidator().validate_async(
+        draft,
+        forged_pack,
+        SCOPE,
+        SNAPSHOT,
+        {},
+        authorization_resolver=ParentRepositoryAuthorizationResolver(
+            Parents(), context_sources=hydrator
+        ),
+    )
+    assert not validation.passed
+
+
+@pytest.mark.asyncio
+async def test_two_real_parents_share_source_without_foreign_local_relations(tmp_path):
+    from agentic_rag.query.evidence_builder import EvidenceBuilder, support_links
+    from agentic_rag.retrieval.models import EvidenceBatch
+
+    hydrator, _, hits, parents = await built(tmp_path, split_parents=True)
+    supporting = await hydrator.hydrate(hits, SCOPE, SNAPSHOT, await plan())
+    packed = EvidenceBuilder().build(
+        [EvidenceBatch(query="q", parents=parents, supporting_context=supporting)],
+        (),
+        SCOPE,
+        SNAPSHOT,
+    )
+    assert len([i for i in packed.items if i.source_kind == "parent_chunk"]) == 2
+    for entry in packed.manifest.values():
+        if entry.source_kind == "parent_chunk":
+            await hydrator.authorize_parent(entry, SCOPE, SNAPSHOT)
+        else:
+            await hydrator.authorize(entry, SCOPE, SNAPSHOT)
+    links = support_links(packed)
+    second = next(i for i in packed.items if i.parent_id == "parent-2")
+    assert links[second.evidence_id]
+    assert all(
+        packed.manifest[eid].source_kind == "canonical_excerpt"
+        for eid in links[second.evidence_id]
+    )
+    from agentic_rag.orchestration.authorization import authorize_sources
+
+    run = dict(
+        user_id=SCOPE.user_id,
+        data=dict(
+            enforce_source_access=False, snapshot=SNAPSHOT.model_dump(mode="json")
+        ),
+    )
+    await authorize_sources(
+        None,
+        run,
+        [i.model_dump(mode="json") for i in packed.items],
+        context_sources=hydrator,
+    )
+    small = EvidenceBuilder().build(
+        [EvidenceBatch(query="q", parents=parents, supporting_context=supporting)],
+        (),
+        SCOPE,
+        SNAPSHOT,
+        max_tokens=600,
+    )
+    assert all(i.parent_id != "parent-2" for i in small.items)
+    assert small.scope_evidence_missing
+
+
+@pytest.mark.asyncio
+async def test_authoritative_parent_reconstruction_accepts_legal_crop_and_rejects_modified_crop(
+    tmp_path,
+):
+    from agentic_rag.models.contextual import text_sha256
+    from agentic_rag.query.evidence_builder import (
+        EvidenceItem,
+        EvidenceManifestEntry,
+        evidence_projection,
+    )
+    from agentic_rag.query.answer_sources import (
+        build_answer_sources,
+        source_snapshot_matches_verified,
+    )
+    from tests.unit.query.test_answer_sources import answer
+
+    hydrator, _, hit, parent = await built(
+        tmp_path,
+        structural=True,
+        preserve_parent=True,
+        texts=("背景原文。" * 200, "上海标准500一晚。"),
+    )
+    packed = await pack(hydrator, hit, parent, budget=400)
+    assert len(packed.items) == 1
+    item = packed.items[0]
+    assert hit.content in item.content and len(item.content) < len(parent.content)
+    authorized = await hydrator.authorize_parent(
+        packed.manifest[item.evidence_id], SCOPE, SNAPSHOT
+    )
+    assert authorized["verified_content"] == item.content
+    public = build_answer_sources(
+        answer((item.evidence_id,)),
+        packed,
+        run_id="r",
+        snapshot_id=SNAPSHOT.snapshot_id,
+    )
+    assert source_snapshot_matches_verified(public.items[0], authorized)
+    bad_content = item.content.replace("500", "999")
+    bad = EvidenceItem(
+        **{
+            **item.model_dump(),
+            "content": bad_content,
+            "content_hash": text_sha256(bad_content),
+        }
+    )
+    with pytest.raises(ValueError, match="original content"):
+        await hydrator.authorize_parent(
+            EvidenceManifestEntry(**evidence_projection(bad)), SCOPE, SNAPSHOT
+        )
+
+
+@pytest.mark.asyncio
+async def test_repeated_child_text_crop_uses_actual_authorized_locator(tmp_path):
+    hydrator, _, hit, parent = await built(
+        tmp_path,
+        structural=True,
+        preserve_parent=True,
+        texts=("上海标准500一晚。", "背景。" * 250, "上海标准500一晚。"),
+    )
+    packed = await pack(hydrator, hit, parent, budget=400)
+    assert packed.items and packed.items[0].content.startswith("…")
+    assert packed.items[0].content.endswith(hit.content)
+    verified = await hydrator.authorize_parent(
+        packed.manifest[packed.items[0].evidence_id], SCOPE, SNAPSHOT
+    )
+    assert verified["verified_content"] == packed.items[0].content
+
+
+@pytest.mark.asyncio
+async def test_schema2_legacy_parent_original_bytes_are_reauthorized_without_context_artifact(
+    tmp_path,
+):
+    from agentic_rag.query.audit import ParentRepositoryAuthorizationResolver
+    from agentic_rag.query.evidence_builder import EvidenceBuilder
+    from agentic_rag.retrieval.models import EvidenceBatch, ChildHit
+    from agentic_rag.models.contextual import text_sha256
+    from types import SimpleNamespace
+
+    _, _, contextual_hit, parent = await built(
+        tmp_path, structural=True, texts=("星河公司普通员工上海标准500一晚。",)
+    )
+    legacy = ChildHit(
+        **{
+            name: getattr(contextual_hit, name)
+            for name in (
+                "child_id",
+                "parent_id",
+                "user_id",
+                "document_id",
+                "document_version_id",
+                "content",
+                "ast_locator",
+                "lane",
+                "lane_rank",
+                "retrieval_score",
+            )
+        }
+    )
+    packed = EvidenceBuilder().build(
+        [
+            EvidenceBatch(
+                query="q",
+                query_plan=await plan(),
+                parents=(parent.model_copy(update={"child_hits": (legacy,)}),),
+            )
+        ],
+        (),
+        SCOPE,
+        SNAPSHOT,
+    )
+    item = packed.items[0]
+    assert item.schema_version == 2 and not item.context_refs
+
+    class Parents:
+        async def get_many(self, ids, scope):
+            return [
+                SimpleNamespace(
+                    id=parent.parent_id,
+                    user_id=SCOPE.user_id,
+                    document_id=parent.document_id,
+                    document_version_id=parent.document_version_id,
+                    status="active",
+                    content=parent.content,
+                    ast_locator=parent.ast_locator,
+                    heading_path=parent.heading_path,
+                    index_generation=SNAPSHOT.index_generation,
+                )
+            ]
+
+    resolver = ParentRepositoryAuthorizationResolver(Parents())
+    verified = await resolver.resolve(packed.manifest, SCOPE, SNAPSHOT)
+    assert verified[item.evidence_id]["verified_content"] == item.content
+    entry = packed.manifest[item.evidence_id].model_copy(
+        update={"content_hash": text_sha256("forged")}
+    )
+    with pytest.raises(ValueError):
+        await resolver.resolve({item.evidence_id: entry}, SCOPE, SNAPSHOT)

@@ -87,6 +87,34 @@ class AnswerSources(BaseModel):
         return self
 
 
+def bounded_source_heading(heading_path: tuple[str, ...]) -> tuple[str, ...]:
+    headings, remaining = [], 128
+    for heading in heading_path[:16]:
+        if remaining <= 0:
+            break
+        headings.append(heading[:remaining])
+        remaining -= len(headings[-1])
+    return tuple(headings)
+
+
+def source_snapshot_matches_verified(source: AnswerSource, authorization: dict) -> bool:
+    """A valid manifest cannot authenticate separately stored display text."""
+    content = authorization.get("verified_content")
+    headings = authorization.get("verified_heading_path")
+    if not isinstance(content, str) or not isinstance(headings, tuple):
+        return False
+    return (
+        source.excerpt == content[:len(source.excerpt)]
+        and len(source.excerpt) <= len(content)
+        and source.truncated == (len(source.excerpt) < len(content))
+        and source.excerpt_omitted == (bool(content) and not source.excerpt)
+        and source.heading_path == bounded_source_heading(headings)
+        and source.heading_truncated == (source.heading_path != headings)
+        and source.page_from == authorization.get("verified_page_from")
+        and source.page_to == authorization.get("verified_page_to")
+    )
+
+
 def within_budget(value: dict) -> bool:
     return (
         max(
@@ -130,12 +158,7 @@ def build_answer_sources(
                 or not matches_manifest(item, manifest)
             ):
                 raise InvalidAnswerSources("packed evidence and manifest disagree")
-            headings, remaining = [], 128
-            for heading in item.heading_path[:16]:
-                if remaining <= 0:
-                    break
-                headings.append(heading[:remaining])
-                remaining -= len(headings[-1])
+            headings = bounded_source_heading(item.heading_path)
             pages: tuple[int | None, int | None] = (None, None)
             try:
                 locator = AstLocator.model_validate_json(item.ast_locator)
@@ -168,7 +191,7 @@ def build_answer_sources(
                 contents.append(item.content)
         # Reserve all bounded metadata before allocating text in citation order.
         candidate = dict(
-            schema_version=2 if any(s["source_kind"] == "canonical_excerpt" for s in sources) else 1,
+            schema_version=2 if any(s["source_provenance"] is not None for s in sources) else 1,
             run_id=run_id,
             runtime_config_snapshot_id=snapshot_id,
             items=sources,
