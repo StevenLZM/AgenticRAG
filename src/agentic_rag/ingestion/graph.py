@@ -23,6 +23,12 @@ from agentic_rag.ingestion.assembler import (
     GlobalAssembler,
 )
 from agentic_rag.ingestion.chunker import ChunkingPipeline, ParentChunk
+from agentic_rag.ingestion.contextualization.service import (
+    ContextualizationService,
+    ContextBuildConfig,
+    digest,
+)
+from agentic_rag.models.contextual import ContextArtifactRef
 from agentic_rag.ingestion.indexer import IndexWriter, StagingContext
 from agentic_rag.ingestion.parser import DocumentParser
 from agentic_rag.ingestion.publisher import VersionPublisher
@@ -73,6 +79,14 @@ class IngestionPipeline(Protocol):
         canonical: ArtifactPointer,
     ) -> ArtifactPointer: ...
 
+    async def contextualize(
+        self,
+        claim: IngestionJobClaim,
+        runtime: IngestionRuntime,
+        canonical: ArtifactPointer,
+        chunks: ArtifactPointer,
+    ) -> dict[str, Any]: ...
+
     async def embed_and_stage(
         self,
         claim: IngestionJobClaim,
@@ -100,8 +114,19 @@ class IngestionGraph:
         *,
         pipeline: IngestionPipeline,
         checkpointer: BaseCheckpointSaver[str],
+        contextualization_enabled: bool = False,
     ) -> None:
         self._pipeline = pipeline
+        self._contextualization_enabled = contextualization_enabled
+        self._context_config_hash = (
+            getattr(pipeline, "context_config_hash", None)
+            if contextualization_enabled
+            else None
+        )
+        if contextualization_enabled and self._context_config_hash is None:
+            raise ValueError(
+                "enabled context graph requires a frozen context build configuration"
+            )
         builder = StateGraph(IngestionState)
         builder.add_node("load_job", self._load_job)
         builder.add_node("upload_safety_gate", self._upload_safety_gate)
@@ -124,7 +149,12 @@ class IngestionGraph:
             {"continue": "validate_canonical", "terminal": "finalize"},
         )
         builder.add_edge("validate_canonical", "chunk")
-        builder.add_edge("chunk", "embed_and_stage")
+        if contextualization_enabled:
+            builder.add_node("contextualize", self._contextualize)
+            builder.add_edge("chunk", "contextualize")
+            builder.add_edge("contextualize", "embed_and_stage")
+        else:
+            builder.add_edge("chunk", "embed_and_stage")
         builder.add_edge("embed_and_stage", "publish")
         builder.add_edge("publish", "finalize")
         builder.add_edge("finalize", END)
@@ -135,6 +165,14 @@ class IngestionGraph:
     async def run(self, claim: IngestionJobClaim) -> dict[str, object]:
         config = self._config(claim.job_id)
         snapshot = await self.compiled.aget_state(config)
+        if snapshot.values and (
+            snapshot.values.get("contextualization_enabled", False)
+            != self._contextualization_enabled
+            or snapshot.values.get("context_config_hash") != self._context_config_hash
+        ):
+            raise DeterministicIngestionError(
+                "checkpoint requires its original context graph/configuration"
+            )
         if snapshot.next:
             await self.compiled.aupdate_state(
                 config,
@@ -146,6 +184,8 @@ class IngestionGraph:
             result = await self.compiled.ainvoke(None, config)
         else:
             initial: IngestionState = {
+                "contextualization_enabled": self._contextualization_enabled,
+                "context_config_hash": self._context_config_hash,
                 "job_id": claim.job_id,
                 "user_id": claim.user_id,
                 "document_id": claim.document_id,
@@ -269,13 +309,25 @@ class IngestionGraph:
             "completed_nodes": self._done(state, "chunk"),
         }
 
+    async def _contextualize(self, state: IngestionState) -> dict[str, Any]:
+        await self._pipeline.assert_lease(self._claim(state))
+        result = await self._pipeline.contextualize(
+            self._claim(state),
+            self._runtime(state),
+            ArtifactPointer.model_validate(state["canonical_ref"]),
+            ArtifactPointer.model_validate(state["chunks_ref"]),
+        )
+        return {**result, "completed_nodes": self._done(state, "contextualize")}
+
     async def _embed_and_stage(self, state: IngestionState) -> dict[str, Any]:
         await self._pipeline.assert_lease(self._claim(state))
         manifest_hash = await self._pipeline.embed_and_stage(
             self._claim(state),
             self._runtime(state),
             ArtifactPointer.model_validate(state["canonical_ref"]),
-            ArtifactPointer.model_validate(state["chunks_ref"]),
+            ArtifactPointer.model_validate(
+                state.get("enriched_chunks_ref", state["chunks_ref"])
+            ),
         )
         return {
             "manifest_hash": manifest_hash,
@@ -320,6 +372,8 @@ class DefaultIngestionPipeline:
         chunker: ChunkingPipeline,
         index_writer: IndexWriter,
         publisher: VersionPublisher,
+        contextualizer: ContextualizationService | None = None,
+        context_build: ContextBuildConfig | None = None,
     ) -> None:
         self._jobs = jobs
         self._artifacts = artifacts
@@ -330,6 +384,15 @@ class DefaultIngestionPipeline:
         self._chunker = chunker
         self._index_writer = index_writer
         self._publisher = publisher
+        self._contextualizer = contextualizer
+        self._context_build = context_build
+        if (contextualizer is None) != (context_build is None):
+            raise ValueError(
+                "contextualizer and context build must be supplied together"
+            )
+        self.context_config_hash = (
+            digest(context_build.model_dump(mode="json")) if context_build else None
+        )
 
     async def assert_lease(self, claim: IngestionJobClaim) -> None:
         await self._jobs.assert_lease(claim)
@@ -455,6 +518,27 @@ class DefaultIngestionPipeline:
         )
         return _pointer(ref)
 
+    async def contextualize(self, claim, runtime, canonical, chunks) -> dict[str, Any]:
+        if self._contextualizer is None or self._context_build is None:
+            raise DeterministicIngestionError("context pipeline is not configured")
+        ast = await self._read_canonical(canonical)
+        payload = await asyncio.to_thread(self._artifacts.read_json, _artifact(chunks))
+        parents = tuple(ParentChunk.model_validate(p) for p in payload["parents"])
+        result = await self._contextualizer.enrich(
+            ast,
+            parents,
+            canonical_ref=ContextArtifactRef(**canonical.model_dump()),
+            build=self._context_build,
+            claim=claim,
+            before_side_effect=lambda: self._jobs.assert_lease(claim),
+        )
+        return {
+            "context_map_ref": result.context_map_ref.model_dump(mode="json"),
+            "context_artifact_ref": result.context_artifact_ref.model_dump(mode="json"),
+            "enriched_chunks_ref": result.enriched_chunks_ref.model_dump(mode="json"),
+            "context_build_fingerprint": result.build_fingerprint,
+        }
+
     async def embed_and_stage(
         self,
         claim: IngestionJobClaim,
@@ -468,6 +552,14 @@ class DefaultIngestionPipeline:
         ):
             raise DeterministicIngestionError("chunk Artifact has an invalid shape")
         parents = [ParentChunk.model_validate(value) for value in payload["parents"]]
+        context_kwargs = {}
+        if "context_artifact_ref" in payload:
+            context_kwargs = {
+                "context_artifact_ref": ContextArtifactRef.model_validate(
+                    payload["context_artifact_ref"]
+                ),
+                "enriched_chunks_ref": ContextArtifactRef(**chunks.model_dump()),
+            }
         manifest = await self._index_writer.stage(
             parents,
             context=StagingContext(
@@ -480,6 +572,7 @@ class DefaultIngestionPipeline:
                 index_generation=runtime.index_generation,
             ),
             canonical_ast=_artifact(canonical),
+            **context_kwargs,
             before_side_effect=lambda: self._jobs.assert_lease(claim),
         )
         return manifest.manifest_hash

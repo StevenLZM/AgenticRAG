@@ -11,7 +11,12 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agentic_rag.ingestion.chunker import ChildChunk, ParentChunk
-from agentic_rag.ingestion.manifest import VersionManifest
+from agentic_rag.ingestion.manifest import (
+    VersionManifest,
+    child_identity_digest,
+    validate_context_artifacts,
+)
+from agentic_rag.models.contextual import ContextArtifactRef
 from agentic_rag.models.embeddings import EmbeddingPort
 from agentic_rag.models.indexing import validate_index_generation
 from agentic_rag.persistence.artifacts import ArtifactRef, ArtifactStore
@@ -164,7 +169,11 @@ class IndexWriter:
         self._artifacts = artifacts
         self._embedding_batch_size = embedding_batch_size
         self._embedding_dimensions = embedding_dimensions
-        if not embedding_model or len(embedding_model) > 255 or any(c.isspace() for c in embedding_model):
+        if (
+            not embedding_model
+            or len(embedding_model) > 255
+            or any(c.isspace() for c in embedding_model)
+        ):
             raise ValueError("embedding model must be a nonblank identifier")
         self._embedding_model = embedding_model
 
@@ -174,14 +183,64 @@ class IndexWriter:
         *,
         context: StagingContext,
         canonical_ast: ArtifactRef,
+        context_artifact_ref: ContextArtifactRef | None = None,
+        enriched_chunks_ref: ContextArtifactRef | None = None,
         before_side_effect: Callable[[], Awaitable[None]] | None = None,
     ) -> VersionManifest:
         parents = tuple(chunks)
         if context.embedding_version != self._embedding_model:
-            raise StagingIdentityError("configured embedding model differs from durable context")
+            raise StagingIdentityError(
+                "configured embedding model differs from durable context"
+            )
         children = self._validate_and_flatten(parents, context)
         if not await asyncio.to_thread(self._artifacts.verify, canonical_ast):
             raise StagingError("Canonical AST Artifact failed integrity verification")
+
+        context_fields = {}
+        if any(child.search_representation is not None for child in children):
+            if context_artifact_ref is None or enriched_chunks_ref is None:
+                raise ValueError(
+                    "context children require immutable enriched artifacts"
+                )
+            reps = [child.search_representation for child in children]
+            if (
+                any(rep is None for rep in reps)
+                or len({rep.build_fingerprint for rep in reps}) != 1
+            ):
+                raise ValueError("mixed context builds cannot be staged")
+            context_fields = dict(
+                schema_version=2,
+                context_artifact_ref=context_artifact_ref,
+                enriched_chunks_ref=enriched_chunks_ref,
+                build_fingerprint=reps[0].build_fingerprint,
+                representation_version="context-v1",
+                child_id_hash_digest=child_identity_digest(
+                    (c.id, c.content_hash) for c in children
+                ),
+                enrichment_counts={
+                    status: sum(rep.enrichment_status == status for rep in reps)
+                    for status in ("enriched", "partial", "structural_only")
+                },
+            )
+            candidate = VersionManifest(
+                canonical_ast_sha256=canonical_ast.sha256,
+                parent_count=len(parents),
+                child_count=len(children),
+                embedding_model=self._embedding_model,
+                embedding_dimensions=EMBEDDING_DIMENSIONS,
+                index_generation=context.index_generation,
+                **context_fields,
+            )
+            stored = await asyncio.to_thread(
+                validate_context_artifacts,
+                candidate,
+                self._artifacts,
+                (context.user_id, context.document_id, context.document_version_id),
+            )
+            if stored != parents:
+                raise ValueError("enriched chunks differ from staged parents")
+        elif context_artifact_ref is not None or enriched_chunks_ref is not None:
+            raise ValueError("legacy children cannot use context manifest artifacts")
 
         embedded_children = await self._embed(
             children, context, before_side_effect=before_side_effect
@@ -226,6 +285,7 @@ class IndexWriter:
             embedding_model=self._embedding_model,
             embedding_dimensions=EMBEDDING_DIMENSIONS,
             index_generation=context.index_generation,
+            **context_fields,
         )
         await _fence(before_side_effect)
         await self._parent_store.assert_writable(context)

@@ -13,6 +13,7 @@ from agentic_rag.models.indexing import (
     validate_writable_index_generation,
 )
 from agentic_rag.tool_runtime.mcp import McpServerConfig
+from agentic_rag.runtime.models import ContextBuildConfig
 
 
 class Settings(BaseSettings):
@@ -33,6 +34,8 @@ class Settings(BaseSettings):
     deepseek_protocol: Literal["auto", "chat", "responses"] = "auto"
     qwen_embedding_base_url: str
     qwen_api_key: SecretStr | None = None
+    context_pipeline_enabled: bool = False
+    context_build: ContextBuildConfig = Field(default_factory=ContextBuildConfig)
     mem0_enabled: bool = True
     mem0_collection: str = "agent_memories_v1"
     mem0_embedding_base_url: str | None = None
@@ -90,12 +93,18 @@ class Settings(BaseSettings):
     amap_mcp_enabled: bool = False
     amap_mcp_url: str = "https://dashscope.aliyuncs.com/api/v1/mcps/amap-maps/sse"
     amap_mcp_transport: Literal["sse", "streamable_http"] = "sse"
-    dashscope_api_key: SecretStr | None = Field(default=None, validation_alias=AliasChoices(
-        "DASHSCOPE_API_KEY", "AGENTIC_RAG_DASHSCOPE_API_KEY", "dashscope_api_key"))
+    dashscope_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "DASHSCOPE_API_KEY", "AGENTIC_RAG_DASHSCOPE_API_KEY", "dashscope_api_key"
+        ),
+    )
 
     @field_validator("mcp_servers")
     @classmethod
-    def _unique_mcp_ids(cls, value: tuple[McpServerConfig, ...]) -> tuple[McpServerConfig, ...]:
+    def _unique_mcp_ids(
+        cls, value: tuple[McpServerConfig, ...]
+    ) -> tuple[McpServerConfig, ...]:
         if len({server.id for server in value}) != len(value) or len(value) > 16:
             raise ValueError("MCP service IDs must be unique; maximum 16 services")
         return value

@@ -70,7 +70,9 @@ class ElasticsearchChildIndexStore:
         validate_index_generation(index_generation)
         return f"agenticrag-children-{index_generation}"
 
-    async def validate_search_target(self, index_generation: str, *, index: str | None = None) -> None:
+    async def validate_search_target(
+        self, index_generation: str, *, index: str | None = None
+    ) -> None:
         """Check the actual query target and embedding space without repairing aliases."""
         expected = self.index_name(index_generation)
         if index is not None and index != expected:
@@ -158,7 +160,9 @@ class ElasticsearchChildIndexStore:
         response = await self._client.indices.update_aliases(actions=actions)
         body = cast(Mapping[str, Any], response.body)
         if body.get("acknowledged") is False:
-            raise ChildIndexWriteError("Elasticsearch active alias switch was not acknowledged")
+            raise ChildIndexWriteError(
+                "Elasticsearch active alias switch was not acknowledged"
+            )
         await self._verify_active_alias(index)
         logger.info(
             "elasticsearch_active_alias_switched",
@@ -243,6 +247,75 @@ class ElasticsearchChildIndexStore:
         )
         return int(cast(Mapping[str, Any], response.body)["count"])
 
+    async def child_identities(
+        self, context: StagingContext
+    ) -> tuple[tuple[str, str], ...]:
+        """Read exact inactive/active context identities before v2 publication."""
+        from agentic_rag.models.contextual import text_sha256
+
+        pairs = []
+        seen = set()
+        after = None
+        while True:
+            kwargs = dict(
+                index=self.index_name(context.index_generation),
+                query={"bool": {"filter": self._scope_filters(context)}},
+                source_includes=[
+                    "id",
+                    "user_id",
+                    "document_id",
+                    "document_version_id",
+                    "representation_version",
+                    "contextualized_content",
+                    "content_hash",
+                ],
+                size=1000,
+                sort=[{"id": "asc"}],
+                track_total_hits=True,
+            )
+            if after is not None:
+                kwargs["search_after"] = after
+            response = await self._client.search(**kwargs)
+            body = response.body
+            if body.get("timed_out") or body.get("_shards", {}).get("failed", 0):
+                raise ValueError("incomplete context identity readback")
+            hits = body["hits"]["hits"]
+            for hit in hits:
+                source = hit["_source"]
+                if (
+                    source["user_id"],
+                    source["document_id"],
+                    source["document_version_id"],
+                ) != (
+                    context.user_id,
+                    context.document_id,
+                    context.document_version_id,
+                ):
+                    raise ValueError("context identity readback crossed scope")
+                if source["representation_version"] != "context-v1" or source[
+                    "content_hash"
+                ] != text_sha256(source["contextualized_content"]):
+                    raise ValueError(
+                        "context identity readback has invalid search hash"
+                    )
+                if source["id"] in seen or hit["_id"] != source["id"]:
+                    raise ValueError("context identity readback duplicate/wrong id")
+                seen.add(source["id"])
+                pairs.append((source["id"], source["content_hash"]))
+            if len(hits) < 1000:
+                total = body["hits"]["total"]
+                if (
+                    not isinstance(total, dict)
+                    or total.get("relation") != "eq"
+                    or total["value"] != len(pairs)
+                ):
+                    raise ValueError("context identity readback count changed")
+                return tuple(pairs)
+            cursor = hits[-1]["sort"]
+            if cursor == after:
+                raise ValueError("context identity readback cursor did not advance")
+            after = cursor
+
     async def activate(self, context: StagingContext) -> None:
         await self._set_active(context, is_active=True)
 
@@ -318,7 +391,12 @@ class ElasticsearchChildIndexStore:
                 f"Index Generation {index_generation!r} uses the legacy Child schema; "
                 f"stage new versions with {DEFAULT_INDEX_GENERATION!r}"
             )
-        expected_mapping = _index_mapping(index_generation, self._lexical_analysis, self._embedding_model, self._expected_representation_version)
+        expected_mapping = _index_mapping(
+            index_generation,
+            self._lexical_analysis,
+            self._embedding_model,
+            self._expected_representation_version,
+        )
         try:
             await self._client.indices.create(
                 index=index,
@@ -335,7 +413,12 @@ class ElasticsearchChildIndexStore:
     async def validate_index(self, index_generation: str) -> None:
         """Read-only compatibility check; never create or alter an index."""
         index = self.index_name(index_generation)
-        expected_mapping = _index_mapping(index_generation, self._lexical_analysis, self._embedding_model, self._expected_representation_version)
+        expected_mapping = _index_mapping(
+            index_generation,
+            self._lexical_analysis,
+            self._embedding_model,
+            self._expected_representation_version,
+        )
         response = await self._client.indices.get_mapping(index=index)
         mapping_body = cast(Mapping[str, Any], response.body)
         index_body = mapping_body.get(index)

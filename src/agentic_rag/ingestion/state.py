@@ -94,6 +94,12 @@ class IngestionState(TypedDict, total=False):
     fragment_refs: list[dict[str, Any]]
     canonical_ref: dict[str, Any]
     chunks_ref: dict[str, Any]
+    context_map_ref: dict[str, Any]
+    context_artifact_ref: dict[str, Any]
+    enriched_chunks_ref: dict[str, Any]
+    context_build_fingerprint: str
+    contextualization_enabled: bool
+    context_config_hash: str | None
     manifest_hash: str
     terminal_status: Literal["completed", "quarantined", "failed"] | None
     quarantine_reasons: list[str]

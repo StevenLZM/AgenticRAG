@@ -14,7 +14,11 @@ from agentic_rag.ingestion.indexer import (
     EMBEDDING_MODEL,
     StagingContext,
 )
-from agentic_rag.ingestion.manifest import VersionManifest
+from agentic_rag.ingestion.manifest import (
+    VersionManifest,
+    child_identity_digest,
+    validate_context_artifacts,
+)
 from agentic_rag.models.indexing import LEGACY_INDEX_GENERATIONS
 from agentic_rag.persistence.artifacts import ArtifactRef
 
@@ -170,9 +174,7 @@ class VersionPublisher:
         await self._repository.finalize(target)
         if self._alias_store is not None:
             await _fence(before_side_effect)
-            await self._alias_store.switch_active_alias(
-                target.context.index_generation
-            )
+            await self._alias_store.switch_active_alias(target.context.index_generation)
 
     async def _require_writable(self, context: StagingContext) -> None:
         if not await self._repository.is_writable(context):
@@ -184,7 +186,9 @@ class VersionPublisher:
         if target.context.embedding_version != self._embedding_model:
             # Reconciliation must not quarantine a valid staged version merely
             # because a newer worker uses a different embedding space.
-            raise PublicationConfigurationError("version requires a different embedding model")
+            raise PublicationConfigurationError(
+                "version requires a different embedding model"
+            )
         if target.context.index_generation in LEGACY_INDEX_GENERATIONS:
             raise PublicationIntegrityError(
                 "version does not use the current strict Child index contract"
@@ -217,6 +221,32 @@ class VersionPublisher:
             raise PublicationIntegrityError(
                 "Manifest Artifact URI is outside the trusted version scope"
             )
+        # Production ArtifactStore can describe either manifest schema. Legacy
+        # readers without describe retain their exact v1 byte-size contract.
+        if hasattr(self._artifacts, "describe"):
+            try:
+                stored_ref = await asyncio.to_thread(
+                    self._artifacts.describe, target.manifest_uri
+                )
+                manifest_ref = ArtifactRef(
+                    uri=target.manifest_uri,
+                    sha256=target.manifest_hash,
+                    size_bytes=stored_ref.size_bytes,
+                )
+                stored_payload = await asyncio.to_thread(
+                    self._artifacts.read_json, manifest_ref
+                )
+                stored_manifest = VersionManifest.model_validate(stored_payload)
+                common_fields = {
+                    k: stored_manifest.payload()[k] for k in manifest.payload()
+                }
+                if common_fields != manifest.payload():
+                    raise ValueError("manifest differs from durable version")
+                manifest = stored_manifest
+            except (OSError, TypeError, ValueError, KeyError) as error:
+                raise PublicationIntegrityError(
+                    "Manifest Artifact failed schema/integrity validation"
+                ) from error
         if target.manifest_hash != manifest.manifest_hash:
             raise PublicationIntegrityError(
                 "durable Manifest hash does not match counts"
@@ -251,6 +281,28 @@ class VersionPublisher:
             raise PublicationIntegrityError(
                 "Canonical AST Artifact failed integrity verification"
             )
+
+        if manifest.schema_version == 2:
+            try:
+                await asyncio.to_thread(
+                    validate_context_artifacts,
+                    manifest,
+                    self._artifacts,
+                    (
+                        target.context.user_id,
+                        target.context.document_id,
+                        target.context.document_version_id,
+                    ),
+                )
+                identities = await self._child_store.child_identities(target.context)
+                if child_identity_digest(identities) != manifest.child_id_hash_digest:
+                    raise ValueError(
+                        "staged child identity digest differs from manifest"
+                    )
+            except (OSError, TypeError, ValueError, KeyError, AttributeError) as error:
+                raise PublicationIntegrityError(
+                    "context artifact or staged child identity digest mismatch"
+                ) from error
 
         parent_count = await self._parent_store.count_total(target.context)
         child_count = await self._child_store.count_total(target.context)

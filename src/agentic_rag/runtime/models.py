@@ -1,6 +1,8 @@
 """Immutable runtime configuration contract."""
 
 import hashlib
+import json
+from pathlib import Path
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Literal
@@ -72,8 +74,15 @@ class RuntimeConfigSnapshot(BaseModel):
     evaluation: EvaluationMetadata | None = None
     # Legacy checkpoints remain readable with their original content hash.
     # New Runs bind endpoints and concurrency as well as model names.
-    provider_config_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
-    query_implementation_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    context_build_fingerprint: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
+    provider_config_fingerprint: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
+    query_implementation_fingerprint: str | None = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$"
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -98,3 +107,85 @@ class RuntimeConfigSnapshot(BaseModel):
         """Return the content-addressed identifier for this configuration."""
         payload = self.model_dump_json(exclude_none=True)
         return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _context_prompt_hash(kind: str) -> str:
+    return hashlib.sha256(
+        (
+            Path(__file__).resolve().parents[1] / "prompts" / f"context_{kind}_v1.md"
+        ).read_bytes()
+    ).hexdigest()
+
+
+class ContextBuildConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    enabled: bool = False
+    embedding_tokenizer_id: str | None = None
+    extraction_tokenizer_id: str | None = None
+    verification_tokenizer_id: str | None = None
+    extraction_model: str | None = None
+    verification_model: str | None = None
+    provider_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    extraction_prompt_hash: str = Field(
+        default_factory=lambda: _context_prompt_hash("extract"),
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    verification_prompt_hash: str = Field(
+        default_factory=lambda: _context_prompt_hash("verify"),
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    max_requests: int | None = Field(default=None, gt=0)
+    max_tokens: int | None = Field(default=None, gt=0)
+    max_cost: float | None = Field(default=None, gt=0)
+    input_price_per_million: float | None = Field(default=None, ge=0)
+    output_price_per_million: float | None = Field(default=None, ge=0)
+    max_concurrency: int = Field(default=1, ge=1, le=32)
+    max_input_tokens: int = Field(default=6000, gt=0, le=6000)
+    max_output_tokens: int = Field(default=1024, gt=0, le=4096)
+    max_source_blocks: int = Field(default=16, gt=0, le=16)
+    max_reference_hops: int = Field(default=2, ge=0, le=2)
+    base_token_budget: Literal[320] = 320
+    prefix_token_budget: Literal[64] = 64
+    final_token_budget: Literal[384] = 384
+    timeout_seconds: float = Field(default=30, gt=0, le=300)
+    selection_version: str = "whole-block-v1"
+    renderer_version: str = "context-v1"
+    entity_mapping_revision: str | None = None
+    chunking_version: str = "hybrid-320-v1"
+
+    @property
+    def extraction_enabled(self):
+        return self.enabled and bool(self.extraction_model and self.verification_model)
+
+    @model_validator(mode="after")
+    def budgets(self):
+        if self.enabled and (self.extraction_model or self.verification_model):
+            if not self.extraction_model or not self.verification_model:
+                raise ValueError(
+                    "both extraction and verifier models must be configured"
+                )
+            if any(
+                getattr(self, n) is None
+                for n in (
+                    "provider_fingerprint",
+                    "max_requests",
+                    "max_tokens",
+                    "max_cost",
+                    "input_price_per_million",
+                    "output_price_per_million",
+                )
+            ):
+                raise ValueError(
+                    "enabled context provider requires finite budgets and prices"
+                )
+        return self
+
+    def fingerprint(self, ast_sha256: str):
+        return hashlib.sha256(
+            json.dumps(
+                {"ast_sha256": ast_sha256, "config": self.model_dump(mode="json")},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()

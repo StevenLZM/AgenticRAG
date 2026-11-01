@@ -237,9 +237,17 @@ class ParentChunk(BaseModel):
             if self.row_to < self.row_from:
                 raise ValueError("parent row range is reversed")
         if self.token_count > PARENT_HARD_MAX_TOKENS and self.oversize_reason is None:
-            raise ValueError("oversized parent requires an explicit indivisible-row reason")
-        if self.oversize_reason is not None and self.content_type not in {"table", "code", "log"}:
-            raise ValueError("only structural row content may exceed the parent hard limit")
+            raise ValueError(
+                "oversized parent requires an explicit indivisible-row reason"
+            )
+        if self.oversize_reason is not None and self.content_type not in {
+            "table",
+            "code",
+            "log",
+        }:
+            raise ValueError(
+                "only structural row content may exceed the parent hard limit"
+            )
         return self
 
 
@@ -320,9 +328,7 @@ class ParentBuilder:
         heading_path: list[str] = []
         heading_ast_locators: list[str] = []
         pending: list[_ParentPiece] = []
-        drafts: list[
-            tuple[tuple[str, ...], tuple[str, ...], list[_ParentPiece]]
-        ] = []
+        drafts: list[tuple[tuple[str, ...], tuple[str, ...], list[_ParentPiece]]] = []
 
         def flush() -> None:
             if pending:
@@ -368,7 +374,9 @@ class ParentBuilder:
         flush()
 
         if not drafts:
-            raise ValueError("canonical AST requires at least one non-heading content block")
+            raise ValueError(
+                "canonical AST requires at least one non-heading content block"
+            )
         return [
             self._materialize(
                 canonical_ast,
@@ -383,9 +391,7 @@ class ParentBuilder:
     def _append_regular_piece(
         self,
         pending: list[_ParentPiece],
-        drafts: list[
-            tuple[tuple[str, ...], tuple[str, ...], list[_ParentPiece]]
-        ],
+        drafts: list[tuple[tuple[str, ...], tuple[str, ...], list[_ParentPiece]]],
         heading_path: tuple[str, ...],
         heading_ast_locators: tuple[str, ...],
         piece: _ParentPiece,
@@ -673,13 +679,17 @@ class ParentBuilder:
 class ChildBuilder:
     """Build searchable children through Docling's production HybridChunker."""
 
-    def __init__(self, tokenizer: BaseTokenizer) -> None:
+    def __init__(
+        self, tokenizer: BaseTokenizer, *, max_tokens: int = CHILD_MAX_TOKENS
+    ) -> None:
+        if not 0 < max_tokens <= CHILD_MAX_TOKENS:
+            raise ValueError("child max_tokens must be between 1 and 384")
         configured_max = int(tokenizer.get_max_tokens())
         if configured_max <= 0:
             raise ValueError("tokenizer maximum must be positive")
         self._tokenizer = _LimitedTokenizer(
             delegate=tokenizer,
-            max_tokens=min(CHILD_MAX_TOKENS, configured_max),
+            max_tokens=min(max_tokens, configured_max),
         )
 
     def build(self, parent: ParentChunk) -> list[ChildChunk]:
@@ -805,9 +815,11 @@ class ChildBuilder:
 class ChunkingPipeline:
     """Compose deterministic Parent and Docling Child construction."""
 
-    def __init__(self, tokenizer: BaseTokenizer) -> None:
+    def __init__(
+        self, tokenizer: BaseTokenizer, *, child_max_tokens: int = CHILD_MAX_TOKENS
+    ) -> None:
         self._parents = ParentBuilder(tokenizer)
-        self._children = ChildBuilder(tokenizer)
+        self._children = ChildBuilder(tokenizer, max_tokens=child_max_tokens)
 
     def build(self, canonical_ast: CanonicalAst) -> list[ParentChunk]:
         return [
@@ -984,9 +996,7 @@ def _clip_locator(
             and source.table_header_row_to == 0
         ):
             row_from, row_to = _intersecting_row_range(
-                parent_content[
-                    source.parent_char_from : source.parent_char_to
-                ],
+                parent_content[source.parent_char_from : source.parent_char_to],
                 overlap_from - source.parent_char_from,
                 overlap_to - source.parent_char_from,
                 base_row=row_from,
@@ -1045,9 +1055,7 @@ def _table_child_locator(
     parent_char_from = parent_layout[local_start + 1].char_from
     parent_char_to = parent_layout[local_to].char_to
     parent_body_char_from = parent_layout[1].char_from
-    canonical_char_from = source.char_from + (
-        parent_char_from - parent_body_char_from
-    )
+    canonical_char_from = source.char_from + (parent_char_from - parent_body_char_from)
     canonical_char_to = source.char_from + (parent_char_to - parent_body_char_from)
     span = source.model_copy(
         update={
