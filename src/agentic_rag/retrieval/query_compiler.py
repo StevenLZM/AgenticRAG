@@ -11,6 +11,7 @@ from agentic_rag.retrieval.query_context import (
     BusinessScopeCoverageProvider,
     QueryBusinessContext,
     ScopeResolution,
+    TaskBusinessObjective,
     TrustedBusinessEntityDirectory,
     TrustedBusinessProfileProvider,
 )
@@ -172,7 +173,11 @@ class QueryCompiler:
         task_ref: str,
         document_ids: tuple[str, ...] = (),
     ) -> QueryBusinessContext:
-        """Project only already assigned literal targets; task prose grants no authority."""
+        """Append task intent; common compilation validates its complete ancestry.
+
+        Literal checks provide early rejection only. They cannot authorize or
+        narrow directory-only names; the async compiler owns that decision.
+        """
         meaning, _ = cls._meaning(business)
         for mention in _literal_mentions(target):
             if mention.resolution_status not in {"resolved", "defaulted"} or not any(
@@ -184,17 +189,6 @@ class QueryCompiler:
                 raise BusinessScopeConflict(
                     "task target requires coordinator reassignment"
                 )
-        targets = tuple(
-            r.model_copy(
-                update={
-                    "source_kind": "task_target",
-                    "source_ref": task_ref,
-                    "source_span": None,
-                }
-            )
-            for r in meaning
-            if r.value in target
-        )
         permitted = business.permitted_document_ids
         if document_ids:
             permitted = tuple(
@@ -202,7 +196,10 @@ class QueryCompiler:
             )
         return business.model_copy(
             update={
-                "task_targets": targets or business.task_targets,
+                "task_objectives": (
+                    *business.task_objectives,
+                    TaskBusinessObjective(text=target, source_ref=task_ref),
+                ),
                 "task_intent_ref": task_ref,
                 "permitted_document_ids": permitted,
             }
@@ -231,6 +228,35 @@ class QueryCompiler:
             else await self.mentions(request.query)
         )
         resolved, status = self._meaning(business)
+        for objective in business.task_objectives:
+            mentions = await self.mentions(objective.text)
+            for mention in mentions:
+                if mention.resolution_status not in {
+                    "resolved",
+                    "defaulted",
+                } or not any(
+                    r.field == mention.field
+                    and r.value == mention.value
+                    and r.resolution_status in {"resolved", "defaulted"}
+                    for r in resolved
+                ):
+                    raise BusinessScopeConflict(
+                        "task target requires coordinator reassignment"
+                    )
+            fields = {r.field for r in mentions}
+            narrowed = tuple(
+                r.model_copy(
+                    update={
+                        "source_kind": "task_target",
+                        "source_ref": objective.source_ref,
+                        "source_span": mention.source_span,
+                    }
+                )
+                for r in resolved
+                for mention in mentions
+                if (r.field, r.value) == (mention.field, mention.value)
+            )
+            resolved = tuple(r for r in resolved if r.field not in fields) + narrowed
         # A generated search may narrow an assigned comparison, never invent a target.
         if request.query != business.source_question:
             for item in explicit:

@@ -141,3 +141,62 @@ async def test_composed_parallel_children_inherit_frozen_profile_and_task_bounds
     )
     assert len(result.results) == len(received) == 2 and profiles.calls == 1
     assert {c.task_intent_ref for c in received} == {"todo:todo-0", "todo:todo-1"}
+
+
+async def test_child_projection_keeps_directory_objective_ancestors():
+    import pytest
+    from agentic_rag.runtime.query_composition import build_subagent_dispatcher
+    from agentic_rag.runtime.concurrency import ConcurrencyManager
+    from agentic_rag.query.todos import TodoItem
+    from agentic_rag.retrieval.query_compiler import BusinessScopeConflict
+    from tests.unit.retrieval.test_query_compiler import NamedDirectory
+    from tests.unit.query.test_graph import SCOPE, SNAPSHOT
+
+    compiler = QueryCompiler(directory=NamedDirectory())
+    root = await compiler.freeze("比较星河集团与远山集团标准", SCOPE)
+    parent = compiler.for_task(root, "星河集团标准", task_ref="task:parent")
+    plans = []
+    inherited = []
+
+    class Retrieval:
+        async def retrieve(self, request, scope, snapshot, *, business_context):
+            inherited.append(business_context)
+            plans.append(
+                await compiler.compile(request, scope, snapshot, business_context)
+            )
+            return EvidenceBatch(query=request.query, parents=())
+
+    dispatcher = build_subagent_dispatcher(
+        retrieval=Retrieval(),
+        evidence_builder=EvidenceBuilder(),
+        snapshot=SNAPSHOT,
+        concurrency=ConcurrencyManager(),
+    )
+    ctx = ResearchContext(scope=SCOPE, snapshot=SNAPSHOT, business_context=parent)
+    await dispatcher.delegate(
+        [TodoItem(id="neutral", title="住宿条件", owner="supervisor")],
+        ctx,
+        queries={"neutral": "住宿标准"},
+    )
+    assert "远山集团" not in plans[0].dense_query
+    assert [o.source_ref for o in inherited[0].task_objectives] == [
+        "task:parent",
+        "todo:neutral",
+    ]
+    with pytest.raises(BusinessScopeConflict, match="task target"):
+        await dispatcher.delegate(
+            [TodoItem(id="conflict", title="远山集团住宿条件", owner="supervisor")],
+            ctx,
+            queries={"conflict": "住宿标准"},
+        )
+    assert len(plans) == 1
+    invalid_parent = compiler.for_task(
+        parent, "远山集团标准", task_ref="task:invalid-ancestor"
+    )
+    with pytest.raises(BusinessScopeConflict, match="task target"):
+        await dispatcher.delegate(
+            [TodoItem(id="grandchild", title="住宿条件", owner="supervisor")],
+            replace(ctx, business_context=invalid_parent),
+            queries={"grandchild": "住宿标准"},
+        )
+    assert len(plans) == 1

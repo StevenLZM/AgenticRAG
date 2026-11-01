@@ -201,3 +201,48 @@ async def test_agent_rejects_conflicting_objective_before_neutral_search():
             TaskSpec.model_validate(raw), {}, execution
         )
     assert retrieval.calls == 0
+
+
+async def test_directory_objective_conflict_reaches_common_boundary_before_recall():
+    import pytest
+    from agentic_rag.orchestration.agents import RetrievalAgent
+    from agentic_rag.orchestration.contracts import TaskSpec
+    from agentic_rag.retrieval.graph import RetrievalService, RetrievalDependencies
+    from agentic_rag.retrieval.query_compiler import BusinessScopeConflict
+    from tests.unit.retrieval.test_query_compiler import NamedDirectory
+    from tests.unit.orchestration.test_agents import Execution
+    from tests.unit.orchestration.test_contracts import task_payload
+
+    compiler = QueryCompiler(directory=NamedDirectory())
+    execution = Execution({"queries": ["住宿标准"], "reason": "neutral search"})
+    execution.business_context = await compiler.freeze("星河集团标准", execution.scope)
+    raw = task_payload()
+    raw["objective"] = "远山集团住宿标准"
+
+    class NoRecall:
+        calls = 0
+
+        async def embed_query(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("conflict reached embedding")
+
+        async def search(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("conflict reached recall")
+
+    port = NoRecall()
+    retrieval = RetrievalService(
+        RetrievalDependencies(
+            embedding=port,
+            vector=port,
+            lexical=port,
+            reranker=None,
+            parent_fetcher=None,
+            query_compiler=compiler,
+        )
+    )
+    with pytest.raises(BusinessScopeConflict, match="task target"):
+        await RetrievalAgent(retrieval).execute(
+            TaskSpec.model_validate(raw), {}, execution
+        )
+    assert port.calls == 0

@@ -563,3 +563,79 @@ async def test_self_directed_confirmed_own_company_defaults_only_missing_populat
         "company": ("星河公司", "confirmed_reference"),
         "population": ("普通员工", "trusted_profile"),
     }
+
+
+class NamedDirectory:
+    names = ("星河集团", "远山集团", "Northwind", "Contoso")
+
+    async def resolve_mentions(self, text):
+        from agentic_rag.retrieval.query_context import ScopeResolution
+
+        return tuple(
+            ScopeResolution(
+                field="company",
+                value=name,
+                source_kind="explicit_user",
+                source_ref="directory:names-v1",
+                source_span=(text.index(name), text.index(name) + len(name)),
+                resolver_version="names-v1",
+            )
+            for name in self.names
+            if name in text
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "own,other", [("星河集团", "远山集团"), ("Northwind", "Contoso")]
+)
+async def test_directory_objective_conflict_rejected_for_neutral_search(own, other):
+    compiler = module.QueryCompiler(directory=NamedDirectory())
+    business = await compiler.freeze(own + "标准", SCOPE)
+    task = compiler.for_task(business, other + "住宿标准", task_ref="task:directory")
+    with pytest.raises(module.BusinessScopeConflict, match="task target"):
+        await compiler.compile(
+            RetrievalRequest(query="住宿标准"), SCOPE, SNAPSHOT, task
+        )
+
+
+@pytest.mark.asyncio
+async def test_directory_task_lineage_keeps_ancestor_scope_through_neutral_child():
+    compiler = module.QueryCompiler(directory=NamedDirectory())
+    business = await compiler.freeze("比较星河集团与远山集团标准", SCOPE)
+    broad = compiler.for_task(
+        business, "比较星河集团与远山集团标准", task_ref="task:broad"
+    )
+    parent = compiler.for_task(broad, "星河集团标准", task_ref="task:parent")
+    neutral = compiler.for_task(parent, "住宿标准", task_ref="task:neutral")
+    restored = QueryBusinessContext.model_validate_json(neutral.model_dump_json())
+    plan = await compiler.compile(
+        RetrievalRequest(query="住宿标准"), SCOPE, SNAPSHOT, restored
+    )
+    assert "星河集团" in plan.dense_query and "远山集团" not in plan.dense_query
+    assert [item.source_ref for item in restored.task_objectives] == [
+        "task:broad",
+        "task:parent",
+        "task:neutral",
+    ]
+    conflicting = compiler.for_task(parent, "远山集团标准", task_ref="task:conflict")
+    child = compiler.for_task(conflicting, "住宿条件", task_ref="task:neutral-child")
+    with pytest.raises(module.BusinessScopeConflict, match="task target"):
+        await compiler.compile(
+            RetrievalRequest(query="住宿条件"), SCOPE, SNAPSHOT, child
+        )
+
+
+@pytest.mark.asyncio
+async def test_directory_legitimate_comparison_narrowing_retains_frozen_profile():
+    profiles = Profiles()
+    compiler = module.QueryCompiler(directory=NamedDirectory(), profiles=profiles)
+    business = await compiler.freeze("比较Northwind与Contoso标准", SCOPE)
+    task = compiler.for_task(business, "Contoso住宿标准", task_ref="task:valid")
+    profiles.value = profiles.value.model_copy(update={"revision": "p2"})
+    plan = await compiler.compile(
+        RetrievalRequest(query="住宿标准"), SCOPE, SNAPSHOT, task
+    )
+    assert plan.effective_business_scope[0].value == "Contoso"
+    assert "Northwind" not in plan.dense_query
+    assert plan.profile_revision == "p1" and profiles.calls == 1

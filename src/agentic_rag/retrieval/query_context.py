@@ -35,6 +35,13 @@ class TrustedBusinessProfile(FrozenContract):
     population: str | None = None
 
 
+class TaskBusinessObjective(FrozenContract):
+    """Pending task intent; resolved against frozen assignment before recall."""
+
+    text: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1)
+
+
 class QueryBusinessContext(FrozenContract):
     owner_id: str
     source_question: str
@@ -42,6 +49,7 @@ class QueryBusinessContext(FrozenContract):
     trusted_profile: TrustedBusinessProfile | None = None
     source_scope: tuple[ScopeResolution, ...] = ()
     task_targets: tuple[ScopeResolution, ...] = ()
+    task_objectives: tuple[TaskBusinessObjective, ...] = ()
     confirmed_reference: tuple[ScopeResolution, ...] = ()
     permitted_document_ids: tuple[str, ...] | None = None
 
