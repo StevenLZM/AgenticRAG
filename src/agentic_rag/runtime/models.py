@@ -148,7 +148,7 @@ class ContextBuildConfig(BaseModel):
     prefix_token_budget: Literal[64] = 64
     final_token_budget: Literal[384] = 384
     timeout_seconds: float = Field(default=30, gt=0, le=300)
-    selection_version: str = "whole-block-v1"
+    selection_version: str = "whole-block-v2"
     renderer_version: str = "context-v1"
     entity_mapping_revision: str | None = None
     chunking_version: str = "hybrid-320-v1"

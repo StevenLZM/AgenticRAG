@@ -48,6 +48,7 @@ from agentic_rag.runtime.model_gateway import (
 from openai import APIError
 
 from agentic_rag.runtime.models import ContextBuildConfig
+from agentic_rag.runtime.circuit import CircuitOpenError
 
 
 @dataclass(frozen=True)
@@ -252,6 +253,23 @@ class ContextualizationService:
                                     ):
                                         status = "insufficient"
                                         reason = "verifier_missing_support"
+                                    # The verifier schema reports source IDs, not
+                                    # precise quotes. Persist the complete original
+                                    # blocks it used, including dependencies beyond
+                                    # the extractor's quotations. Qualification
+                                    # checks below must inspect this same closure.
+                                    dependency_ids = dict.fromkeys(
+                                        (
+                                            *[r.source_id for r in refs],
+                                            *verification.source_ids,
+                                        )
+                                    )
+                                    refs = tuple(
+                                        catalog.resolve_quote(
+                                            source_id, catalog.source_text(source_id)
+                                        )
+                                        for source_id in dependency_ids
+                                    )
                                 if scope is None or not catalog.covers_child(
                                     scope.source_refs, child
                                 ):
@@ -492,6 +510,7 @@ class ContextualizationService:
             BudgetExhausted,
             TimeoutError,
             ConnectionError,
+            CircuitOpenError,
             StructuredOutputValidationError,
             ModelOutputTruncatedError,
             APIError,

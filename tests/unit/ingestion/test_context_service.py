@@ -557,3 +557,170 @@ def test_tokenizer_identity_changes_build_fingerprint():
         {**first.model_dump(), "embedding_tokenizer_id": "tokenizer-new"}
     )
     assert first.fingerprint("a" * 64) != second.fingerprint("a" * 64)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "applicability,exclusions,expected_status",
+    [
+        ("本制度适用于甲方。", (), "accepted"),
+        ("本制度适用于甲方，不含外包人员。", ("不含外包人员",), "accepted"),
+        ("本制度适用于甲方，不含外包人员。", (), "rejected"),
+    ],
+)
+async def test_verifier_additional_cross_parent_dependencies_are_retained(
+    tmp_path, applicability, exclusions, expected_status
+):
+    from agentic_rag.models.contextual import ContextArtifact
+    from agentic_rag.ingestion.contextualization.sources import SourceCatalog
+    from tests.unit.ingestion.test_context_assembly import isolated_target
+
+    texts = ("甲方定义：星河公司。", applicability, "上海标准500一晚。")
+    artifacts, ast, ref, parent, claim = setup(tmp_path, texts)
+    parent, child = isolated_target(parent, 2, texts[2])
+    catalog = SourceCatalog.from_ast(ast, ref.sha256)
+
+    class CrossParent(Recorded):
+        async def extract(self, input):
+            result = await super().extract(input)
+            assert input.target_content == texts[2]
+            return result.model_copy(
+                update={
+                    "claims": (
+                        result.claims[0].model_copy(
+                            update={"exclusion_conditions": exclusions}
+                        ),
+                    )
+                }
+            )
+
+        async def verify(self, input):
+            self.calls.append(("verify", input))
+            assert len(input.candidate.source_quotes) == 1
+            return VerificationResponse(
+                status="supported", source_ids=catalog.source_ids[:2]
+            )
+
+    model = CrossParent()
+    service = ContextualizationService(
+        artifacts=artifacts,
+        store=MemoryContextBuildStore(),
+        model=model,
+        count_tokens=len,
+        count_model_tokens=lambda text, model_id: len(text),
+    )
+    result = await service.enrich(
+        ast,
+        [parent],
+        canonical_ref=ref,
+        build=config(),
+        claim=claim,
+        before_side_effect=fence,
+    )
+    rep = result.parents[0].children[0].search_representation
+    artifact = ContextArtifact.model_validate(artifacts.read_json(rep.context_ref))
+    saved = artifact.claims[0]
+    assert saved.status == expected_status
+    assert {r.block_id for r in saved.source_refs} == {"block-0", "block-1"}
+    assert {catalog.verify_source(r) for r in saved.source_refs} == set(texts[:2])
+    assert {r.block_id for r in saved.scope_region.source_refs} == {"block-2"}
+    assert result.parents[0].content == parent.content == child.content
+    if expected_status == "accepted":
+        assert "company: 星河公司" in rep.context_prefix
+        assert all(value in rep.context_prefix for value in exclusions)
+    else:
+        assert rep.enrichment_status == "structural_only"
+
+
+@pytest.mark.asyncio
+async def test_circuit_open_retains_supported_field_and_reserved_usage(tmp_path):
+    from agentic_rag.runtime.circuit import CircuitOpenError
+
+    artifacts, ast, ref, parent, claim = setup(
+        tmp_path, ("本制度适用于星河公司，普通员工。",)
+    )
+
+    class CircuitAfterSupport(Recorded):
+        async def extract(self, input):
+            result = await super().extract(input)
+            return result.model_copy(
+                update={
+                    "claims": (
+                        result.claims[0],
+                        result.claims[0].model_copy(
+                            update={"field": "population", "value": "普通员工"}
+                        ),
+                    )
+                }
+            )
+
+        async def verify(self, input):
+            if input.candidate.field == "population":
+                self.calls.append(("verify", input))
+                raise CircuitOpenError("provider circuit is open")
+            return await super().verify(input)
+
+    store = MemoryContextBuildStore()
+    service = ContextualizationService(
+        artifacts=artifacts,
+        store=store,
+        model=CircuitAfterSupport(),
+        count_tokens=len,
+        count_model_tokens=lambda text, model_id: len(text),
+    )
+    result = await service.enrich(
+        ast,
+        [parent],
+        canonical_ref=ref,
+        build=config(),
+        claim=claim,
+        before_side_effect=fence,
+    )
+    rep = result.parents[0].children[0].search_representation
+    assert rep.enrichment_status == "partial"
+    assert rep.context_prefix == "company: 星河公司"
+    assert len(store.reservations) == 3
+    assert all(not settled for _, _, _, settled in store.reservations.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_kind", ["lease", "source"])
+async def test_provider_fallback_does_not_swallow_lease_or_source_errors(
+    tmp_path, error_kind
+):
+    from agentic_rag.persistence.repositories import LeaseLost
+    from agentic_rag.ingestion.contextualization.sources import SourceIntegrityError
+
+    artifacts, ast, ref, parent, claim = setup(tmp_path, ("本制度适用于星河公司。",))
+    error_type = LeaseLost if error_kind == "lease" else SourceIntegrityError
+
+    class Failing(Recorded):
+        async def verify(self, input):
+            raise error_type("must propagate")
+
+    store = MemoryContextBuildStore()
+    service = ContextualizationService(
+        artifacts=artifacts,
+        store=store,
+        model=Failing(),
+        count_tokens=len,
+        count_model_tokens=lambda text, model_id: len(text),
+    )
+    with pytest.raises(error_type, match="must propagate"):
+        await service.enrich(
+            ast,
+            [parent],
+            canonical_ref=ref,
+            build=config(),
+            claim=claim,
+            before_side_effect=fence,
+        )
+    assert store.ready == {}
+    assert len(store.reservations) == 2
+
+
+def test_dependency_closure_policy_uses_new_default_build_fingerprint():
+    current = config()
+    previous = current.model_copy(update={"selection_version": "whole-block-v1"})
+    assert current.selection_version == "whole-block-v2"
+    assert current.fingerprint("a" * 64) != previous.fingerprint("a" * 64)

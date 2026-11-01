@@ -41,3 +41,55 @@ def test_runtime_snapshot_binds_context_fingerprint_without_changing_legacy():
     )
     assert updated.snapshot_id != first
     assert SNAPSHOT.model_validate(SNAPSHOT.model_dump()).snapshot_id == first
+
+
+@pytest.mark.asyncio
+async def test_real_gateway_open_circuit_falls_back_without_losing_reservation(
+    tmp_path,
+):
+    from agentic_rag.ingestion.contextualization.service import ContextualizationService
+    from agentic_rag.ingestion.contextualization.store import MemoryContextBuildStore
+    from tests.unit.ingestion.test_context_service import setup, fence
+
+    client = FakeClient([TimeoutError("offline outage") for _ in range(3)])
+    client.max_retries = 0
+    adapter = GatewayContextModel(
+        client=client,
+        snapshot=SNAPSHOT.model_copy(update={"provider_config_fingerprint": "a" * 64}),
+        build=config(),
+    )
+    input = ContextInput(
+        target_source_child_id="raw", target_content="body", sources=(), scopes={}
+    )
+    # Real ModelGateway opens its default circuit after three failed calls.
+    for _ in range(3):
+        with pytest.raises(TimeoutError):
+            await adapter.extract(input)
+    assert len(client.responses.calls) == 3
+
+    artifacts, ast, ref, parent, claim = setup(tmp_path, ("本制度适用于星河公司。",))
+    store = MemoryContextBuildStore()
+    service = ContextualizationService(
+        artifacts=artifacts,
+        store=store,
+        model=adapter,
+        count_tokens=len,
+        count_model_tokens=lambda text, model_id: len(text),
+    )
+    result = await service.enrich(
+        ast,
+        [parent],
+        canonical_ref=ref,
+        build=config(),
+        claim=claim,
+        before_side_effect=fence,
+    )
+    assert (
+        result.parents[0].children[0].search_representation.enrichment_status
+        == "structural_only"
+    )
+    assert len(client.responses.calls) == 3
+    assert len(store.reservations) == 1
+    _, tokens, cost, settled = next(iter(store.reservations.values()))
+    assert tokens == config().max_input_tokens + config().max_output_tokens
+    assert cost > 0 and not settled
