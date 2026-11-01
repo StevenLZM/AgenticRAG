@@ -111,7 +111,9 @@ class ContextClaim(_FrozenModel):
                 raise ValueError("accepted claims require verification")
             if self.verification_status in {"contradicted", "insufficient"}:
                 raise ValueError("unsupported claims cannot be accepted")
-            if self.derivation == "llm" and self.verification_status != "supported":
+            if (
+                self.derivation == "llm" or self.verification_method == "llm_supported"
+            ) and self.verification_status != "supported":
                 raise ValueError(
                     "accepted LLM claims require a supported verifier result"
                 )

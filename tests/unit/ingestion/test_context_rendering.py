@@ -166,6 +166,18 @@ def test_llm_verified_claim_cannot_gain_permissions_by_changing_derivation() -> 
         )
 
 
+def test_llm_verified_non_llm_derivation_requires_supported_result() -> None:
+    # A non-LLM derivation cannot bypass the result of its LLM verification.
+    payload = _claim().model_dump() | {
+        "derivation": "trusted_mapping",
+        "verification_status": None,
+    }
+    with pytest.raises(ValidationError, match="supported verifier result"):
+        ContextClaim.model_validate(payload)
+    supported = ContextClaim.model_validate(payload | {"verification_status": "supported"})
+    assert _render(claims=(supported,)).context_claim_ids == ("company-claim",)
+
+
 def test_artifact_retains_rejected_and_unrendered_accepted_dependencies() -> None:
     accepted = _claim()
     rejected = _claim(id="rejected", status="rejected")
