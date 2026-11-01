@@ -38,6 +38,8 @@ class AnswerSource(BaseModel):
     document_version_id: SourceId
     source_kind: Literal["parent_chunk", "canonical_excerpt"] = "parent_chunk"
     parent_id: SourceId | None
+    # Private per-item format marker; None preserves pre-marker snapshots.
+    evidence_schema_version: Literal[1, 2] | None = None
     source_provenance: EvidenceManifestEntry | None = None
     heading_path: tuple[str, ...] = Field(default=(), max_length=16)
     heading_truncated: bool = False
@@ -53,12 +55,14 @@ class AnswerSource(BaseModel):
             raise ValueError("invalid source kind identity")
         if self.source_provenance is not None:
             entry = self.source_provenance
+            if self.evidence_schema_version is not None and self.evidence_schema_version != entry.schema_version:
+                raise ValueError("source snapshot evidence version differs")
             if (entry.evidence_id, entry.document_id, entry.document_version_id, entry.parent_id, entry.source_kind) != (self.evidence_id, self.document_id, self.document_version_id, self.parent_id, self.source_kind):
                 raise ValueError("source snapshot provenance differs")
             if entry.source_ref is not None and (self.page_from, self.page_to) != (entry.source_ref.page_from, entry.source_ref.page_to):
                 raise ValueError("source snapshot page provenance differs")
-        if self.source_kind == "canonical_excerpt" and self.source_provenance is None:
-            raise ValueError("canonical source snapshot requires private provenance")
+        if (self.evidence_schema_version == 2 or self.source_kind == "canonical_excerpt") and self.source_provenance is None:
+            raise ValueError("schema2 source snapshot requires private provenance")
         if sum(map(len, self.heading_path)) > 128:
             raise ValueError("heading too long")
         if (self.page_from is None) != (self.page_to is None) or (
@@ -80,6 +84,8 @@ class AnswerSources(BaseModel):
     def bounded_storage(self):
         if self.schema_version == 1 and any(i.source_kind != "parent_chunk" for i in self.items):
             raise ValueError("canonical sources require schema v2")
+        if self.schema_version == 2 and any(i.evidence_schema_version is None and i.source_provenance is None for i in self.items):
+            raise ValueError("schema2 snapshot requires per-item version or provenance")
         if not within_budget(self.model_dump(mode="json")):
             raise ValueError("source snapshot exceeds byte budget")
         if len({item.evidence_id for item in self.items}) != len(self.items):
@@ -178,6 +184,7 @@ def build_answer_sources(
                 document_version_id=item.document_version_id,
                 parent_id=item.parent_id,
                 source_kind=item.source_kind,
+                evidence_schema_version=item.schema_version,
                 source_provenance=manifest if item.schema_version == 2 else None,
                 heading_path=tuple(headings),
                 heading_truncated=tuple(headings) != item.heading_path,

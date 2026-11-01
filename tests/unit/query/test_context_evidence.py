@@ -1021,6 +1021,9 @@ async def test_full_retrieval_entry_uses_shared_original_source_service(tmp_path
         "page",
         "flags",
         "missing_provenance",
+        "missing_version_and_provenance",
+        "version_mismatch",
+        "old_version_marker",
         "valid_prefix",
     ],
 )
@@ -1194,6 +1197,13 @@ async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(
                 )
             elif tamper == "missing_provenance":
                 item["source_provenance"] = None
+            elif tamper == "missing_version_and_provenance":
+                item.pop("evidence_schema_version", None)
+                item["source_provenance"] = None
+            elif tamper == "version_mismatch":
+                item["evidence_schema_version"] = 1
+            elif tamper == "old_version_marker":
+                item.pop("evidence_schema_version", None)
             elif tamper == "heading":
                 item.update(heading_path=["伪造适用范围"], heading_truncated=True)
             elif tamper == "page":
@@ -1210,7 +1220,9 @@ async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(
             )
         changed_view = await reader.get(SCOPE, session.id, run.id)
         assert changed_view.status == (
-            "available" if tamper == "valid_prefix" else "unavailable"
+            "available"
+            if tamper in {"valid_prefix", "old_version_marker"}
+            else "unavailable"
         )
     authority.revoked = True
     if source_mode == "legacy_v2":
@@ -1611,3 +1623,128 @@ async def test_schema2_legacy_parent_original_bytes_are_reauthorized_without_con
     )
     with pytest.raises(ValueError):
         await resolver.resolve({item.evidence_id: entry}, SCOPE, SNAPSHOT)
+
+
+@pytest.mark.asyncio
+async def test_mixed_legacy_and_contextual_sources_survive_reducer_and_public_read(
+    tmp_path, monkeypatch
+):
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from agentic_rag.domain.models import RunStatus
+    from agentic_rag.query.answer_sources import build_answer_sources
+    from agentic_rag.query.evidence_builder import EvidenceBuilder
+    from agentic_rag.query.subagents import EvidenceReducer
+    from agentic_rag.retrieval.models import ChildHit, EvidenceBatch
+    from agentic_rag.runtime import chat_sources
+    from tests.unit.query.test_answer_sources import answer
+
+    hydrator, authority, hits, parents = await built(tmp_path, split_parents=True)
+    contextual = await pack(hydrator, hits[0], parents[0])
+    legacy_hit = ChildHit(
+        **{
+            name: getattr(hits[1], name)
+            for name in (
+                "child_id",
+                "parent_id",
+                "user_id",
+                "document_id",
+                "document_version_id",
+                "content",
+                "ast_locator",
+                "lane",
+                "lane_rank",
+                "retrieval_score",
+            )
+        }
+    )
+    legacy_parent = parents[1].model_copy(update={"child_hits": (legacy_hit,)})
+    legacy = EvidenceBuilder().build(
+        [EvidenceBatch(query="q", parents=(legacy_parent,))],
+        (),
+        SCOPE,
+        SNAPSHOT,
+    )
+    merged = EvidenceReducer.merge(
+        [
+            SimpleNamespace(todo_id="context", evidence=contextual),
+            SimpleNamespace(todo_id="legacy", evidence=legacy),
+        ],
+        expected_index_generation=SNAPSHOT.index_generation,
+    )
+    assert {item.schema_version for item in merged.items} == {1, 2}
+    public = answer(tuple(merged.manifest))
+    sources = build_answer_sources(
+        public, merged, run_id="run", snapshot_id=SNAPSHOT.snapshot_id
+    )
+    assert sources.schema_version == 2
+    assert {s.evidence_id: s.evidence_schema_version for s in sources.items} == {
+        item.evidence_id: item.schema_version for item in merged.items
+    }
+    run = SimpleNamespace(
+        id="run",
+        thread_id="session",
+        status=RunStatus.COMPLETED,
+        runtime_config_snapshot=SNAPSHOT.model_dump(mode="json"),
+        runtime_config_snapshot_id=SNAPSHOT.snapshot_id,
+        answer=public.model_dump(mode="json"),
+        answer_sources=sources.model_dump(mode="json"),
+    )
+
+    class Sessions:
+        def __init__(self, db):
+            pass
+
+        async def get_owned(self, scope, session_id):
+            assert scope == SCOPE and session_id == "session"
+            return object()
+
+        async def source_documents(self, scope, identities):
+            assert scope == SCOPE
+            return {
+                key: SimpleNamespace(filename="policy.pdf", active_version_id=key[1])
+                for key in identities
+            }
+
+    class Runs:
+        def __init__(self, db):
+            pass
+
+        async def get(self, run_id, scope):
+            assert run_id == "run" and scope == SCOPE
+            return run
+
+    @asynccontextmanager
+    async def session_factory():
+        yield object()
+
+    monkeypatch.setattr(chat_sources, "SqlAlchemyChatSessionRepository", Sessions)
+    monkeypatch.setattr(chat_sources, "SqlAlchemyRunRepository", Runs)
+    reader = chat_sources.ChatSourceService(session_factory, context_sources=hydrator)
+    view = await reader.get(SCOPE, "session", "run")
+    assert view.status == "available" and view.omitted_source_count == 0
+    assert tuple(s.evidence_id for s in view.items) == tuple(merged.manifest)
+    assert {s.evidence_id: s.excerpt for s in view.items} == {
+        s.evidence_id: s.excerpt for s in sources.items
+    }
+    assert all("evidence_schema_version" not in s.model_dump() for s in view.items)
+    # Revoking context authority must still remove only the affected new source.
+    authority.revoked = True
+    revoked = await reader.get(SCOPE, "session", "run")
+    assert revoked.status == "partial"
+    assert tuple(s.evidence_id for s in revoked.items) == tuple(legacy.manifest)
+    # Genuine historical schema1 snapshots predate both private fields.
+    historical_answer = answer(tuple(legacy.manifest))
+    historical = build_answer_sources(
+        historical_answer, legacy, run_id="run", snapshot_id=SNAPSHOT.snapshot_id
+    ).model_dump(mode="json")
+    assert historical["schema_version"] == 1
+    for source in historical["items"]:
+        source.pop("evidence_schema_version")
+        source.pop("source_provenance")
+    run.answer = historical_answer.model_dump(mode="json")
+    run.answer_sources = historical
+    old_view = await reader.get(SCOPE, "session", "run")
+    assert old_view.status == "available" and old_view.omitted_source_count == 0
+    assert tuple(s.evidence_id for s in old_view.items) == tuple(legacy.manifest)

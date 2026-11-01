@@ -83,7 +83,7 @@ class ChatSourceService:
                 if document is None:
                     continue
                 entry = source.source_provenance
-                if snapshot.schema_version == 2 or entry is not None or source.source_kind == "canonical_excerpt":
+                if source.evidence_schema_version == 2 or entry is not None or source.source_kind == "canonical_excerpt":
                     if entry is None or ((source.source_kind == "canonical_excerpt" or entry.context_refs) and self.context_sources is None):
                         continue
                     from agentic_rag.runtime.models import RuntimeConfigSnapshot
@@ -105,7 +105,7 @@ class ChatSourceService:
                 items.append(
                     SourceItemView(
                         **source.model_dump(
-                            exclude={"document_id", "document_version_id", "parent_id", "source_provenance"}
+                            exclude={"document_id", "document_version_id", "parent_id", "source_provenance", "evidence_schema_version"}
                         ),
                         filename=document.filename,
                         version_status="current"
