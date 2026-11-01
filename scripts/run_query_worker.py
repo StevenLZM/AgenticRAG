@@ -52,10 +52,22 @@ DependenciesFactory = Callable[[AppContainer, Settings], Awaitable[QueryGraphDep
 async def ensure_active_child_alias(
     container: AppContainer, settings: Settings
 ) -> None:
-    """Repair a missing configured Child alias before consuming Query Outbox."""
-    await ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis, embedding_model=settings.embedding_model, **({"expected_representation_version": settings.expected_representation_version} if settings.expected_representation_version else {})).ensure_active_alias(
-        settings.index_generation
+    """Validate controlled targets; retain alias repair for legacy startup."""
+    store = ElasticsearchChildIndexStore(
+        container.elasticsearch,
+        lexical_analysis=settings.lexical_analysis,
+        embedding_model=settings.embedding_model,
+        **(
+            {"expected_representation_version": settings.expected_representation_version}
+            if settings.expected_representation_version
+            else {}
+        ),
     )
+    if settings.context_release_enabled:
+        # Only the fenced release workflow may repair a controlled search target.
+        await store.validate_search_target(settings.index_generation)
+    else:
+        await store.ensure_active_alias(settings.index_generation)
 
 
 class TransactionalQueryOutboxAdapter:

@@ -1,9 +1,11 @@
 """Offline A/B/C/D/E analysis of recorded runs; never dispatches a model."""
 
 import math
+import re
 from collections import defaultdict
 from statistics import mean
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from agentic_rag.models.contextual import SHA256_PATTERN
 
 ABLATIONS = {
     "A": "legacy 384 split / original rerank / original query",
@@ -91,9 +93,13 @@ def validate_ablation_configs(configs):
         raise ValueError("measure 384 to 320 split independently in A/B")
     if len({configs[key]["source_boundaries_hash"] for key in "BCDE"}) != 1:
         raise ValueError("B/C/D/E require identical original source boundaries")
-    if configs["D"].get("index_manifest_hash") != configs["E"].get(
-        "index_manifest_hash"
+    identities = [configs[key].get("index_manifest_hash") for key in "DE"]
+    if any(
+        not isinstance(identity, str) or not re.fullmatch(SHA256_PATTERN, identity)
+        for identity in identities
     ):
+        raise ValueError("D/E require explicit SHA-256 index manifest identities")
+    if identities[0] != identities[1]:
         raise ValueError("D/E require exactly the same index build")
 
 
