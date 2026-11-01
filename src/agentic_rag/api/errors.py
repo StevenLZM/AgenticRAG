@@ -172,6 +172,10 @@ async def _chat_error_handler(request: Request, exc: Exception) -> JSONResponse:
 
 
 def register_error_handlers(app: FastAPI) -> None:
+    from agentic_rag.persistence.context_release import ReleaseNotReady
+    @app.exception_handler(ReleaseNotReady)
+    async def maintenance_handler(request: Request, error: ReleaseNotReady):
+        return _response(request, status_code=503, error_code="maintenance_not_ready", message="Service maintenance is in progress.", retryable=True)
     """Install stable mappings without exposing exception strings or tracebacks."""
     for error_type in (SessionNotFound, SessionGone, SessionBusy, IdempotencyConflict):
         app.add_exception_handler(error_type, _chat_error_handler)

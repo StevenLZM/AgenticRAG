@@ -131,6 +131,8 @@ def build_query_snapshot(settings: Settings) -> RuntimeConfigSnapshot:
         retrieval_config_version="retrieval-ik-v1" if settings.lexical_analysis == "ik" else "retrieval-v1",
         index_generation=settings.index_generation,
         memory_config_version="agent_memories_v1-v1",
+        expected_representation_version=settings.expected_representation_version,
+        context_build_fingerprint=settings.context_build.fingerprint("0" * 64) if settings.context_pipeline_enabled else None,
         query_context_version="business-v1" if settings.query_context_enabled else None,
         max_research_rounds=settings.max_research_rounds,
         max_answer_revisions=settings.max_answer_revisions,
@@ -238,11 +240,19 @@ async def build_query_dependencies(
         gateway = ModelGateway(deepseek)
         embedding = _OpenAIEmbedding(qwen, settings.embedding_model, settings.embedding_dimensions)
         cross_encoder = cross_encoder_type(settings.reranker_model)
+        from agentic_rag.runtime.context_composition import pair_adapter
+        context_sources = getattr(container, "context_sources", None)
+        query_compiler = getattr(container, "query_compiler", None)
+        if settings.expected_representation_version and context_sources is None:
+            raise QueryCompositionError("enabled representation requires current SQL source authority")
+        if settings.query_context_enabled and query_compiler is None:
+            raise QueryCompositionError("enabled query context requires configured compiler")
         reranker = Reranker(
             cross_encoder,
             model_version=settings.reranker_model,
             max_concurrent_reranks=settings.max_concurrent_reranks,
             max_candidates=200,
+            **({"pair_tokenizer": pair_adapter(cross_encoder, settings)} if settings.expected_representation_version or settings.query_context_enabled else {}),
         )
         parents = _SessionParentRepository(repositories.session_factory)
         retrieval = RetrievalService(
@@ -251,17 +261,21 @@ async def build_query_dependencies(
                 vector=ElasticsearchVectorIndex(
                     elasticsearch,
                     index_generation=settings.index_generation,
+                    expected_representation_version=settings.expected_representation_version,
                     index=child_index,
                 ),
                 lexical=ElasticsearchBm25Index(
                     elasticsearch,
                     index_generation=settings.index_generation,
+                    expected_representation_version=settings.expected_representation_version,
                     index=child_index,
                     lexical_analysis=settings.lexical_analysis,
                 ),
                 reranker=reranker,
                 parent_fetcher=ParentFetcher(parents),
                 lane_timeout_seconds=10.0,
+                context_sources=context_sources,
+                query_compiler=query_compiler,
             )
         )
         evidence_builder = EvidenceBuilder()
@@ -290,6 +304,7 @@ async def build_query_dependencies(
         )
         dependencies = QueryGraphDependencies(
             memory=cast(Any, memory),
+            query_compiler=query_compiler,
             gateway=gateway,
             retrieval=retrieval,
             evidence_builder=evidence_builder,
@@ -298,7 +313,7 @@ async def build_query_dependencies(
             generator=AnswerGenerator(gateway),
             faithfulness_auditor=FaithfulnessAuditor(gateway),
             citation_validator=CitationValidator(),
-            authorization_resolver=ParentRepositoryAuthorizationResolver(parents),
+            authorization_resolver=ParentRepositoryAuthorizationResolver(parents, context_sources=context_sources),
             event_repository=event_repository,
             trace_recorder=TraceRecorder(runtime_config_snapshot_id=snapshot.snapshot_id),
             event_emitter=emitter,

@@ -36,19 +36,26 @@ class SourceView(BaseModel):
 
 
 class ChatSourceService:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, context_sources=None, parent_repository_factory=SqlAlchemyParentRepository):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, context_sources=None, parent_repository_factory=SqlAlchemyParentRepository, expected_snapshot=None):
+        self.expected_snapshot = expected_snapshot
         self.session_factory = session_factory
         self.context_sources = context_sources
         self.parent_repository_factory = parent_repository_factory
 
     async def get(self, scope: UserScope, session_id: str, run_id: str) -> SourceView:
         async with self.session_factory() as db:
+            from agentic_rag.persistence.context_release import check_context_admission
+            await check_context_admission(db, lock=False)
             repo = SqlAlchemyChatSessionRepository(db)
             if await repo.get_owned(scope, session_id) is None:
                 raise SessionNotFound(session_id)
             run = await SqlAlchemyRunRepository(db).get(run_id, scope)
             if run is None or run.thread_id != session_id:
                 raise SessionNotFound(run_id)
+            if self.expected_snapshot is not None:
+                frozen = run.runtime_config_snapshot
+                if (frozen.get("index_generation"), frozen.get("expected_representation_version")) != (self.expected_snapshot.index_generation, self.expected_snapshot.expected_representation_version):
+                    return SourceView(status="unavailable")
             if run.runtime_config_snapshot.get("answer_protocol_version") == "answer-v2" and run.answer:
                 from agentic_rag.orchestration.streaming import PublicSupervisorAnswer
                 ids = cited_ids(PublicSupervisorAnswer.model_validate(run.answer))
@@ -69,6 +76,8 @@ class ChatSourceService:
                 or tuple(item.evidence_id for item in snapshot.items) != ids[:64]
                 or snapshot.omitted_source_count != max(0, len(ids) - 64)
             ):
+                return SourceView(status="unavailable")
+            if run.runtime_config_snapshot.get("expected_representation_version") == "context-v1" and (snapshot.schema_version != 2 or any(item.source_provenance is None or not item.source_provenance.context_refs for item in snapshot.items)):
                 return SourceView(status="unavailable")
             access = await repo.source_documents(
                 scope,

@@ -132,7 +132,9 @@ class VersionPublisher:
         artifacts: ManifestArtifactReader,
         alias_store: ActiveIndexAliasStore | None = None,
         embedding_model: str = EMBEDDING_MODEL,
+        registry_enabled: bool = False,
     ) -> None:
+        self._registry_enabled = registry_enabled
         self._repository = repository
         self._parent_store = parent_store
         self._child_store = child_store
@@ -153,6 +155,18 @@ class VersionPublisher:
             )
 
         await self._verify(target)
+        if self._registry_enabled:
+            manifest = VersionManifest.model_validate(self._artifacts.read_json(self._artifacts.describe(target.manifest_uri)))
+            if manifest.schema_version == 2:
+                parents = validate_context_artifacts(manifest, self._artifacts, (target.context.user_id, target.context.document_id, target.context.document_version_id))
+            else:
+                from agentic_rag.ingestion.chunker import ParentChunk
+                context = target.context
+                raw = self._artifacts.read_json(self._artifacts.describe(f"artifact://documents/{context.user_id}/{context.document_id}/{context.document_version_id}/chunks/{context.pipeline_version}/parents.json"))
+                parents = tuple(ParentChunk.model_validate(value) for value in raw["parents"])
+            actual = await self._child_store.child_identities(target.context)
+            if child_identity_digest(actual) != child_identity_digest((child.id, child.content_hash) for parent in parents for child in parent.children):
+                raise PublicationIntegrityError("registered publication child identity mismatch")
 
         # This order is a durable contract. Each operation is idempotent and scoped by
         # the trusted user/document/version identity in ``StagingContext``.

@@ -53,7 +53,7 @@ async def ensure_active_child_alias(
     container: AppContainer, settings: Settings
 ) -> None:
     """Repair a missing configured Child alias before consuming Query Outbox."""
-    await ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis, embedding_model=settings.embedding_model).ensure_active_alias(
+    await ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis, embedding_model=settings.embedding_model, **({"expected_representation_version": settings.expected_representation_version} if settings.expected_representation_version else {})).ensure_active_alias(
         settings.index_generation
     )
 
@@ -134,6 +134,9 @@ async def run(
         await ensure_active_child_alias(container, settings)
         dependencies = await dependencies_factory(container, settings)
         shared_concurrency = dependencies.concurrency or ConcurrencyManager()
+        from agentic_rag.runtime.context_composition import validate_context_role
+        if settings.context_release_enabled:
+            await validate_context_role(container, "query")
         async with container.checkpoints.open_query() as checkpointer:
             worker = QueryWorker(
                 runs=TransactionalRunRepository(container.repositories.session_factory),

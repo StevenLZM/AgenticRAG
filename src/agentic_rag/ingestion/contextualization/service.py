@@ -98,7 +98,24 @@ class ContextualizationService:
             uri=ref.uri, sha256=ref.sha256, size_bytes=ref.size_bytes
         )
 
-    async def enrich(
+    async def enrich(self, canonical, parents, *, canonical_ref, build, claim, before_side_effect):
+        import time
+        started = time.monotonic()
+        key = BuildKey(user_id=claim.user_id, document_id=claim.document_id,
+            document_version_id=claim.document_version_id, build_fingerprint=build.fingerprint(canonical_ref.sha256), source_child_id="__document__")
+        if hasattr(self._store, "record_event"):
+            await self._store.record_event(key, claim, {"stage": "document", "outcome": "triggered", "llm_enabled": build.extraction_enabled})
+        try:
+            result = await self._enrich(canonical, parents, canonical_ref=canonical_ref, build=build, claim=claim, before_side_effect=before_side_effect)
+        except SourceIntegrityError:
+            if hasattr(self._store, "record_event"):
+                await self._store.record_event(key, claim, {"stage": "document", "outcome": "source_integrity_failure", "latency_seconds": time.monotonic() - started})
+            raise
+        if hasattr(self._store, "record_event"):
+            await self._store.record_event(key, claim, {"stage": "document", "outcome": "completed", "latency_seconds": time.monotonic() - started})
+        return result
+
+    async def _enrich(
         self,
         canonical: CanonicalAst,
         parents: Sequence[ParentChunk],
@@ -432,6 +449,10 @@ class ContextualizationService:
                     raise SourceIntegrityError(
                         "accepted context representation differs from artifact"
                     )
+                if hasattr(self._store, "record_event"):
+                    from collections import Counter
+                    await self._store.record_event(key, claim, {"stage": "rendered", "before_search_hash": child.content_hash, "after_search_hash": rep.content_hash,
+                        "fields": dict(Counter(f"{c.field}:{c.status}:{c.verification_status or 'none'}" for c in artifact.claims)), "enrichment_status": rep.enrichment_status})
                 children.append(apply_search_representation(child, rep))
                 accepted_refs.append(rep.context_ref.model_dump(mode="json"))
             enriched.append(parent.model_copy(update={"children": tuple(children)}))
@@ -482,6 +503,10 @@ class ContextualizationService:
             build.max_input_tokens * build.input_price_per_million
             + build.max_output_tokens * build.output_price_per_million
         ) / 1_000_000
+        import time
+        started = time.monotonic()
+        if hasattr(self._store, "record_event"):
+            await self._store.record_event(key, claim, {"stage": kind, "outcome": "triggered"})
         try:
             async with self._semaphore:
                 await before()
@@ -505,6 +530,8 @@ class ContextualizationService:
                         tokens=usage.input_tokens + usage.output_tokens,
                         cost=actual_cost,
                     )
+                if hasattr(self._store, "record_event"):
+                    await self._store.record_event(key, claim, {"stage": kind, "outcome": "completed", "latency_seconds": time.monotonic() - started, "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens, "usage_complete": response.usage.complete, "fields": [candidate.field for candidate in response.claims] if kind == "extract" else [input.candidate.field]})
                 return response
         except (
             BudgetExhausted,
@@ -514,6 +541,8 @@ class ContextualizationService:
             StructuredOutputValidationError,
             ModelOutputTruncatedError,
             APIError,
-        ):
+        ) as error:
+            if hasattr(self._store, "record_event"):
+                await self._store.record_event(key, claim, {"stage": kind, "outcome": "fallback", "reason": type(error).__name__, "latency_seconds": time.monotonic() - started})
             # Unknown dispatch spend stays reserved across retries and crashes.
             return None

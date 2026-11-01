@@ -51,6 +51,9 @@ def create_app(settings: Settings, *, container: Any | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
+            if settings.context_release_enabled:
+                from agentic_rag.runtime.context_composition import validate_context_role
+                await validate_context_role(container, "api")
             yield
         finally:
             if owns_container:

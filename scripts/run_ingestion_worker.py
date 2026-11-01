@@ -129,13 +129,14 @@ async def run(settings: Settings) -> None:
     factory = container.repositories.session_factory
     jobs = SqlAlchemyIngestionJobStore(factory)
     parent_store = SqlAlchemyParentStagingStore(factory, embedding_model=settings.embedding_model)
-    child_store = ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis, embedding_model=settings.embedding_model)
+    child_store = ElasticsearchChildIndexStore(container.elasticsearch, lexical_analysis=settings.lexical_analysis, embedding_model=settings.embedding_model, expected_representation_version=settings.expected_representation_version)
     publisher = VersionPublisher(
         repository=SqlAlchemyPublicationRepository(factory),
         parent_store=parent_store,
         child_store=child_store,
         artifacts=artifacts,
-        alias_store=child_store,
+        alias_store=None if settings.context_release_enabled else child_store,
+        registry_enabled=settings.context_release_enabled,
         embedding_model=settings.embedding_model,
     )
     reconciler = IngestionReconciler(
@@ -151,8 +152,10 @@ async def run(settings: Settings) -> None:
         artifacts=artifacts,
     )
     tokenizer = HuggingFaceTokenizer.from_pretrained(
-        settings.embedding_tokenizer_model, max_tokens=CHILD_MAX_TOKENS
+        settings.embedding_tokenizer_model, max_tokens=CHILD_MAX_TOKENS, **({"local_files_only": True} if settings.context_pipeline_enabled else {})
     )
+    from agentic_rag.runtime.context_composition import build_contextualizer, validate_context_role
+    contextualizer, context_client = build_contextualizer(container, settings, tokenizer)
     parser = DocumentParser(
         source_loader=artifacts.read_bytes,
         artifacts=artifacts,
@@ -167,7 +170,9 @@ async def run(settings: Settings) -> None:
         parser=parser,
         assembler=GlobalAssembler(),
         content_scanner=ContentSafetyScanner(),
-        chunker=ChunkingPipeline(tokenizer),
+        chunker=ChunkingPipeline(tokenizer, child_max_tokens=320 if settings.context_pipeline_enabled else CHILD_MAX_TOKENS),
+        contextualizer=contextualizer,
+        context_build=settings.context_build if settings.context_pipeline_enabled else None,
         index_writer=IndexWriter(
             embedding=embedding,
             embedding_model=settings.embedding_model,
@@ -179,7 +184,8 @@ async def run(settings: Settings) -> None:
     )
     try:
         async with container.checkpoints.open_ingestion() as checkpointer:
-            graph = IngestionGraph(pipeline=pipeline, checkpointer=checkpointer)
+            graph = IngestionGraph(pipeline=pipeline, checkpointer=checkpointer, contextualization_enabled=settings.context_pipeline_enabled)
+            await validate_context_role(container, "ingestion")
             worker = IngestionWorker(
                 jobs=jobs,
                 broker=container.broker,
@@ -196,6 +202,8 @@ async def run(settings: Settings) -> None:
                     pass
             await worker.run_forever(stop_event=stop)
     finally:
+        if context_client is not None:
+            await context_client.close()
         await embedding.close()
         await container.close()
 

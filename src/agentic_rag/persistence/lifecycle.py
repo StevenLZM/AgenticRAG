@@ -44,6 +44,8 @@ class SqlAlchemyPublicationRepository(PublicationRepository):
 
     async def is_writable(self, context: StagingContext) -> bool:
         async with self._session_factory() as session:
+            from agentic_rag.persistence.context_release import check_context_admission
+            await check_context_admission(session, allow_draining=True, lock=False)
             writable = await session.scalar(
                 select(documents.c.id)
                 .select_from(
@@ -160,6 +162,9 @@ class SqlAlchemyPublicationRepository(PublicationRepository):
     async def finalize(self, target: PublicationTarget) -> None:
         context = target.context
         async with self._session_factory.begin() as session:
+            from agentic_rag.persistence.context_release import check_context_admission
+            from agentic_rag.persistence.context_registry import publication_builds
+            await check_context_admission(session, allow_draining=True)
             document = (
                 (
                     await session.execute(
@@ -209,6 +214,7 @@ class SqlAlchemyPublicationRepository(PublicationRepository):
             if newer_active is not None:
                 raise PublicationObsoleteError(context, cast(str, newer_active))
 
+            await publication_builds(session, target)
             current_version_status = await session.scalar(
                 select(document_versions.c.status).where(
                     document_versions.c.id == context.document_version_id,
@@ -735,6 +741,8 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
 
     async def restore_active_document(self, version_id: str) -> bool:
         async with self._session_factory.begin() as session:
+            from agentic_rag.persistence.context_release import check_context_admission
+            await check_context_admission(session, allow_draining=True)
             row = (
                 (
                     await session.execute(
@@ -781,6 +789,8 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
 
     async def resolve_deactivated_version(self, version_id: str) -> None:
         async with self._session_factory.begin() as session:
+            from agentic_rag.persistence.context_release import check_context_admission
+            await check_context_admission(session, allow_draining=True)
             version = (
                 (
                     await session.execute(
@@ -885,12 +895,19 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
                 .mappings()
                 .all()
             )
+        registry_rows = []
+        async with self._session_factory() as session:
+            if session.info.get("context_config_hash"):
+                from agentic_rag.persistence.context_registry import retrieval_builds
+                registry_rows = (await session.execute(select(retrieval_builds.c.document_version_id, retrieval_builds.c.index_generation).where(retrieval_builds.c.document_id.in_(document_ids)))).all()
         grouped: dict[str, list[StagingContext]] = {value: [] for value in document_ids}
         user_by_document = {
             cast(str, row["id"]): cast(str, row["user_id"]) for row in document_rows
         }
         for row in rows:
-            grouped[cast(str, row["document_id"])].append(_context(row))
+            base = _context(row)
+            generations = {base.index_generation, *(generation for version, generation in registry_rows if version == base.document_version_id)}
+            grouped[cast(str, row["document_id"])].extend(base.model_copy(update={"index_generation": generation}) for generation in sorted(generations))
         return tuple(
             DeletedDocument(
                 user_id=user_by_document[value],
@@ -922,6 +939,11 @@ class SqlAlchemyReconciliationRepository(ReconciliationRepository):
             document_ids = tuple(cast(str, value) for value in values)
             if not document_ids:
                 return ()
+            if session.info.get("context_config_hash"):
+                from agentic_rag.persistence.context_registry import invalidate_document_builds
+                owners = (await session.execute(select(documents.c.user_id, documents.c.id).where(documents.c.id.in_(document_ids)))).all()
+                for owner, document in owners:
+                    await invalidate_document_builds(session, owner, document)
             await session.execute(
                 update(ingestion_jobs)
                 .where(

@@ -70,6 +70,9 @@ class AppContainer:
     chat_session_service: ChatSessionService | None = None
     chat_source_service: ChatSourceService | None = None
     query_phase_reader: QueryPhaseReader | None = None
+    context_sources: object | None = None
+    query_compiler: object | None = None
+    coordination_store: object | None = None
 
     async def close(self, *, raise_on_error: bool = False) -> None:
         """Attempt cleanup of every process-owned async client.
@@ -125,8 +128,10 @@ class _TransactionalEventRepository:
             )
 
 
-def build_container(settings: Settings) -> AppContainer:
+def build_container(settings: Settings, *, business_profiles=None, business_directory=None, business_coverage=None) -> AppContainer:
     """Construct adapters without opening network connections or calling models."""
+    from agentic_rag.runtime.context_composition import validate_context_configuration, build_context_sources, build_query_compiler
+    validate_context_configuration(settings)
     mysql_engine = create_mysql_engine(settings.mysql_dsn, pool_pre_ping=True)
     redis = Redis.from_url(settings.redis_url)
     elasticsearch = AsyncElasticsearch(settings.elasticsearch_url)
@@ -135,6 +140,12 @@ def build_container(settings: Settings) -> AppContainer:
     reranker_initialized = bool(settings.reranker_model.strip())
     runtime_snapshot = build_query_snapshot(settings)
     repositories = Repositories(create_session_factory(mysql_engine))
+    if settings.context_release_enabled:
+        repositories.session_factory.configure(info={"context_config_hash": runtime_snapshot.snapshot_id, "context_artifacts": artifacts, "context_instance_id": settings.context_instance_id, "context_build_config_hash": runtime_snapshot.context_build_fingerprint})
+    context_sources = build_context_sources(repositories.session_factory, artifacts, settings)
+    query_compiler = build_query_compiler(settings, artifacts, profiles=business_profiles, directory=business_directory, coverage=business_coverage)
+    from agentic_rag.orchestration.store import CoordinationStore
+    coordination_store = CoordinationStore(repositories.session_factory, context_sources=context_sources, query_compiler=query_compiler) if settings.supervisor_enabled else None
     event_repository = _TransactionalEventRepository(repositories.session_factory)
     memory_container = type("MemoryContainer", (), {"repositories": repositories})()
     try:
@@ -201,8 +212,11 @@ def build_container(settings: Settings) -> AppContainer:
         runtime_snapshot=runtime_snapshot,
         run_manager=run_manager,
         chat_session_service=ChatSessionService(repositories.session_factory, run_manager),
-        chat_source_service=ChatSourceService(repositories.session_factory),
+        chat_source_service=ChatSourceService(repositories.session_factory, context_sources=context_sources, expected_snapshot=runtime_snapshot if settings.context_release_enabled else None),
         query_phase_reader=QueryPhaseReader(repositories.session_factory),
         event_repository=event_repository,
         memory_service=memory_service,
+        context_sources=context_sources,
+        query_compiler=query_compiler,
+        coordination_store=coordination_store,
     )

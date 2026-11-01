@@ -11,6 +11,12 @@ class SourceAccessRevoked(PermissionError):
 
 
 async def authorize_sources(db: Any, run: dict[str, Any], evidence: list[dict[str, Any]], *, context_sources=None) -> None:
+    if db is not None and getattr(db, "info", {}).get("context_config_hash"):
+        from agentic_rag.persistence.context_release import check_context_admission
+        from agentic_rag.runtime.models import RuntimeConfigSnapshot
+        await check_context_admission(db, allow_draining=True, lock=False, snapshot=RuntimeConfigSnapshot.model_validate(run["data"]["snapshot"]))
+    if run["data"]["snapshot"].get("expected_representation_version") == "context-v1" and any(e.get("schema_version") != 2 or not e.get("context_refs") for e in evidence):
+        raise SourceAccessRevoked("frozen context-v1 policy requires registered context provenance")
     contextual = [e for e in evidence if e.get("source_kind") == "canonical_excerpt" or e.get("context_refs")]
     if contextual:
         if context_sources is None:

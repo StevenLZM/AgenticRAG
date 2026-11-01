@@ -366,6 +366,8 @@ class ContextSourceHydrator:
         requirements = []
         loaded = {}
         for hit in hits:
+            if snapshot.expected_representation_version == "context-v1" and hit.representation_version != "context-v1":
+                raise ContextSourceViolation("frozen context-v1 policy cannot accept legacy hit")
             if hit.user_id != scope.user_id:
                 raise ContextSourceViolation("source outside scope")
             if query_plan is not None and (

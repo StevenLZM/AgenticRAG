@@ -775,6 +775,8 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         if not outbox_stream_name.strip():
             raise ValueError("query outbox stream name must not be blank")
         session = self._session(transaction)
+        from agentic_rag.persistence.context_release import check_context_admission
+        await check_context_admission(session, snapshot=snapshot)
         chat = await lock_chat_session(session, scope, thread_id)
         if chat is not None and snapshot.evaluation is not None:
             raise ValueError("evaluation cannot use a chat session")
@@ -887,6 +889,8 @@ class SqlAlchemyRunRepository(_SqlAlchemyRepository):
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         session = self._session()
+        from agentic_rag.persistence.context_release import check_context_admission
+        await check_context_admission(session, allow_draining=True)
         now = _now()
         result = cast(
             CursorResult[Any],
@@ -1282,6 +1286,10 @@ class SqlAlchemyDocumentRepository(_SqlAlchemyRepository):
         *,
         transaction: AsyncSession | None = None,
     ) -> bool:
+        from agentic_rag.persistence.context_release import check_context_admission
+        from agentic_rag.persistence.context_registry import invalidate_document_builds
+        await check_context_admission(self._session(transaction))
+        await invalidate_document_builds(self._session(transaction), scope.user_id, document_id)
         result = await self._session(transaction).execute(
             update(documents)
             .where(

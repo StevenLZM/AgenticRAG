@@ -74,6 +74,7 @@ class RuntimeConfigSnapshot(BaseModel):
     evaluation: EvaluationMetadata | None = None
     # Legacy checkpoints remain readable with their original content hash.
     # New Runs bind endpoints and concurrency as well as model names.
+    expected_representation_version: Literal["context-v1"] | None = None
     query_context_version: Literal["business-v1"] | None = None
     context_build_fingerprint: str | None = Field(
         default=None, pattern=r"^[a-f0-9]{64}$"

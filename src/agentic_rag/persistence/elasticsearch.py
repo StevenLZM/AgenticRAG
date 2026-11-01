@@ -292,7 +292,7 @@ class ElasticsearchChildIndexStore:
                     context.document_version_id,
                 ):
                     raise ValueError("context identity readback crossed scope")
-                if source["representation_version"] != "context-v1" or source[
+                if source.get("representation_version") != self._expected_representation_version or source[
                     "content_hash"
                 ] != text_sha256(source["contextualized_content"]):
                     raise ValueError(
@@ -315,6 +315,21 @@ class ElasticsearchChildIndexStore:
             if cursor == after:
                 raise ValueError("context identity readback cursor did not advance")
             after = cursor
+
+    async def prepare_release_membership(self, index_generation, members):
+        """Maintenance-only exact current corpus activation, before alias switch."""
+        from agentic_rag.ingestion.manifest import child_identity_digest
+        await self.validate_search_target(index_generation, index=self.index_name(index_generation))
+        for context, expected_digest in members:
+            if context.index_generation != index_generation or child_identity_digest(await self.child_identities(context)) != expected_digest:
+                raise ValueError("release member identity/hash collection differs")
+        response = await self._client.update_by_query(
+            index=self.index_name(index_generation), query={"term": {"search_type": "document"}},
+            script={"lang": "painless", "source": "ctx._source.is_active = false"},
+            conflicts="abort", refresh=True)
+        self._require_complete_lifecycle(response.body, operation="release deactivation")
+        for context, _ in members:
+            await self.activate(context)
 
     async def activate(self, context: StagingContext) -> None:
         await self._set_active(context, is_active=True)

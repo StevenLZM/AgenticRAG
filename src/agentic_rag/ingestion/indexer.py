@@ -177,6 +177,10 @@ class IndexWriter:
             raise ValueError("embedding model must be a nonblank identifier")
         self._embedding_model = embedding_model
 
+    async def stage_search_representation(self, chunks, **kwargs):
+        from agentic_rag.ingestion.contextualization.builds import stage_search_representation
+        return await stage_search_representation(self, chunks, **kwargs)
+
     async def stage(
         self,
         chunks: Sequence[ParentChunk],

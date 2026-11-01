@@ -340,6 +340,8 @@ class SqlAlchemyIngestionJobStore:
             raise ValueError("lease_seconds must be positive")
         now = datetime.now(UTC)
         async with self._session_factory.begin() as session:
+            from agentic_rag.persistence.context_release import check_context_admission
+            await check_context_admission(session, allow_draining=True)
             result = await session.execute(
                 update(ingestion_jobs)
                 .where(

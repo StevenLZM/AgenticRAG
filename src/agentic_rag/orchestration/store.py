@@ -62,6 +62,12 @@ class CoordinationStore:
             raise ValueError("invalid server run context")
         try:
             async with self.session_factory.begin() as db:
+                from agentic_rag.persistence.context_release import check_context_admission
+                admitted = False
+                if db.info.get("context_config_hash"):
+                    from agentic_rag.persistence.repositories import agent_runs
+                    admitted = bool(await db.scalar(select(agent_runs.c.id).where(agent_runs.c.id == run_id, agent_runs.c.user_id == user_id, agent_runs.c.runtime_config_snapshot_id == snapshot.snapshot_id, agent_runs.c.status.in_(("queued", "running")))))
+                await check_context_admission(db, allow_draining=admitted, snapshot=snapshot)
                 if self.max_active_runs is not None:
                     from agentic_rag.orchestration.capacity import lock_admission
                     await lock_admission(db)
@@ -145,6 +151,8 @@ class CoordinationStore:
         if hint is None:
             return None
         async with self.session_factory.begin() as db:
+            from agentic_rag.persistence.context_release import check_context_admission
+            await check_context_admission(db, allow_draining=True)
             run = await lock_run(db, hint["run_id"])
             item = (await db.execute(select(schema.work_items).where(schema.work_items.c.id == work_id).with_for_update())).mappings().one_or_none()
             if item is None:

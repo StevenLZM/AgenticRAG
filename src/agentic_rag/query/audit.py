@@ -109,6 +109,9 @@ class ParentRepositoryAuthorizationResolver:
         by_id = {row.id: row for row in rows}
         result = {}
         for evidence_id, entry in manifest.items():
+            if snapshot.expected_representation_version == "context-v1" and (entry.schema_version != 2 or not entry.context_refs):
+                result[evidence_id] = {}
+                continue
             if entry.source_kind == "canonical_excerpt":
                 if self._context_sources is None:
                     result[evidence_id] = {}

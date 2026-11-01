@@ -133,6 +133,7 @@ class Reranker:
         if type(max_candidates) is not int or not 1 <= max_candidates <= 200:
             raise ValueError("max_candidates must be in [1, 200]")
         self.max_candidates = max_candidates
+        self.max_inference_pairs = 2 * max_candidates if pair_tokenizer is not None else max_candidates
         self.model = model
         self._model_version = model_version
         self._timeout_seconds = timeout_seconds
@@ -182,6 +183,8 @@ class Reranker:
             pairs.extend((window, document) for window in windows)
             counts.append(len(windows))
         # No inference runs until every candidate's complete text passes preflight.
+        if len(pairs) > self.max_inference_pairs:
+            raise ValueError("rerank inference pair budget exceeded")
         scores = self.model.predict(pairs)
         if len(scores) != len(pairs):
             raise ValueError("Cross-Encoder returned a score count mismatch")

@@ -298,6 +298,7 @@ def build_retrieval_graph(
             reranked_hits=result.hits,
             rerank_window_counts=result.window_counts,
             rerank_pairs=sum(result.window_counts),
+            **({"rerank_pair_upper_bound": 2 * len(state["fused_hits"])} if state["snapshot"].expected_representation_version or state["snapshot"].query_context_version else {}),
             reranker=len(result.hits),
             degraded_components=degraded,
         )
@@ -459,7 +460,7 @@ def _stage_update(
     timings = dict(state["timings_ms"])
     timings[stage] = _elapsed_ms(started)
     counts = dict(state["candidate_counts"])
-    for key in ("rrf", "reranker", "rerank_pairs", "parents_selected", "parents_hydrated"):
+    for key in ("rrf", "reranker", "rerank_pairs", "rerank_pair_upper_bound", "parents_selected", "parents_hydrated"):
         value = update.pop(key, None)
         if value is not None:
             counts[key] = cast(int, value)

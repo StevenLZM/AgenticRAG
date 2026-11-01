@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     qwen_api_key: SecretStr | None = None
     query_context_enabled: bool = False
     context_pipeline_enabled: bool = False
+    context_release_enabled: bool = False
+    context_instance_id: str | None = None
+    context_maintenance_public_key: str | None = None
+    context_maintenance_issuer: str | None = None
+    context_model_tokenizers: dict[str, str] = Field(default_factory=dict)
+    expected_representation_version: Literal["context-v1"] | None = None
+    context_deployment_roles: tuple[str, ...] = ("api", "query", "ingestion", "rebuild")
     context_build: ContextBuildConfig = Field(default_factory=ContextBuildConfig)
     mem0_enabled: bool = True
     mem0_collection: str = "agent_memories_v1"

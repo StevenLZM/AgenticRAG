@@ -60,19 +60,38 @@ context_build_reservations = Table(
 )
 
 
+context_build_observations = Table("context_build_observations", metadata,
+    Column("id", String(32), primary_key=True),
+    Column("build_id", String(64), nullable=False, index=True),
+    Column("item_id", String(64), nullable=False),
+    Column("event", JSON, nullable=False))
+
+
 class SqlAlchemyContextBuildStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
         self._factory = session_factory
+
+    async def record_event(self, key, claim, event):
+        import logging
+        async with self._factory.begin() as session:
+            await self._fence(session, key, claim)
+            await session.execute(insert(context_build_observations).values(id=uuid4().hex, build_id=key.build_id, item_id=key.item_id, event=event))
+        logging.getLogger(__name__).info("context_build_observation", extra={"build_id": key.build_id, "item_id": key.item_id, **event})
 
     async def _fence(self, session, key, claim):
         key.check_claim(claim)
         # A write locks the durable Job until this SAME transaction commits.
         # A separate assert_lease read cannot protect the accepted pointer.
-        result = await session.execute(
-            update(ingestion_jobs)
-            .where(*_live_claim_predicates(claim, datetime.now(UTC)))
-            .values(heartbeat_at=ingestion_jobs.c.heartbeat_at)
-        )
+        from agentic_rag.persistence.context_registry import RebuildClaim, retrieval_rebuild_jobs, rebuild_predicates, current_source
+        if isinstance(claim, RebuildClaim):
+            await current_source(session, claim.user_id, claim.document_id, claim.document_version_id)
+            result = await session.execute(update(retrieval_rebuild_jobs).where(*rebuild_predicates(claim, datetime.now(UTC))).values(lease_owner=claim.owner))
+        else:
+            result = await session.execute(
+                update(ingestion_jobs)
+                .where(*_live_claim_predicates(claim, datetime.now(UTC)))
+                .values(heartbeat_at=ingestion_jobs.c.heartbeat_at)
+            )
         if result.rowcount != 1:
             raise LeaseLost("context build lease lost")
 

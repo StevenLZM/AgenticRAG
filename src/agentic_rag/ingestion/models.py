@@ -112,6 +112,8 @@ class DocumentService:
         )
         try:
             async with self._session_factory.begin() as transaction:
+                from agentic_rag.persistence.context_release import check_context_admission
+                await check_context_admission(transaction)
                 values = _VersionCreationValues(
                     content_hash=decision.content_hash,
                     parser_version=self._versions.parser,
