@@ -140,7 +140,7 @@ async def built(
         from tests.unit.ingestion.test_context_sources import _child
         from agentic_rag.ingestion.chunker import ParentChunk
 
-        first_child = _child(*texts[:-1]).model_copy(update={"id": "first-child"})
+        first_child = _child(*texts[:2]).model_copy(update={"id": "first-child"})
         first = ParentChunk(
             **{
                 **first_child.model_dump(
@@ -1024,10 +1024,11 @@ async def test_full_retrieval_entry_uses_shared_original_source_service(tmp_path
         "missing_version_and_provenance",
         "version_mismatch",
         "old_version_marker",
+        "downgrade_without_provenance",
         "valid_prefix",
     ],
 )
-@pytest.mark.parametrize("source_mode", ["contextual", "legacy_v2"])
+@pytest.mark.parametrize("source_mode", ["contextual", "legacy_v2", "structural"])
 async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(
     tmp_path, tamper, source_mode
 ):
@@ -1080,6 +1081,14 @@ async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(
             SNAPSHOT,
         )
         assert packed.items and not packed.items[0].context_refs
+    elif source_mode == "structural":
+        hydrator, authority, hit, parent = await built(
+            tmp_path / "artifacts",
+            structural=True,
+            texts=("星河公司普通员工上海标准500一晚。",),
+        )
+        packed = await pack(hydrator, hit, parent)
+        assert len(packed.items) == 1 and packed.items[0].schema_version == 2
     else:
         hydrator, authority, hit, parent = await built(tmp_path / "artifacts")
         packed = await pack(hydrator, hit, parent)
@@ -1204,6 +1213,13 @@ async def test_chat_sources_rechecks_private_excerpt_authority_on_each_read(
                 item["evidence_schema_version"] = 1
             elif tamper == "old_version_marker":
                 item.pop("evidence_schema_version", None)
+            elif tamper == "downgrade_without_provenance":
+                item.update(
+                    evidence_schema_version=1,
+                    source_provenance=None,
+                    excerpt="伪造：星河公司标准99999一晚。",
+                    truncated=False,
+                )
             elif tamper == "heading":
                 item.update(heading_path=["伪造适用范围"], heading_truncated=True)
             elif tamper == "page":
@@ -1626,8 +1642,9 @@ async def test_schema2_legacy_parent_original_bytes_are_reauthorized_without_con
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repeated_legacy", [False, True])
 async def test_mixed_legacy_and_contextual_sources_survive_reducer_and_public_read(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, repeated_legacy
 ):
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
@@ -1640,7 +1657,23 @@ async def test_mixed_legacy_and_contextual_sources_survive_reducer_and_public_re
     from agentic_rag.runtime import chat_sources
     from tests.unit.query.test_answer_sources import answer
 
-    hydrator, authority, hits, parents = await built(tmp_path, split_parents=True)
+    options = (
+        dict(
+            preserve_parent=True,
+            texts=(
+                "本制度适用于星河公司。",
+                "本章仅适用于普通员工，不含外包人员。",
+                "上海差旅标准500一晚。",
+                "背景。" * 500,
+                "上海差旅标准500一晚。",
+            ),
+        )
+        if repeated_legacy
+        else {}
+    )
+    hydrator, authority, hits, parents = await built(
+        tmp_path, split_parents=True, **options
+    )
     contextual = await pack(hydrator, hits[0], parents[0])
     legacy_hit = ChildHit(
         **{
@@ -1665,7 +1698,11 @@ async def test_mixed_legacy_and_contextual_sources_survive_reducer_and_public_re
         (),
         SCOPE,
         SNAPSHOT,
+        max_tokens=400 if repeated_legacy else 12000,
     )
+    if repeated_legacy:
+        assert legacy.items[0].content.startswith("…")
+        assert legacy.items[0].content.endswith(legacy_hit.content)
     merged = EvidenceReducer.merge(
         [
             SimpleNamespace(todo_id="context", evidence=contextual),
@@ -1679,9 +1716,11 @@ async def test_mixed_legacy_and_contextual_sources_survive_reducer_and_public_re
         public, merged, run_id="run", snapshot_id=SNAPSHOT.snapshot_id
     )
     assert sources.schema_version == 2
-    assert {s.evidence_id: s.evidence_schema_version for s in sources.items} == {
-        item.evidence_id: item.schema_version for item in merged.items
-    }
+    assert all(
+        s.evidence_schema_version == 2 and s.source_provenance.schema_version == 2
+        for s in sources.items
+    )
+    assert {s.evidence_id for s in sources.items} == set(merged.manifest)
     run = SimpleNamespace(
         id="run",
         thread_id="session",
@@ -1719,9 +1758,35 @@ async def test_mixed_legacy_and_contextual_sources_survive_reducer_and_public_re
     async def session_factory():
         yield object()
 
+    parent_active = True
+
+    class Parents:
+        def __init__(self, db):
+            pass
+
+        async def get_many(self, parent_ids, scope):
+            assert scope == SCOPE
+            return [
+                SimpleNamespace(
+                    id=p.parent_id,
+                    user_id=SCOPE.user_id,
+                    document_id=p.document_id,
+                    document_version_id=p.document_version_id,
+                    ast_locator=p.ast_locator,
+                    heading_path=p.heading_path,
+                    content=p.content,
+                    status="active" if parent_active else "deleted",
+                    index_generation=SNAPSHOT.index_generation,
+                )
+                for p in parents
+                if p.parent_id in parent_ids
+            ]
+
     monkeypatch.setattr(chat_sources, "SqlAlchemyChatSessionRepository", Sessions)
     monkeypatch.setattr(chat_sources, "SqlAlchemyRunRepository", Runs)
-    reader = chat_sources.ChatSourceService(session_factory, context_sources=hydrator)
+    reader = chat_sources.ChatSourceService(
+        session_factory, context_sources=hydrator, parent_repository_factory=Parents
+    )
     view = await reader.get(SCOPE, "session", "run")
     assert view.status == "available" and view.omitted_source_count == 0
     assert tuple(s.evidence_id for s in view.items) == tuple(merged.manifest)
@@ -1729,11 +1794,23 @@ async def test_mixed_legacy_and_contextual_sources_survive_reducer_and_public_re
         s.evidence_id: s.excerpt for s in sources.items
     }
     assert all("evidence_schema_version" not in s.model_dump() for s in view.items)
+    # The normalized legacy sibling also binds public text to its repository bytes.
+    changed = sources.model_dump(mode="json")
+    for source in changed["items"]:
+        if source["evidence_id"] in legacy.manifest:
+            source["excerpt"] = "伪造99999"
+    run.answer_sources = changed
+    altered = await reader.get(SCOPE, "session", "run")
+    assert altered.status == "partial"
+    assert tuple(s.evidence_id for s in altered.items) == tuple(contextual.manifest)
+    run.answer_sources = sources.model_dump(mode="json")
     # Revoking context authority must still remove only the affected new source.
     authority.revoked = True
     revoked = await reader.get(SCOPE, "session", "run")
     assert revoked.status == "partial"
     assert tuple(s.evidence_id for s in revoked.items) == tuple(legacy.manifest)
+    parent_active = False
+    assert (await reader.get(SCOPE, "session", "run")).status == "unavailable"
     # Genuine historical schema1 snapshots predate both private fields.
     historical_answer = answer(tuple(legacy.manifest))
     historical = build_answer_sources(

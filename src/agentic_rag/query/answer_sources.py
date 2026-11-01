@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from agentic_rag.ingestion.chunker import AstLocator
+from agentic_rag.models.contextual import text_sha256
 from agentic_rag.query.evidence_builder import PackedEvidence, EvidenceManifestEntry, matches_manifest
 from agentic_rag.query.public_answer import PublicAnswer
 
@@ -38,7 +39,7 @@ class AnswerSource(BaseModel):
     document_version_id: SourceId
     source_kind: Literal["parent_chunk", "canonical_excerpt"] = "parent_chunk"
     parent_id: SourceId | None
-    # Private per-item format marker; None preserves pre-marker snapshots.
+    # Private proof-format marker, never a substitute for source provenance.
     evidence_schema_version: Literal[1, 2] | None = None
     source_provenance: EvidenceManifestEntry | None = None
     heading_path: tuple[str, ...] = Field(default=(), max_length=16)
@@ -84,8 +85,8 @@ class AnswerSources(BaseModel):
     def bounded_storage(self):
         if self.schema_version == 1 and any(i.source_kind != "parent_chunk" for i in self.items):
             raise ValueError("canonical sources require schema v2")
-        if self.schema_version == 2 and any(i.evidence_schema_version is None and i.source_provenance is None for i in self.items):
-            raise ValueError("schema2 snapshot requires per-item version or provenance")
+        if self.schema_version == 2 and any(i.source_provenance is None or i.source_provenance.schema_version != 2 for i in self.items):
+            raise ValueError("schema2 snapshot requires original-source proof for every item")
         if not within_budget(self.model_dump(mode="json")):
             raise ValueError("source snapshot exceeds byte budget")
         if len({item.evidence_id for item in self.items}) != len(self.items):
@@ -154,6 +155,7 @@ def build_answer_sources(
         lookup = {item.evidence_id: item for item in packed.items}
         if len(lookup) != len(packed.items):
             raise InvalidAnswerSources("duplicate packed evidence")
+        snapshot_version = 2 if any(item.schema_version == 2 for item in packed.items if item.evidence_id in ids) else 1
         sources: list[dict[str, object]] = []
         contents: list[str] = []
         for eid in ids:
@@ -164,6 +166,14 @@ def build_answer_sources(
                 or not matches_manifest(item, manifest)
             ):
                 raise InvalidAnswerSources("packed evidence and manifest disagree")
+            if snapshot_version == 2 and manifest.schema_version == 1:
+                # Normalize the disclosure proof without replacing citation identity.
+                # The scoped repository later reconstructs this exact original crop.
+                manifest = EvidenceManifestEntry(**{
+                    **manifest.model_dump(), "schema_version": 2,
+                    "content_hash": text_sha256(item.content),
+                    "parent_excerpt_length": len(item.content),
+                })
             headings = bounded_source_heading(item.heading_path)
             pages: tuple[int | None, int | None] = (None, None)
             try:
@@ -184,8 +194,8 @@ def build_answer_sources(
                 document_version_id=item.document_version_id,
                 parent_id=item.parent_id,
                 source_kind=item.source_kind,
-                evidence_schema_version=item.schema_version,
-                source_provenance=manifest if item.schema_version == 2 else None,
+                evidence_schema_version=manifest.schema_version,
+                source_provenance=manifest if snapshot_version == 2 else None,
                 heading_path=tuple(headings),
                 heading_truncated=tuple(headings) != item.heading_path,
                 page_from=pages[0],
@@ -198,7 +208,7 @@ def build_answer_sources(
                 contents.append(item.content)
         # Reserve all bounded metadata before allocating text in citation order.
         candidate = dict(
-            schema_version=2 if any(s["source_provenance"] is not None for s in sources) else 1,
+            schema_version=snapshot_version,
             run_id=run_id,
             runtime_config_snapshot_id=snapshot_id,
             items=sources,

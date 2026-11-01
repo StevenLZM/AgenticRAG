@@ -703,10 +703,27 @@ class EvidenceBuilder:
         capacity: int,
     ) -> tuple[EvidenceItem, str] | None:
         item = self._item(candidate)
+        verified_range = None
+        from agentic_rag.ingestion.chunker import AstLocator
+        from agentic_rag.retrieval.context_evidence import parent_excerpt_range
+
+        try:
+            AstLocator.model_validate_json(candidate.parent.ast_locator or "")
+        except ValueError:
+            pass  # Historical opaque locators retain their existing packing path.
+        else:
+            try:
+                verified_range = parent_excerpt_range(
+                    candidate.parent.ast_locator,
+                    candidate.locator,
+                    candidate.parent.content,
+                )
+            except ValueError:
+                return None
         envelope = DataEnvelope(
             source_label=f"document:{item.document_id}",
             evidence_id=item.evidence_id,
-            content=item.content,
+            content=candidate.parent.content if verified_range else item.content,
             heading_path=item.heading_path,
         )
         included = self._fit(
@@ -714,10 +731,18 @@ class EvidenceBuilder:
             rendered,
             capacity,
             candidate.parent.child_hits[0].content,
+            matching_child_offset=verified_range[0] if verified_range else None,
+            max_content_length=1200 if verified_range else None,
         )
         if included is None:
             return None
         fitted_content, rendered_envelope = included
+        if verified_range:
+            crop_from, crop_to = _crop_bounds(
+                candidate.parent.content, len(fitted_content), verified_range[0]
+            )
+            if not crop_from <= verified_range[0] < verified_range[1] <= crop_to:
+                return None
         # Coverage is provenance attached to the retrieval batch, not a text
         # match inferred from untrusted document content.  Cropping may remove
         # the human-readable target description while retaining usable source
@@ -855,14 +880,22 @@ class EvidenceBuilder:
         matching_child_content: str,
         *,
         matching_child_offset: int | None = None,
+        max_content_length: int | None = None,
     ) -> tuple[str, str] | None:
         separator = "\n" if rendered else ""
         existing = "\n".join(rendered)
         full = envelope.render()
-        if _estimate_tokens(f"{existing}{separator}{full}") <= capacity:
+        if (
+            max_content_length is None or len(envelope.content) <= max_content_length
+        ) and _estimate_tokens(f"{existing}{separator}{full}") <= capacity:
             return envelope.content, full
 
-        low, high = 0, len(envelope.content)
+        low, high = (
+            0,
+            min(len(envelope.content), max_content_length)
+            if max_content_length is not None
+            else len(envelope.content),
+        )
         best: tuple[str, str] | None = None
         while low <= high:
             length = (low + high) // 2
