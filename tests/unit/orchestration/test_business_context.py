@@ -169,3 +169,35 @@ async def test_evidence_preparation_forwards_each_frozen_plan_to_builder(tmp_pat
         SCOPE,
         SNAPSHOT,
     )
+
+
+async def test_agent_rejects_conflicting_objective_before_neutral_search():
+    import pytest
+    from agentic_rag.orchestration.agents import RetrievalAgent
+    from agentic_rag.orchestration.contracts import TaskSpec
+    from agentic_rag.retrieval.query_compiler import BusinessScopeConflict
+    from tests.unit.orchestration.test_agents import Execution
+    from tests.unit.orchestration.test_contracts import task_payload
+
+    compiler = QueryCompiler()
+    execution = Execution(
+        {"queries": ["住宿标准"], "reason": "search policy"},
+        {"findings": [], "gaps": []},
+    )
+    execution.business_context = await compiler.freeze("星河公司标准", execution.scope)
+    raw = task_payload()
+    raw["objective"] = "远山公司住宿标准"
+
+    class Retrieval:
+        calls = 0
+
+        async def retrieve_candidates(self, *args, **kwargs):
+            self.calls += 1
+            raise AssertionError("conflicting task must not reach retrieval")
+
+    retrieval = Retrieval()
+    with pytest.raises(BusinessScopeConflict, match="task target"):
+        await RetrievalAgent(retrieval).execute(
+            TaskSpec.model_validate(raw), {}, execution
+        )
+    assert retrieval.calls == 0

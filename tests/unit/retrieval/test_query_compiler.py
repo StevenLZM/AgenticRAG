@@ -407,3 +407,159 @@ async def test_serialized_plan_cannot_change_scope_or_drop_protected_qualifiers(
     ):
         with pytest.raises(ValidationError):
             QueryPlan.model_validate({**plan.model_dump(), **edit})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", [False, True])
+async def test_confirmed_company_survives_explicit_population_per_field(profile):
+    from agentic_rag.retrieval.query_context import ScopeResolution
+
+    compiler = module.QueryCompiler(
+        profiles=Profiles() if profile else None,
+        coverage=Coverage(certificate(), certificate().binding),
+    )
+    business = await compiler.freeze("我出差，管理人员住宿标准", SCOPE)
+    business = business.model_copy(
+        update={
+            "confirmed_reference": (
+                ScopeResolution(
+                    field="company",
+                    value="远山公司",
+                    source_kind="confirmed_reference",
+                    source_ref="confirmed:1",
+                ),
+                ScopeResolution(
+                    field="population",
+                    value="普通员工",
+                    source_kind="confirmed_reference",
+                    source_ref="confirmed:1",
+                ),
+            )
+        }
+    )
+    plan = await compiler.compile(
+        RetrievalRequest(query=business.source_question), SCOPE, SNAPSHOT, business
+    )
+    assert {r.field: r.value for r in plan.effective_business_scope} == {
+        "company": "远山公司",
+        "population": "管理人员",
+    }
+    assert "星河公司" not in plan.dense_query and "普通员工" not in plan.dense_query
+    assert plan.business_filter == ("doc-y",)
+    assert (
+        next(
+            r for r in plan.effective_business_scope if r.field == "company"
+        ).source_ref
+        == "confirmed:1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_objective_cannot_reassign_before_neutral_query():
+    compiler = module.QueryCompiler()
+    business = await compiler.freeze("星河公司标准", SCOPE)
+    with pytest.raises(module.BusinessScopeConflict, match="task target"):
+        task = compiler.for_task(business, "远山公司住宿标准", task_ref="task:conflict")
+        await compiler.compile(
+            RetrievalRequest(query="住宿标准"), SCOPE, SNAPSHOT, task
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["unresolved", "ambiguous"])
+async def test_uncertain_explicit_scope_disables_windows_and_stays_unasserted(status):
+    from agentic_rag.retrieval.query_context import ScopeResolution
+    from pydantic import ValidationError
+
+    class Directory:
+        async def resolve_mentions(self, text):
+            return (
+                ScopeResolution(
+                    field="company",
+                    value="星河",
+                    source_kind="explicit_user",
+                    source_ref="directory:uncertain",
+                    source_span=(0, 2),
+                    resolution_status=status,
+                ),
+            )
+
+    question = "星河" + "住宿政策条件" * 100
+    plan = await module.QueryCompiler(
+        directory=Directory(), coverage=Coverage(certificate(), certificate().binding)
+    ).compile(RetrievalRequest(query=question), SCOPE, SNAPSHOT, None)
+    assert not plan.allow_query_windows
+    assert plan.resolution_status == status
+    assert plan.dense_query == plan.rerank_query == question
+    assert (
+        plan.protected_query_context == ""
+        and plan.lexical_scope_terms == ()
+        and plan.business_filter is None
+    )
+    with pytest.raises(ValidationError, match="unwindowed"):
+        QueryPlan.model_validate({**plan.model_dump(), "allow_query_windows": True})
+
+
+@pytest.mark.asyncio
+async def test_field_precedence_keeps_confirmed_company_under_task_population():
+    from agentic_rag.retrieval.query_context import ScopeResolution
+
+    compiler = module.QueryCompiler(profiles=Profiles())
+    business = await compiler.freeze("我出差住宿标准", SCOPE)
+    business = business.model_copy(
+        update={
+            "confirmed_reference": (
+                ScopeResolution(
+                    field="company",
+                    value="远山公司",
+                    source_kind="confirmed_reference",
+                    source_ref="confirmed:1",
+                ),
+            ),
+            "task_targets": (
+                ScopeResolution(
+                    field="population",
+                    value="管理人员",
+                    source_kind="task_target",
+                    source_ref="task:1",
+                ),
+            ),
+        }
+    )
+    plan = await compiler.compile(
+        RetrievalRequest(query=business.source_question), SCOPE, SNAPSHOT, business
+    )
+    assert {r.field: r.value for r in plan.effective_business_scope} == {
+        "company": "远山公司",
+        "population": "管理人员",
+    }
+    assert "星河公司" not in plan.dense_query and "普通员工" not in plan.dense_query
+
+
+@pytest.mark.asyncio
+async def test_self_directed_confirmed_own_company_defaults_only_missing_population():
+    from agentic_rag.retrieval.query_context import ScopeResolution
+
+    compiler = module.QueryCompiler(profiles=Profiles())
+    business = await compiler.freeze("我出差住宿标准", SCOPE)
+    business = business.model_copy(
+        update={
+            "confirmed_reference": (
+                ScopeResolution(
+                    field="company",
+                    value="星河公司",
+                    source_kind="confirmed_reference",
+                    source_ref="confirmed:1",
+                ),
+            )
+        }
+    )
+    plan = await compiler.compile(
+        RetrievalRequest(query=business.source_question), SCOPE, SNAPSHOT, business
+    )
+    assert {
+        r.field: (r.value, r.source_kind) for r in plan.effective_business_scope
+    } == {
+        "company": ("星河公司", "confirmed_reference"),
+        "population": ("普通员工", "trusted_profile"),
+    }

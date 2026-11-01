@@ -512,3 +512,30 @@ async def test_explicit_scope_disables_windows_and_keeps_complete_pair():
                 assert model.calls == [[(query, hit.search_content)]]
         finally:
             service.close()
+
+
+@pytest.mark.parametrize("kind", ["shorthand", "ambiguous"])
+async def test_uncertain_explicit_qualifiers_never_disappear_in_query_windows(kind):
+    from agentic_rag.retrieval.query_compiler import QueryCompiler
+    from agentic_rag.retrieval.query_context import ScopeResolution
+    from agentic_rag.retrieval.models import RetrievalRequest
+    from tests.unit.retrieval.test_graph import SCOPE, SNAPSHOT
+    class Directory:
+        async def resolve_mentions(self, text):
+            return (ScopeResolution(field="company", value="星河", source_kind="explicit_user", source_ref="directory:uncertain", source_span=(0, 2), resolution_status="ambiguous"),)
+    question = ("比较星河与远山两家公司标准" if kind == "shorthand" else "星河标准") + "住宿条件" * 20
+    plan = await QueryCompiler(directory=Directory() if kind == "ambiguous" else None).compile(RetrievalRequest(query=question), SCOPE, SNAPSHOT, None)
+    hit = ChildHit(**hit_payload())
+    for body_capacity, degraded in ((len(question) // 2 + 1, True), (len(question), False)):
+        capacity = len(hit.search_content) + body_capacity + 3
+        model = LengthCheckingEncoder(capacity)
+        service = Reranker(model, model_version="offline", pair_tokenizer=reranker_module.TokenizerPairAdapter(CharacterTokenizer(), max_pair_tokens=capacity))
+        try:
+            result = await service.rerank(plan.rerank_query, [hit], allow_query_windows=plan.allow_query_windows)
+            assert result.degraded is degraded
+            if degraded:
+                assert result.degradation_reason == "rerank_input_too_long" and not model.calls
+            else:
+                assert model.calls == [[(question, hit.search_content)]]
+        finally:
+            service.close()

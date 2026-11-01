@@ -97,7 +97,7 @@ class QueryPlan(BaseModel):
             raise ValueError("lexical scope terms differ from resolved additions")
         if self.protected_query_context != "；".join(self.lexical_scope_terms):
             raise ValueError("protected context differs from resolved additions")
-        if self.allow_query_windows and any(r.value in self.original_query for r in self.effective_business_scope if r.resolution_status in {"resolved", "defaulted"}):
+        if self.allow_query_windows and any(r.value in self.original_query for r in self.effective_business_scope):
             raise ValueError("explicit scope requires complete unwindowed query")
         auth, effective = self.authorization_filter, self.effective_filter
         for name in ("user_id", "is_active", "index_generation", "search_type", "content_types", "date_range"):

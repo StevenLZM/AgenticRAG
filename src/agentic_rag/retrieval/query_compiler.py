@@ -103,7 +103,10 @@ class QueryCompiler:
     def _meaning(
         business: QueryBusinessContext,
     ) -> tuple[tuple[ScopeResolution, ...], str]:
-        resolved = business.source_scope or business.confirmed_reference
+        explicit_fields = {r.field for r in business.source_scope}
+        resolved = business.source_scope + tuple(
+            r for r in business.confirmed_reference if r.field not in explicit_fields
+        )
         if business.task_targets:
             if any(
                 t.value
@@ -125,15 +128,22 @@ class QueryCompiler:
                 r"我们公司|我的公司|我(?:去|要|出差)|本公司", business.source_question
             )
         )
-        if not any(r.field == "company" for r in resolved) and self_directed:
+        if self_directed:
             profile = business.trusted_profile
-            if profile is None or not profile.companies:
+            companies = {r.value for r in resolved if r.field == "company"}
+            if not companies and (profile is None or not profile.companies):
                 status = "unresolved"
-            elif len(profile.companies) != 1:
+            elif not companies and len(profile.companies) != 1:
                 status = "ambiguous"
-            else:
+            elif (
+                profile is not None
+                and len(profile.companies) == 1
+                and (not companies or companies == {profile.companies[0]})
+            ):
+                # Own-profile defaults apply only to a still-missing field in
+                # a self-directed own-company scope, never another company.
                 existing = {r.field for r in resolved}
-                resolved += tuple(
+                defaults = tuple(
                     ScopeResolution(
                         field=field,
                         value=value,
@@ -148,7 +158,9 @@ class QueryCompiler:
                     )
                     if value and field not in existing
                 )
-                status = "defaulted"
+                resolved += defaults
+                if defaults:
+                    status = "defaulted"
         return resolved, status
 
     @classmethod
@@ -162,6 +174,16 @@ class QueryCompiler:
     ) -> QueryBusinessContext:
         """Project only already assigned literal targets; task prose grants no authority."""
         meaning, _ = cls._meaning(business)
+        for mention in _literal_mentions(target):
+            if mention.resolution_status not in {"resolved", "defaulted"} or not any(
+                r.field == mention.field
+                and r.value == mention.value
+                and r.resolution_status in {"resolved", "defaulted"}
+                for r in meaning
+            ):
+                raise BusinessScopeConflict(
+                    "task target requires coordinator reassignment"
+                )
         targets = tuple(
             r.model_copy(
                 update={
@@ -282,7 +304,7 @@ class QueryCompiler:
             lexical_scope_terms=added,
             rerank_query=semantic,
             protected_query_context=prefix,
-            allow_query_windows=not any(r.value in request.query for r in usable),
+            allow_query_windows=not any(r.value in request.query for r in resolved),
             authorization_filter=authorization,
             business_filter=business_filter,
             effective_filter=effective,
