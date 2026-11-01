@@ -128,14 +128,17 @@ class ElasticsearchChildIndexStore:
             )
         return False
 
-    async def switch_active_alias(self, index_generation: str) -> bool:
+    async def switch_active_alias(self, index_generation: str, *, before_write=None) -> bool:
         """Atomically point the active alias at a validated physical generation."""
         index = self.index_name(index_generation)
         if not bool(await self._client.indices.exists(index=index)):
             raise ChildIndexWriteError(
                 f"cannot switch active alias to missing index {index!r}"
             )
-        await self.ensure_index(index_generation)
+        if before_write is None:
+            await self.ensure_index(index_generation)
+        else:
+            await self.validate_index(index_generation)
         targets = await self._read_active_alias_targets()
         if targets == (index,):
             return False
@@ -157,6 +160,8 @@ class ElasticsearchChildIndexStore:
                 }
             }
         )
+        if before_write is not None:
+            await before_write()
         response = await self._client.indices.update_aliases(actions=actions)
         body = cast(Mapping[str, Any], response.body)
         if body.get("acknowledged") is False:
@@ -316,19 +321,21 @@ class ElasticsearchChildIndexStore:
                 raise ValueError("context identity readback cursor did not advance")
             after = cursor
 
-    async def prepare_release_membership(self, index_generation, members):
+    async def prepare_release_membership(self, index_generation, members, *, before_write):
         """Maintenance-only exact current corpus activation, before alias switch."""
         from agentic_rag.ingestion.manifest import child_identity_digest
         await self.validate_search_target(index_generation, index=self.index_name(index_generation))
         for context, expected_digest in members:
             if context.index_generation != index_generation or child_identity_digest(await self.child_identities(context)) != expected_digest:
                 raise ValueError("release member identity/hash collection differs")
+        await before_write()
         response = await self._client.update_by_query(
             index=self.index_name(index_generation), query={"term": {"search_type": "document"}},
             script={"lang": "painless", "source": "ctx._source.is_active = false"},
             conflicts="abort", refresh=True)
         self._require_complete_lifecycle(response.body, operation="release deactivation")
         for context, _ in members:
+            await before_write()
             await self.activate(context)
 
     async def activate(self, context: StagingContext) -> None:

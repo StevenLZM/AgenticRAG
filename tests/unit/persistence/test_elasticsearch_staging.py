@@ -456,3 +456,44 @@ async def test_lifecycle_write_fails_closed_on_partial_es_conflicts(
 
     with pytest.raises(ChildIndexWriteError, match="did not fully apply"):
         await getattr(store, operation)(_context())
+
+
+@pytest.mark.asyncio
+async def test_release_membership_rechecks_execution_before_each_remote_write(monkeypatch):
+    from agentic_rag.ingestion.manifest import child_identity_digest
+    client = _Client()
+    store = ElasticsearchChildIndexStore(cast(Any, client))
+    await store.ensure_index("index-v2")
+    async def identities(context):
+        return (("child-1", "hash"),)
+    monkeypatch.setattr(store, "child_identities", identities)
+    writes, checks = [], []
+    async def update(**kwargs):
+        writes.append(kwargs)
+        return _Response(client.lifecycle_response)
+    client.update_by_query = update
+    async def guard():
+        checks.append(1)
+        if len(checks) == 2:
+            raise RuntimeError("execution token superseded")
+    with pytest.raises(RuntimeError, match="superseded"):
+        await store.prepare_release_membership(
+            "index-v2", [(_context(), child_identity_digest((("child-1", "hash"),)))],
+            before_write=guard,
+        )
+    assert len(writes) == 1  # late activation did not follow deactivation
+    assert writes[0]["script"]["source"] == "ctx._source.is_active = false"
+
+
+@pytest.mark.asyncio
+async def test_fenced_alias_switch_checks_owner_without_creating_index():
+    client = _Client()
+    store = ElasticsearchChildIndexStore(cast(Any, client))
+    await store.ensure_index("index-v2")
+    client.indices.aliases[ACTIVE_CHILD_INDEX_ALIAS] = {"agenticrag-children-old-v1"}
+    async def reject():
+        raise RuntimeError("execution token superseded")
+    with pytest.raises(RuntimeError, match="superseded"):
+        await store.switch_active_alias("index-v2", before_write=reject)
+    assert client.indices.alias_updates == []
+    assert client.indices.create_calls == 1

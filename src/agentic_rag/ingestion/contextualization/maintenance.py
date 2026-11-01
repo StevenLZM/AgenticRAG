@@ -17,6 +17,16 @@ class DeploymentInstance(BaseModel):
     role: str = Field(min_length=1, max_length=64)
 
 
+class ExecutionRecovery(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    journal_id: str = Field(min_length=1, max_length=64)
+    execution_token: str = Field(pattern=r"^[0-9a-f]{32}$")
+    maintenance_receipt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    effect: str | None = Field(default=None, max_length=32)
+    stopped_executor_ref: str = Field(min_length=1, max_length=1024)
+    es_quiescence_ref: str = Field(min_length=1, max_length=1024)
+
+
 class MaintenancePayload(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     issuer: str
@@ -30,6 +40,7 @@ class MaintenancePayload(BaseModel):
     expires_at: int
     previous_instances: tuple[DeploymentInstance, ...]
     instances: tuple[DeploymentInstance, ...]
+    execution_recovery: ExecutionRecovery | None = None
 
     @model_validator(mode="after")
     def inventories(self):

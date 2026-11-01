@@ -29,6 +29,8 @@ def parser():
             "work",
             "release",
             "resume",
+            "recover-execution",
+            "execution-status",
             "rollback",
         ),
     )
@@ -72,7 +74,11 @@ def load_plan(args):
         raise ValueError("refuse active-generation in-place rebuild/replacement")
     if not 1 <= args.max_jobs <= 1000:
         raise ValueError("max-jobs must be finite and between 1 and 1000")
-    if args.command in ("release", "resume", "rollback") and not args.journal:
+    if (
+        args.command
+        in ("release", "resume", "rollback", "recover-execution", "execution-status")
+        and not args.journal
+    ):
         raise ValueError("release/resume require explicit durable journal id")
     return current, target, manifest, snapshot
 
@@ -121,7 +127,7 @@ async def execute(args, current, target, manifest, snapshot):
         if args.maintenance_receipt
         else None
     )
-    if args.command in ("install", "release", "rollback") and (
+    if args.command in ("install", "release", "rollback", "recover-execution") and (
         verifier is None or receipt is None
     ):
         raise ValueError(
@@ -166,6 +172,12 @@ async def execute(args, current, target, manifest, snapshot):
             await ContextRelease(factory, artifacts, aliases, verifier).rollback(
                 args.journal, target_snapshot=snapshot, receipt=receipt
             )
+        elif args.command == "execution-status":
+            print(
+                json.dumps(await store.execution_status(args.journal), sort_keys=True)
+            )
+        elif args.command == "recover-execution":
+            await store.recover_execution(args.journal, receipt)
         elif args.command == "resume":
             await ContextRelease(factory, artifacts, aliases, verifier).resume(
                 args.journal
@@ -323,10 +335,11 @@ def main(argv=None):
                     "documents": len(manifest.get("documents", [])),
                     "readiness": "not_checked_offline",
                     "requires": [
-                        "migrated schema",
+                        "schema through 0012, applied before first arm",
                         "armed durable admission",
                         "complete current corpus builds",
-                        "trusted signed maintenance receipt for install/release",
+                        "trusted signed maintenance receipt for install/release/rollback",
+                        "stopped executor and settled ES writes proof for recover-execution",
                         "all configured deployment instance startup receipts",
                     ],
                 },

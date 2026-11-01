@@ -23,7 +23,7 @@ An enabled structural-only build is `ContextBuildConfig(enabled=True)` with an e
 
 ## Additive schema and source immutability
 
-Apply `0010_context_builds` and `0011_context_release` through the existing Alembic maintenance workflow **before enabling release control**. Startup performs read-only schema checks; it never migrates. Migration declarations are frozen and create only additive tables. Do not downgrade while any context-aware role is running.
+Apply `0010_context_builds`, `0011_context_release`, and `0012_context_execution_fence` through the existing Alembic maintenance workflow **before enabling release control**. Startup performs read-only schema checks; it never migrates. Migration declarations are frozen; 0010/0011 add tables and 0012 adds execution-fence fields. Startup explicitly requires the 0012 fields. 0012 refuses an already-armed 0011 gate before any DDL: earlier executor ownership cannot be inferred safely. This pre-release implementation supports migration before first arm; it provides no automatic reconciliation of an armed, unfenced deployment. Do not downgrade while any context-aware role is running.
 
 `retrieval_builds` uniquely binds owner/version/generation to immutable manifest ref, representation policy, build fingerprint, original Parent projection hash and final child ID/search-hash digest. `document_versions` manifest/generation/count fields are the selected compatibility projection, not history. Registry membership still requires the document's current active source version, owner and no deletion/revocation fence.
 
@@ -44,7 +44,7 @@ The state machine is `open -> draining -> frozen -> open`:
 1. `draining` refuses new run/upload/delete admission with retryable maintenance errors. Existing queued tasks can still claim under the old configuration, heartbeat and finish. This is the progress path; the queue is not stranded behind a closed claim gate.
 2. Drain checks queued/running uploads and rebuilds, unfinished source publication, Macro runs, Supervisor runs and queued/running/retry-wait work. Unfinished work must finish or be explicitly cancelled through its existing lifecycle. Failed rebuilds are not ready builds.
 3. `frozen` rejects claims/publication. The journal binds before/after mappings for **every owner** in the current effective corpus. It independently verifies manifests, Parent sources, final ES child identity/hash collections and policy. A missing build blocks readiness.
-4. Compatibility projections, exact active ES membership, alias switch and configuration are separate idempotent boundaries. The target index first deactivates all old document members, then activates only the current corpus mapping. A crash keeps admission closed; resume repeats the safe operations.
+4. Compatibility projections, exact active ES membership, alias switch and configuration are separate idempotent boundaries. The target index first deactivates all old document members, then activates only the current corpus mapping. A non-expiring durable execution token binds every step to the active journal, maintenance receipt and target configuration. Stage transitions are monotonic compare-and-swap operations; completed and aborted journals cannot replay. Only the owning executor may reopen. Known completed boundaries can resume without replaying earlier ES operations.
 5. Processes restart with the selected configuration, attest, and the journal rechecks the target before opening. A crash after reopening can finish the journal without replaying an unsafe switch.
 
 ## CLI: plan first, then explicit execution
@@ -62,12 +62,44 @@ The manifest binds `source_generation`, `target_generation`, `target_snapshot_id
 
 A controlled rollout sequence is:
 
-1. Apply additive schema during authorized maintenance. Obtain a trusted receipt proving replacement of the complete unmanaged deployment with the release-controlled legacy deployment. `install` uses equal source/target generations and the legacy configuration; first arm cannot switch generations. Start every signed instance, then `open`. This is the external trust boundary that preserves default-off legacy startup without letting old unguarded processes participate in a release.
+1. Apply additive schema through 0012, before first arm, during authorized maintenance. Obtain a trusted receipt proving replacement of the complete unmanaged deployment with the release-controlled legacy deployment. `install` uses equal source/target generations and the legacy configuration; first arm cannot switch generations. Start every signed instance, then `open`. This is the external trust boundary that preserves default-off legacy startup without letting old unguarded processes participate in a release.
 2. `import-source --execute` validates current raw/context artifacts and ES child identities and registers old builds. `enqueue --execute` creates durable target jobs for the explicit source manifest. `work --execute --max-jobs N` is a bounded restartable worker invocation for queued/expired jobs of that target generation; run it repeatedly under your worker supervisor. It is not a user-scoped query API. No generation is modified in place.
 3. Finish offline and separately authorized real-service/model acceptance. Pause admission with `pause --execute`. Let already queued work drain. Reconcile candidate coverage for any newly active sources. Obtain the new deployment manager receipt and use `release --execute --journal RELEASE_ID --maintenance-receipt RECEIPT` with the same explicit config/manifest arguments. A `not_ready` result keeps user admission closed; it is not release success. Missing builds are checked before freezing, so shadow jobs can be configured and drained. If the corpus races the final pre-journal freeze, `continue-drain --execute` restores only maintenance worker progress; it refuses unfinished journals and never reopens user admission.
 4. After the journal selects target configuration, restart the signed inventory with matching configuration and run `resume --execute --journal RELEASE_ID`. It requires the existing validated journal and exact target inputs. `open` is also available for the initial armed deployment once every instance has attested.
 
-For rollback use `rollback --execute --journal ORIGINAL_RELEASE_ID --maintenance-receipt NEW_RECEIPT` with source=current generation and target=the original configuration, then resume `ORIGINAL_RELEASE_ID:rollback`. A partial switch uses a separate compensating journal and marks the original aborted. It selects current source versions only; it never restores an old active-version pointer or a deleted document. During the rollback window publication records missing old-generation builds as `blocked_config`. Supply the explicit compatible old target configuration through `enqueue` to make these durable jobs executable, and run `work`. Until they are ready, full rollback is `not_ready`; no current material is silently omitted. Exhausted/failed jobs and missing config require operator correction, not free retries or source rollback.
+For rollback use `rollback --execute --journal ORIGINAL_RELEASE_ID --maintenance-receipt NEW_RECEIPT` with source=current generation and target=the original configuration, then resume `ORIGINAL_RELEASE_ID:rollback`. A partial switch uses a separate compensating journal and marks the original aborted. It selects current source versions only; it never restores an old active-version pointer or a deleted document. During the rollback window publication records missing old-generation builds as `blocked_config`. Supply the explicit compatible old target configuration through `enqueue` to make these durable jobs executable, and run `work`. The entire current-source rollback mapping must match both the old frozen representation and build-configuration fingerprint; resume revalidates that invariant. Until compatible builds are ready, full rollback is `not_ready`; no current material is silently omitted. Exhausted/failed jobs and missing config require operator correction, not free retries or source rollback.
+
+## Uncertain ES writes and execution recovery
+
+Before membership or alias writes, the executor commits an `execution_effect` latch under its exclusive token. No timeout-based takeover exists. A request timeout, cancellation, process crash or lost response may leave remote ES work running: resume, rollback, open and maintenance worker reopening remain blocked. Every subsequent remote write and stage transition rechecks the active journal/token/receipt. Normal exceptions at known completed boundaries release ownership and allow ordinary resume. A process crash between those boundaries also retains ownership and requires the recovery procedure below.
+
+Inspect the current durable identity without mutating it (all common files/arguments still bind the selected source/target):
+
+```sh
+python scripts/rebuild_context_index.py execution-status --execute \
+  --journal RELEASE_ID --source old-v1 --target context-v1 \
+  --config /secure/current.json --target-config /secure/target.json \
+  --manifest /secure/corpus-plan.json
+```
+
+The JSON output includes journal/stage/state, execution token, current effect, maintenance receipt hash, exact from/to generation, target config hash and instance inventories. Send this binding to the trusted deployment manager. It must **stop the old release executor and prove all of its related ES writes have completed or been cancelled**. Request a fresh signed maintenance envelope using the existing issuer/nonce/time/deployment/inventory fields and this additional payload object:
+
+```json
+{
+  "execution_recovery": {
+    "journal_id": "RELEASE_ID",
+    "execution_token": "EXACT_32_HEX_TOKEN_FROM_STATUS",
+    "maintenance_receipt_hash": "EXACT_64_HEX_HASH_FROM_STATUS",
+    "effect": "membership",
+    "stopped_executor_ref": "deployment-audit://stopped/release-executor",
+    "es_quiescence_ref": "es-audit://all-related-writes-completed-or-cancelled"
+  }
+}
+```
+
+Use the exact status `effect` (which can be null), generations, config hash and unchanged inventories. This is an extension to the complete maintenance payload, not a standalone signature. The proof references' truth is the external authority's responsibility; SQL and signature validation do not observe remote quiescence. A CLI-generated signature, operator boolean, elapsed timeout or local PID observation cannot replace it. Ordinary installation/release receipts cannot clear an executor; recovery receipts cannot authorize a deployment switch.
+
+Run `recover-execution --execute --journal RELEASE_ID --maintenance-receipt /secure/recovery.json` with the same common arguments. It consumes the one-time nonce, records the complete signed recovery envelope, and clears only the matching current execution token/effect; it does not open traffic, change the selected journal/receipt/configuration, or perform ES writes. Then run ordinary `resume --execute --journal RELEASE_ID`, or request a separately signed rollback. Wrong journal/token/receipt/target/configuration, expired proof, inventory changes and replay are rejected. If the old coroutine returns late after accepted recovery, its token cannot authorize another write or stage transition. Safe recovery still relies on the trusted manager settling already-dispatched requests before issuing the proof; this code does not implement an ES-wide remote cancellation/fencing service.
 
 ## Offline evaluation and observations
 

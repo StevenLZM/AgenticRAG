@@ -141,10 +141,12 @@ class Aliases:
     def __init__(self):
         self.generation = "old-v1"
 
-    async def prepare_release_membership(self, generation, members):
+    async def prepare_release_membership(self, generation, members, *, before_write):
+        await before_write()
         assert all(context.index_generation == generation for context, _ in members)
 
-    async def switch_active_alias(self, generation):
+    async def switch_active_alias(self, generation, *, before_write):
+        await before_write()
         self.generation = generation
 
     async def validate_search_target(self, generation):
@@ -547,3 +549,399 @@ async def test_real_structural_rebuild_executor_uses_durable_claim_and_context_s
             for event in events
         )
         assert all("原始正文" not in str(event) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resumer_and_rollback_cannot_overtake_projected_owner(
+    release_sql, tmp_path
+):
+    import asyncio
+    from tests.unit.runtime.test_query_composition import SNAPSHOT
+
+    release, aliases = await prepared(release_sql, tmp_path)
+    projected, proceed = asyncio.Event(), asyncio.Event()
+    states = []
+    original_membership = aliases.prepare_release_membership
+
+    async def membership(generation, members, *, before_write):
+        async with release_sql() as db:
+            states.append(await db.scalar(select(context_gate.c.state)))
+        await original_membership(generation, members, before_write=before_write)
+
+    aliases.prepare_release_membership = membership
+
+    async def barrier(stage):
+        if stage == "projected":
+            projected.set()
+            await proceed.wait()
+
+    first = asyncio.create_task(release.resume("journal-1", after_boundary=barrier))
+    await projected.wait()
+    try:
+        other = ContextRelease(release_sql, release.artifacts, aliases)
+        with pytest.raises(ReleaseNotReady, match="execution"):
+            await other.resume("journal-1")
+        with pytest.raises(ReleaseNotReady, match="execution"):
+            await other.rollback(
+                "journal-1",
+                target_snapshot=SNAPSHOT.model_copy(
+                    update={"index_generation": "old-v1"}
+                ),
+                receipt=None,
+            )
+        assert states == []
+    finally:
+        proceed.set()
+        result = await asyncio.gather(first, return_exceptions=True)
+    assert isinstance(result[0], ReleaseNotReady)
+    assert states == ["frozen"]
+    async with release_sql() as db:
+        config = await db.scalar(select(context_gate.c.config_hash))
+    release_sql.configure(
+        info={"context_config_hash": config, "context_instance_id": "new-api"}
+    )
+    await release.store.attest("api", config)
+    await release.resume("journal-1")
+    await other.resume("journal-1")
+    assert states == ["frozen"]  # verified/complete never replay ES
+    async with release_sql() as db:
+        assert await db.scalar(select(context_gate.c.state)) == "open"
+        assert await db.scalar(select(release_journal.c.stage)) == "complete"
+
+
+@pytest.mark.asyncio
+async def test_aborted_journal_resume_has_no_projection_or_alias_side_effects(
+    release_sql, tmp_path
+):
+    from tests.unit.runtime.test_query_composition import SNAPSHOT
+
+    release, aliases = await prepared(release_sql, tmp_path)
+
+    async def crash(stage):
+        if stage == "alias_switched":
+            raise RuntimeError("interrupted")
+
+    with pytest.raises(RuntimeError):
+        await release.resume("journal-1", after_boundary=crash)
+    snapshot = SNAPSHOT.model_copy(update={"index_generation": "old-v1"})
+    receipt, release.store.verifier = signed_receipt(
+        nonce="rollback-aborted",
+        from_generation="old-v1",
+        to_generation="old-v1",
+        config_hash=snapshot.snapshot_id,
+        previous_instances=[{"instance": "new-api", "role": "api"}],
+        instances=[{"instance": "rollback-api", "role": "api"}],
+    )
+    with pytest.raises(ReleaseNotReady, match="roles"):
+        await release.rollback("journal-1", target_snapshot=snapshot, receipt=receipt)
+    async with release_sql() as db:
+        before_gate = dict((await db.execute(select(context_gate))).mappings().one())
+        before_version = dict(
+            (await db.execute(select(document_versions))).mappings().one()
+        )
+        before_journals = [
+            dict(row) for row in (await db.execute(select(release_journal))).mappings()
+        ]
+    with pytest.raises(ReleaseNotReady, match="aborted|superseded"):
+        await release.resume("journal-1")
+    async with release_sql() as db:
+        assert (
+            dict((await db.execute(select(context_gate))).mappings().one())
+            == before_gate
+        )
+        assert (
+            dict((await db.execute(select(document_versions))).mappings().one())
+            == before_version
+        )
+        assert [
+            dict(row) for row in (await db.execute(select(release_journal))).mappings()
+        ] == before_journals
+    assert aliases.generation == "old-v1"
+
+
+@pytest.mark.asyncio
+async def test_rollback_rejects_current_version_with_wrong_frozen_context_config(
+    release_sql, tmp_path
+):
+    from agentic_rag.persistence.context_registry import identity, source_parent_hash
+    from tests.unit.runtime.test_query_composition import SNAPSHOT
+
+    release, aliases = await prepared(release_sql, tmp_path)
+    snapshot = SNAPSHOT.model_copy(
+        update={
+            "index_generation": "old-v1",
+            "expected_representation_version": "context-v1",
+            "context_build_fingerprint": "a" * 64,
+        }
+    )
+    # Model a newer active source whose retained generation build is ready and
+    # has the right representation, but was built using a different config.
+    async with release_sql.begin() as db:
+        version = dict((await db.execute(select(document_versions))).mappings().one())
+        version.update(id="version-2", version_no=2)
+        await db.execute(insert(document_versions).values(**version))
+        await db.execute(update(documents).values(active_version_id="version-2"))
+        await db.execute(update(parent_chunks).values(document_version_id="version-2"))
+        parent_hash = await source_parent_hash(db, "user-1", "document-1", "version-2")
+        build = dict(
+            (
+                await db.execute(
+                    select(retrieval_builds).where(
+                        retrieval_builds.c.index_generation == "old-v1"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        build.update(
+            id=identity("user-1", "version-2", "old-v1"),
+            document_version_id="version-2",
+            parent_hash=parent_hash,
+            representation_version="context-v1",
+            build_config_hash="b" * 64,
+        )
+        await db.execute(insert(retrieval_builds).values(**build))
+        await db.execute(
+            update(release_journal).values(source_config_hash=snapshot.snapshot_id)
+        )
+    receipt, release.store.verifier = signed_receipt(
+        nonce="wrong-build-rollback",
+        from_generation="old-v1",
+        to_generation="old-v1",
+        config_hash=snapshot.snapshot_id,
+        previous_instances=[{"instance": "new-api", "role": "api"}],
+        instances=[{"instance": "rollback-api", "role": "api"}],
+    )
+    with pytest.raises(ReleaseNotReady, match="policy|configuration"):
+        await release.rollback("journal-1", target_snapshot=snapshot, receipt=receipt)
+    assert aliases.generation == "old-v1"
+    async with release_sql() as db:
+        assert (
+            await db.scalar(
+                select(release_journal.c.id).where(
+                    release_journal.c.id == "journal-1:rollback"
+                )
+            )
+            is None
+        )
+        assert await db.scalar(select(documents.c.active_version_id)) == "version-2"
+
+
+@pytest.mark.asyncio
+async def test_uncertain_effect_requires_signed_recovery_and_fences_late_continuation(
+    release_sql, tmp_path
+):
+    import asyncio
+    from tests.unit.runtime.test_query_composition import SNAPSHOT
+
+    release, aliases = await prepared(release_sql, tmp_path)
+    dispatched, late = asyncio.Event(), asyncio.Event()
+    writes = []
+    original = aliases.prepare_release_membership
+
+    async def delayed(generation, members, *, before_write):
+        await before_write()
+        writes.append("dispatched")
+        dispatched.set()
+        await late.wait()  # models an old executor returning from remote I/O
+        await before_write()  # must fail after recovery, before any next ES write
+        writes.append("late-write")
+
+    aliases.prepare_release_membership = delayed
+    first = asyncio.create_task(release.resume("journal-1"))
+    await dispatched.wait()
+    try:
+        async with release_sql() as db:
+            gate = dict((await db.execute(select(context_gate))).mappings().one())
+        assert gate["execution_effect"] == "membership"
+        status = await release.store.execution_status("journal-1")
+        assert status["execution_token"] == gate["execution_token"]
+        assert status["maintenance_receipt_hash"] == gate["receipt_hash"]
+        other = ContextRelease(release_sql, release.artifacts, aliases)
+        with pytest.raises(ReleaseNotReady, match="execution"):
+            await other.resume("journal-1")
+        with pytest.raises(ReleaseNotReady, match="execution"):
+            await other.rollback("journal-1", target_snapshot=SNAPSHOT, receipt=None)
+        with pytest.raises(ReleaseNotReady, match="execution"):
+            await other.store.reopen()
+        proof_fields = dict(
+            journal_id="journal-1",
+            execution_token=gate["execution_token"],
+            maintenance_receipt_hash=gate["receipt_hash"],
+            effect="membership",
+            stopped_executor_ref="deployment-audit://stopped/executor-1",
+            es_quiescence_ref="es-audit://all-related-writes-completed-or-cancelled/1",
+        )
+
+        def recovery(**changes):
+            return signed_receipt(
+                nonce="recover-1",
+                from_generation=gate["generation"],
+                to_generation="new-v1",
+                config_hash=gate["maintenance_receipt"]["payload"]["config_hash"],
+                previous_instances=gate["inventory"],
+                instances=gate["inventory"],
+                execution_recovery={**proof_fields, **changes},
+            )
+
+        for changes in (
+            {"execution_token": "0" * 32},
+            {"journal_id": "other-journal"},
+            {"maintenance_receipt_hash": "0" * 64},
+            {"effect": "alias"},
+        ):
+            receipt, other.store.verifier = recovery(**changes)
+            with pytest.raises(ReleaseNotReady, match="recovery"):
+                await other.store.recover_execution("journal-1", receipt)
+        import time
+
+        for changes, error, match in (
+            ({"to_generation": "wrong-v1"}, ReleaseNotReady, "generation"),
+            ({"config_hash": "c" * 64}, ReleaseNotReady, "configuration"),
+            (
+                {
+                    "issued_at": int(time.time()) - 100,
+                    "expires_at": int(time.time()) - 1,
+                },
+                ValueError,
+                "expired",
+            ),
+        ):
+            receipt, _ = recovery()
+            payload = {**receipt["payload"], **changes}
+            receipt, other.store.verifier = signed_receipt(**payload)
+            with pytest.raises(error, match=match):
+                await other.store.recover_execution("journal-1", receipt)
+        receipt, other.store.verifier = recovery()
+        await other.store.recover_execution("journal-1", receipt)
+        with pytest.raises(ReleaseNotReady, match="recovery|nonce"):
+            await other.store.recover_execution("journal-1", receipt)
+        aliases.prepare_release_membership = original
+        with pytest.raises(ReleaseNotReady, match="roles"):
+            await other.resume("journal-1")
+        async with release_sql() as db:
+            config = await db.scalar(select(context_gate.c.config_hash))
+        release_sql.configure(
+            info={"context_config_hash": config, "context_instance_id": "new-api"}
+        )
+        await other.store.attest("api", config)
+        await other.resume("journal-1")
+    finally:
+        late.set()
+        result = await asyncio.gather(first, return_exceptions=True)
+    assert isinstance(result[0], ReleaseNotReady)
+    assert writes == ["dispatched"]
+    async with release_sql() as db:
+        assert await db.scalar(select(context_gate.c.state)) == "open"
+        assert await db.scalar(select(release_journal.c.stage)) == "complete"
+        journal = (await db.execute(select(release_journal))).mappings().one()
+        assert len(journal["recovery_receipts"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_timeout_persists_uncertainty_across_release_instances(
+    release_sql, tmp_path
+):
+    release, aliases = await prepared(release_sql, tmp_path)
+
+    async def timeout(*args, **kwargs):
+        await kwargs["before_write"]()
+        raise TimeoutError("remote outcome unknown")
+
+    aliases.prepare_release_membership = timeout
+    with pytest.raises(TimeoutError):
+        await release.resume("journal-1")
+    async with release_sql() as db:
+        gate = (await db.execute(select(context_gate))).mappings().one()
+        assert gate["execution_token"] and gate["execution_effect"] == "membership"
+    with pytest.raises(ReleaseNotReady, match="execution"):
+        await ContextRelease(release_sql, release.artifacts, aliases).resume(
+            "journal-1"
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_revalidates_frozen_build_config_even_if_saved_mapping_matches(
+    release_sql, tmp_path
+):
+    from tests.unit.runtime.test_query_composition import SNAPSHOT
+
+    release, aliases = await prepared(release_sql, tmp_path)
+    snapshot = SNAPSHOT.model_copy(
+        update={
+            "index_generation": "new-v1",
+            "expected_representation_version": "context-v1",
+            "context_build_fingerprint": "a" * 64,
+        }
+    )
+    async with release_sql.begin() as db:
+        await db.execute(
+            update(retrieval_builds)
+            .where(retrieval_builds.c.index_generation == "new-v1")
+            .values(representation_version="context-v1", build_config_hash="b" * 64)
+        )
+    current = await release.mapping("new-v1")
+    receipt, verifier = signed_receipt(
+        nonce="saved-policy", config_hash=snapshot.snapshot_id
+    )
+    receipt_hash = verifier.verify(receipt).sha256
+    async with release_sql.begin() as db:
+        await db.execute(
+            update(release_journal).values(
+                after_mapping=current,
+                target_snapshot=snapshot.model_dump(mode="json"),
+                target_config_hash=snapshot.snapshot_id,
+                receipt_hash=receipt_hash,
+                maintenance_receipt=receipt,
+            )
+        )
+        await db.execute(
+            update(context_gate).values(
+                receipt_hash=receipt_hash, maintenance_receipt=receipt
+            )
+        )
+    with pytest.raises(ReleaseNotReady, match="policy"):
+        await release.resume("journal-1")
+    async with release_sql() as db:
+        assert await db.scalar(select(release_journal.c.stage)) == "prepared"
+        assert await db.scalar(select(document_versions.c.index_generation)) == "old-v1"
+    assert aliases.generation == "old-v1"
+
+
+@pytest.mark.asyncio
+async def test_completed_release_rollback_can_continue_previously_started_drain(
+    release_sql, tmp_path
+):
+    from tests.unit.runtime.test_query_composition import SNAPSHOT
+
+    release, _ = await prepared(release_sql, tmp_path)
+    with pytest.raises(ReleaseNotReady, match="roles"):
+        await release.resume("journal-1")
+    snapshot = SNAPSHOT.model_copy(update={"index_generation": "new-v1"})
+    release_sql.configure(
+        info={
+            "context_config_hash": snapshot.snapshot_id,
+            "context_instance_id": "new-api",
+        }
+    )
+    await release.store.attest("api", snapshot.snapshot_id)
+    await release.resume("journal-1")
+    await release.store.pause()
+    old = SNAPSHOT.model_copy(update={"index_generation": "old-v1"})
+    receipt, release.store.verifier = signed_receipt(
+        nonce="drained-rollback",
+        from_generation="new-v1",
+        to_generation="old-v1",
+        config_hash=old.snapshot_id,
+        previous_instances=[{"instance": "new-api", "role": "api"}],
+        instances=[{"instance": "rollback-api", "role": "api"}],
+    )
+    with pytest.raises(ReleaseNotReady, match="roles"):
+        await release.rollback("journal-1", target_snapshot=old, receipt=receipt)
+    async with release_sql() as db:
+        assert (
+            await db.scalar(select(context_gate.c.active_journal_id))
+            == "journal-1:rollback"
+        )
+        assert await db.scalar(select(context_gate.c.generation)) == "old-v1"

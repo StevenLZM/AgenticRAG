@@ -113,7 +113,13 @@ def test_pair_adapter_uses_loaded_encoder_and_smaller_actual_capacity():
     assert adapter._tokenizer is tokenizer and adapter.max_pair_tokens == 384
     tokenizer.is_fast = False
     with pytest.raises(ValueError, match="fast tokenizer"):
-        pair_adapter(encoder, Settings(expected_representation_version="context-v1", context_release_enabled=True))
+        pair_adapter(
+            encoder,
+            Settings(
+                expected_representation_version="context-v1",
+                context_release_enabled=True,
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -163,3 +169,33 @@ async def test_frozen_context_policy_rejects_legacy_hit_and_citation_markers(tmp
             },
             [{"schema_version": 1}],
         )
+
+
+@pytest.mark.asyncio
+async def test_role_readiness_rejects_pre_execution_fence_schema_before_es(tmp_path):
+    import importlib.util
+    from types import SimpleNamespace
+    from pathlib import Path
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from agentic_rag.runtime.context_composition import validate_context_role
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/pre-fence.db")
+    try:
+        async with engine.begin() as connection:
+            for name in ("0010_context_builds", "0011_context_release"):
+                spec = importlib.util.spec_from_file_location(
+                    name, Path(f"alembic/versions/{name}.py")
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                await connection.run_sync(module.metadata.create_all)
+        container = SimpleNamespace(
+            mysql_engine=engine,
+            settings=Settings(
+                context_release_enabled=True, context_instance_id="api-1"
+            ),
+        )
+        with pytest.raises(ValueError, match="0012"):
+            await validate_context_role(container, "api")
+    finally:
+        await engine.dispose()

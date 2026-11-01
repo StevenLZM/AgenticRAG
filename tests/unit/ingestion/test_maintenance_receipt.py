@@ -49,3 +49,18 @@ def test_receipt_binds_inventory_hash_expiry_and_signature():
     )
     with pytest.raises(ValueError, match="expired"):
         verifier.verify(expired)
+
+
+def test_execution_recovery_requires_nonempty_stop_and_es_quiescence_references():
+    fields = dict(
+        journal_id="release-1",
+        execution_token="a" * 32,
+        maintenance_receipt_hash="b" * 64,
+        effect="alias",
+        stopped_executor_ref="proof://stopped",
+        es_quiescence_ref="proof://settled",
+    )
+    for name in ("stopped_executor_ref", "es_quiescence_ref"):
+        envelope, verifier = signed_receipt(execution_recovery={**fields, name: ""})
+        with pytest.raises(ValueError):
+            verifier.verify(envelope)

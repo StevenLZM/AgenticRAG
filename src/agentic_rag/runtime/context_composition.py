@@ -85,7 +85,9 @@ def pair_adapter(encoder, settings):
     capacity = getattr(encoder, "max_length", None)
     tokenizer = getattr(encoder, "tokenizer", None)
     if tokenizer is None or not getattr(tokenizer, "is_fast", False):
-        raise ValueError("enabled context reranker requires actual loaded fast tokenizer")
+        raise ValueError(
+            "enabled context reranker requires actual loaded fast tokenizer"
+        )
     model_limit = getattr(getattr(encoder, "model", None), "config", None)
     limits = [
         value
@@ -217,6 +219,19 @@ async def validate_context_role(container, role):
         raise ValueError(
             "context schema missing; apply additive migrations in maintenance first"
         )
+    async with container.mysql_engine.connect() as connection:
+        columns = await connection.run_sync(
+            lambda conn: {
+                name: {column["name"] for column in inspect(conn).get_columns(name)}
+                for name in ("context_release_gate", "context_release_journal")
+            }
+        )
+    if (
+        not {"active_journal_id", "execution_token", "execution_effect"}
+        <= columns["context_release_gate"]
+        or "recovery_receipts" not in columns["context_release_journal"]
+    ):
+        raise ValueError("context execution fence schema missing; apply migration 0012")
     from agentic_rag.persistence.elasticsearch import ElasticsearchChildIndexStore
 
     await ElasticsearchChildIndexStore(

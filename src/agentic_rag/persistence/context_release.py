@@ -4,6 +4,8 @@ An opted-in session locks the same gate row as maintenance transitions. The
 legacy session path issues no SQL here and needs none of the additive tables.
 """
 
+from uuid import uuid4
+
 from sqlalchemy import JSON, Column, Integer, String, Table, insert, select, update
 from agentic_rag.persistence.repositories import (
     metadata,
@@ -26,6 +28,9 @@ context_gate = Table(
     Column("maintenance_receipt", JSON, nullable=False),
     Column("receipts", JSON, nullable=False),
     Column("rollback_generation", String(128)),
+    Column("active_journal_id", String(64)),
+    Column("execution_token", String(32)),
+    Column("execution_effect", String(32)),
 )
 release_journal = Table(
     "context_release_journal",
@@ -42,6 +47,7 @@ release_journal = Table(
     Column("corpus_hash", String(64), nullable=False),
     Column("receipt_hash", String(64), nullable=False),
     Column("maintenance_receipt", JSON, nullable=False),
+    Column("recovery_receipts", JSON),
 )
 
 maintenance_nonces = Table(
@@ -64,6 +70,7 @@ async def consume_receipt(
     config_hash,
     previous=None,
     roles=None,
+    recovery=False,
 ):
     if verifier is None or envelope is None:
         raise ReleaseNotReady(
@@ -71,6 +78,8 @@ async def consume_receipt(
         )
     receipt = verifier.verify(envelope)
     payload = receipt.payload
+    if (payload.execution_recovery is not None) != recovery:
+        raise ReleaseNotReady("maintenance receipt recovery purpose differs")
     if (payload.from_generation, payload.to_generation, payload.config_hash) != (
         source,
         target,
@@ -183,8 +192,270 @@ class ReleaseStore:
                 )
             )
 
-    async def pause(self):
+    @staticmethod
+    def bind_journal(gate, journal):
+        payload = gate["maintenance_receipt"]["payload"]
+        if (
+            gate["active_journal_id"] != journal["id"]
+            or gate["receipt_hash"] != journal["receipt_hash"]
+            or (payload["to_generation"], payload["config_hash"])
+            != (journal["target_generation"], journal["target_config_hash"])
+        ):
+            raise ReleaseNotReady(
+                "journal superseded or maintenance authorization differs"
+            )
+        if journal["stage"] == "aborted":
+            raise ReleaseNotReady("aborted journal cannot execute")
+
+    async def execution(self, db, journal, token, *, allow_open=False):
+        gate = (
+            (
+                await db.execute(
+                    select(context_gate).where(context_gate.c.id == 1).with_for_update()
+                )
+            )
+            .mappings()
+            .one()
+        )
+        self.bind_journal(gate, journal)
+        if gate["execution_token"] != token or not token:
+            raise ReleaseNotReady("release execution ownership lost")
+        if gate["state"] != "frozen" and not allow_open:
+            raise ReleaseNotReady("release execution requires frozen admission")
+        return gate
+
+    async def claim_execution(self, journal_id, *, compensation=False):
+        token = uuid4().hex
         async with self.factory.begin() as db:
+            gate = (
+                (
+                    await db.execute(
+                        select(context_gate)
+                        .where(context_gate.c.id == 1)
+                        .with_for_update()
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            journal = dict(
+                (
+                    await db.execute(
+                        select(release_journal).where(
+                            release_journal.c.id == journal_id
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            if journal["stage"] == "aborted":
+                raise ReleaseNotReady("aborted journal cannot execute")
+            if journal["stage"] == "complete" and not compensation:
+                return journal, None
+            self.bind_journal(gate, journal)
+            if gate["execution_token"] is not None:
+                raise ReleaseNotReady(
+                    "release execution already owned; recovery requires trusted quiescence"
+                )
+            if (
+                gate["state"] != "frozen"
+                and not (
+                    gate["state"] == "open"
+                    and journal["stage"] in ("verified", "complete")
+                )
+                and not (compensation and gate["state"] == "draining")
+            ):
+                raise ReleaseNotReady("release execution requires frozen admission")
+            changed = await db.execute(
+                update(context_gate)
+                .where(
+                    context_gate.c.id == 1,
+                    context_gate.c.execution_token.is_(None),
+                    context_gate.c.active_journal_id == journal_id,
+                    context_gate.c.receipt_hash == journal["receipt_hash"],
+                )
+                .values(execution_token=token, execution_effect=None)
+            )
+            if changed.rowcount != 1:
+                raise ReleaseNotReady("release execution already owned")
+        return journal, token
+
+    async def release_execution(self, journal_id, token):
+        # A timed-out/cancelled ES request may still run remotely. Never expire
+        # or clear its ownership merely because this coroutine returned.
+        async with self.factory.begin() as db:
+            await db.execute(
+                update(context_gate)
+                .where(
+                    context_gate.c.id == 1,
+                    context_gate.c.active_journal_id == journal_id,
+                    context_gate.c.execution_token == token,
+                    context_gate.c.execution_effect.is_(None),
+                )
+                .values(execution_token=None)
+            )
+
+    async def mark_effect(self, journal, token, effect):
+        async with self.factory.begin() as db:
+            gate = await self.execution(db, journal, token)
+            if effect is not None and gate["execution_effect"] is not None:
+                raise ReleaseNotReady(
+                    "release execution has an uncertain external effect"
+                )
+            await db.execute(
+                update(context_gate)
+                .where(
+                    context_gate.c.id == 1,
+                    context_gate.c.execution_token == token,
+                )
+                .values(execution_effect=effect)
+            )
+
+    async def execution_status(self, journal_id):
+        """Read the exact recovery binding; no proof issuance or state mutation."""
+        async with self.factory() as db:
+            gate = (
+                (await db.execute(select(context_gate).where(context_gate.c.id == 1)))
+                .mappings()
+                .one()
+            )
+            journal = (
+                (
+                    await db.execute(
+                        select(release_journal).where(
+                            release_journal.c.id == journal_id
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            self.bind_journal(gate, journal)
+            return dict(
+                journal_id=journal_id,
+                stage=journal["stage"],
+                state=gate["state"],
+                execution_token=gate["execution_token"],
+                effect=gate["execution_effect"],
+                maintenance_receipt_hash=gate["receipt_hash"],
+                from_generation=gate["generation"],
+                to_generation=journal["target_generation"],
+                config_hash=journal["target_config_hash"],
+                instances=gate["inventory"],
+                previous_instances=gate["inventory"],
+            )
+
+    async def recover_execution(self, journal_id, envelope):
+        """Consume trusted stopped-executor + remote-write-quiescence evidence.
+
+        No timer, local PID probe or caller flag can clear execution ownership.
+        The external authority must stop the executor and settle ALL its ES
+        requests before issuing this receipt. A late local continuation still
+        loses its token and cannot commit or dispatch the next write.
+        """
+        if self.verifier is None or envelope is None:
+            raise ReleaseNotReady("trusted execution recovery authority is required")
+        verified = self.verifier.verify(envelope)
+        proof = verified.payload.execution_recovery
+        async with self.factory.begin() as db:
+            gate = (
+                (
+                    await db.execute(
+                        select(context_gate)
+                        .where(context_gate.c.id == 1)
+                        .with_for_update()
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            journal = (
+                (
+                    await db.execute(
+                        select(release_journal).where(
+                            release_journal.c.id == journal_id
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            self.bind_journal(gate, journal)
+            if (
+                proof is None
+                or not gate["execution_token"]
+                or (
+                    proof.journal_id,
+                    proof.execution_token,
+                    proof.maintenance_receipt_hash,
+                    proof.effect,
+                )
+                != (
+                    journal_id,
+                    gate["execution_token"],
+                    gate["receipt_hash"],
+                    gate["execution_effect"],
+                )
+            ):
+                raise ReleaseNotReady("execution recovery does not match current fence")
+            if gate["execution_effect"] is not None and gate["state"] != "frozen":
+                raise ReleaseNotReady(
+                    "uncertain execution recovery requires frozen admission"
+                )
+            _, inventory = await consume_receipt(
+                db,
+                self.verifier,
+                envelope,
+                operation=f"recover:{proof.execution_token}",
+                source=gate["generation"],
+                target=journal["target_generation"],
+                config_hash=journal["target_config_hash"],
+                previous=gate["inventory"],
+                roles=gate["roles"],
+                recovery=True,
+            )
+            if sorted(inventory, key=lambda v: v["instance"]) != sorted(
+                gate["inventory"], key=lambda v: v["instance"]
+            ):
+                raise ReleaseNotReady(
+                    "execution recovery cannot replace deployment inventory"
+                )
+            changed = await db.execute(
+                update(context_gate)
+                .where(
+                    context_gate.c.id == 1,
+                    context_gate.c.active_journal_id == journal_id,
+                    context_gate.c.receipt_hash == proof.maintenance_receipt_hash,
+                    context_gate.c.execution_token == proof.execution_token,
+                )
+                .values(execution_token=None, execution_effect=None)
+            )
+            if changed.rowcount != 1:
+                raise ReleaseNotReady("execution recovery lost current fence")
+            await db.execute(
+                update(release_journal)
+                .where(release_journal.c.id == journal_id)
+                .values(
+                    recovery_receipts=[*(journal["recovery_receipts"] or []), envelope]
+                )
+            )
+
+    async def pause(self, *, token=None):
+        async with self.factory.begin() as db:
+            gate = (
+                (
+                    await db.execute(
+                        select(context_gate)
+                        .where(context_gate.c.id == 1)
+                        .with_for_update()
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            if gate["execution_token"] is not None and gate["execution_token"] != token:
+                raise ReleaseNotReady("release execution already owned")
             await db.execute(
                 update(context_gate)
                 .where(context_gate.c.id == 1, context_gate.c.state == "open")
@@ -210,6 +481,8 @@ class ReleaseStore:
                 .where(release_journal.c.stage.not_in(("complete", "aborted")))
                 .limit(1)
             )
+            if gate["execution_token"] is not None:
+                raise ReleaseNotReady("release execution already owned")
             if pending or gate["state"] not in ("frozen", "draining"):
                 raise ReleaseNotReady(
                     "unfinished release must be resumed or compensated first"
@@ -220,7 +493,7 @@ class ReleaseStore:
                 .values(state="draining")
             )
 
-    async def assert_drained(self):
+    async def assert_drained(self, *, token=None):
         from agentic_rag.orchestration import schema
         from agentic_rag.persistence.context_registry import retrieval_rebuild_jobs
 
@@ -236,6 +509,8 @@ class ReleaseStore:
                 .mappings()
                 .one()
             )
+            if row["execution_token"] is not None and row["execution_token"] != token:
+                raise ReleaseNotReady("release execution already owned")
             if row["state"] not in ("draining", "frozen"):
                 raise ReleaseNotReady("pause admission before drain")
             for name, table, states in (
@@ -258,7 +533,9 @@ class ReleaseStore:
                 .values(state="frozen")
             )
 
-    async def set_configuration(self, generation, config_hash):
+    async def set_configuration(
+        self, generation, config_hash, *, journal=None, token=None
+    ):
         async with self.factory.begin() as db:
             row = (
                 (
@@ -271,6 +548,17 @@ class ReleaseStore:
                 .mappings()
                 .one()
             )
+            if row["active_journal_id"] is not None:
+                if journal is None:
+                    raise ReleaseNotReady(
+                        "configuration switch requires active journal execution"
+                    )
+                await self.execution(db, journal, token)
+                if (generation, config_hash) != (
+                    journal["target_generation"],
+                    journal["target_config_hash"],
+                ):
+                    raise ReleaseNotReady("configuration differs from journal target")
             if row["state"] != "frozen":
                 raise ReleaseNotReady("configuration switch requires frozen gate")
             if (row["generation"], row["config_hash"]) != (generation, config_hash):
@@ -329,7 +617,7 @@ class ReleaseStore:
                 .values(receipts=receipts)
             )
 
-    async def reopen(self):
+    async def reopen(self, *, journal=None, token=None):
         async with self.factory.begin() as db:
             row = (
                 (
@@ -342,6 +630,42 @@ class ReleaseStore:
                 .mappings()
                 .one()
             )
+            if row["active_journal_id"] is not None:
+                active = (
+                    (
+                        await db.execute(
+                            select(release_journal).where(
+                                release_journal.c.id == row["active_journal_id"]
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                self.bind_journal(row, active)
+                if active["stage"] != "complete":
+                    if journal is None or journal["id"] != active["id"]:
+                        raise ReleaseNotReady(
+                            "reopen requires active journal execution"
+                        )
+                    await self.execution(db, active, token)
+                    if active["stage"] != "verified":
+                        raise ReleaseNotReady(
+                            "release journal has unfinished boundaries"
+                        )
+                if row["execution_effect"] is not None:
+                    raise ReleaseNotReady(
+                        "release execution has an uncertain external effect"
+                    )
+                if (row["generation"], row["config_hash"]) != (
+                    active["target_generation"],
+                    active["target_config_hash"],
+                ):
+                    raise ReleaseNotReady(
+                        "reopen configuration differs from journal target"
+                    )
+            if row["execution_token"] is not None and row["execution_token"] != token:
+                raise ReleaseNotReady("release execution already owned")
             if row["state"] != "frozen":
                 raise ReleaseNotReady("reopen requires frozen gate")
             pending = await db.scalar(

@@ -66,3 +66,22 @@ def test_execute_release_without_authority_fails_before_opening_services(
     )
     with pytest.raises(ValueError, match="authority"):
         main(arguments(tmp_path, "release") + ["--journal", "release-1", "--execute"])
+
+
+def test_recover_execution_requires_journal_and_external_proof_before_clients(
+    tmp_path, monkeypatch, capsys
+):
+    import agentic_rag.bootstrap
+
+    monkeypatch.setattr(
+        agentic_rag.bootstrap,
+        "build_container",
+        lambda *a: pytest.fail("recovery opened services without proof"),
+    )
+    args = arguments(tmp_path, "recover-execution")
+    with pytest.raises(ValueError, match="journal"):
+        main(args)
+    assert main(args + ["--journal", "journal-1"]) == 0
+    assert "settled ES" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="authority"):
+        main(args + ["--journal", "journal-1", "--execute"])
